@@ -1493,46 +1493,72 @@ forbids them).
 
 ## 13  NETLINK_GENERIC — IPVS Generic-Netlink Family
 
-**Genl family name resolution note:** The IPVS family name `"IPVS\0"` must be
-resolved at startup via `CTRL_CMD_GETFAMILY` (section 8.1 pattern) and cached
-in a separate `OnceLock<u16>` from the ethtool and wireguard families.
+**Genl family:** name `"IPVS"` (`IPVS_GENL_NAME`), version `1`
+(`IPVS_GENL_VERSION`). The dynamic family ID is obtained once per process by
+sending `CTRL_CMD_GETFAMILY` (cmd=3) to the generic-netlink controller family
+(family ID 16, i.e. `NETLINK_GENERIC` socket) with a
+`CTRL_ATTR_FAMILY_NAME` NLA containing the NUL-terminated string `"IPVS"`. The
+reply's `CTRL_ATTR_FAMILY_ID` (u16, host order) is the dynamic family ID used
+in all subsequent `genlmsghdr.nlmsg_type` fields. Cache in a separate
+`OnceLock<u16>` from the ethtool and WireGuard families.
 
-### 13.1  Three-Phase Collection Sequence
+### 13.1  Command Enumeration
 
-The IPVS collector uses the same `NETLINK_GENERIC` (protocol 16) socket and
-`CTRL_CMD_GETFAMILY` resolution path as the ethtool collector (section 8.1).
-
-```mermaid
-sequenceDiagram
-    participant U as nft_exporter
-    participant K as Linux Kernel
-
-    Note over U,K: Phase 1 — Family resolution (OnceLock, ENOENT = runtime-gated)
-    U->>K: nlmsghdr{type=16, flags=NLM_F_REQUEST|NLM_F_ACK}<br/>genlmsghdr{cmd=CTRL_CMD_GETFAMILY=3, version=2}<br/>CTRL_ATTR_FAMILY_NAME="IPVS\0"
-    K-->>U: CTRL_ATTR_FAMILY_ID (u16 LE) → cached ipvs_family_id
-    Note over U: ENOENT → available=false, emit nft_scrape_collector_available=0, stop
-
-    Note over U,K: Phase 2 — Info (one unicast, NLM_F_REQUEST|NLM_F_ACK)
-    U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0005}<br/>genlmsghdr{cmd=IPVS_CMD_GET_INFO=15, version=1}
-    K-->>U: IPVS_INFO_ATTR_CONN_TAB_SIZE u32
-
-    Note over U,K: Phase 3 — Service dump (NLM_F_REQUEST|NLM_F_DUMP)
-    U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0301}<br/>genlmsghdr{cmd=IPVS_CMD_GET_SERVICE=4, version=1}
-    K-->>U: [NLM_F_MULTI] IPVS_SVC_ATTR_* + IPVS_SVC_ATTR_STATS64 [svc 1]
-    K-->>U: [NLM_F_MULTI] IPVS_SVC_ATTR_* + IPVS_SVC_ATTR_STATS64 [svc 2]
-    K-->>U: NLMSG_DONE
-
-    Note over U,K: Phase 4 — Destination query per service (unicast, sequential)
-    U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0005}<br/>genlmsghdr{cmd=IPVS_CMD_GET_DEST=8, version=1}<br/>+ service key attrs
-    K-->>U: [NLM_F_MULTI] IPVS_DEST_ATTR_* + IPVS_DEST_ATTR_STATS64 [dest 1]
-    K-->>U: NLMSG_DONE
+```
+IPVS_CMD_UNSPEC       = 0
+IPVS_CMD_NEW_SERVICE  = 1
+IPVS_CMD_SET_SERVICE  = 2
+IPVS_CMD_DEL_SERVICE  = 3
+IPVS_CMD_GET_SERVICE  = 4   ← dump all virtual services
+IPVS_CMD_NEW_DEST     = 5
+IPVS_CMD_SET_DEST     = 6
+IPVS_CMD_DEL_DEST     = 7
+IPVS_CMD_GET_DEST     = 8   ← dump destinations for one service
+IPVS_CMD_NEW_DAEMON   = 9
+IPVS_CMD_DEL_DAEMON   = 10
+IPVS_CMD_GET_DAEMON   = 11
+IPVS_CMD_SET_CONFIG   = 12
+IPVS_CMD_GET_CONFIG   = 13
+IPVS_CMD_SET_INFO     = 14
+IPVS_CMD_GET_INFO     = 15
+IPVS_CMD_ZERO         = 16
+IPVS_CMD_FLUSH        = 17
 ```
 
-### 13.2  genlmsghdr for IPVS
+### 13.2  Three-Phase Collection Sequence
+
+```
+nft_exporter                                   Linux Kernel
+     |                                               |
+     |-- NETLINK_GENERIC socket, family name "IPVS" -|
+     |   CTRL_CMD_GETFAMILY(3), CTRL_ATTR_FAMILY_NAME="IPVS\0"
+     |<- CTRL_ATTR_FAMILY_ID u16 (dynamic ipvs_family_id) ---|
+     |   [ENOENT => available=0, stop]                        |
+     |                                                         |
+     |-- GET_SERVICE dump (cmd=4, NLM_F_REQUEST|NLM_F_DUMP) --|
+     |<- [NLM_F_MULTI] IPVS_CMD_ATTR_SERVICE nest [svc 1] ----|
+     |<- [NLM_F_MULTI] IPVS_CMD_ATTR_SERVICE nest [svc 2] ----|
+     |<- NLMSG_DONE ------------------------------------------|
+     |                                                         |
+     |  For each service:                                      |
+     |-- GET_DEST dump (cmd=8, NLM_F_REQUEST|NLM_F_DUMP) -----|
+     |   + IPVS_CMD_ATTR_SERVICE(1) nest with service key      |
+     |<- [NLM_F_MULTI] IPVS_CMD_ATTR_DEST nest [dest 1] ------|
+     |<- NLMSG_DONE ------------------------------------------|
+```
+
+**Critical:** The `IPVS_CMD_ATTR_SERVICE` (type=1) NLA_NESTED container is
+**mandatory** in `GET_DEST` requests. The kernel's `GET_DEST` handler parses
+`nlmsg_parse()` expecting service key attrs inside this outer nest. Omitting
+the nest causes `EINVAL` or an empty multipart response. keepalived reference:
+`ipvs_get_dests()` calls `nla_nest_start(msg, IPVS_CMD_ATTR_SERVICE)` then
+fills service key attrs inside the nest before `nla_nest_end()`.
+
+### 13.3  genlmsghdr for IPVS
 
 The `genlmsghdr` (4 bytes at offset 16 following `nlmsghdr`) for all IPVS
 messages uses `version=1` (`IPVS_GENL_VERSION`). Sending `version=0` causes
-`EINVAL` on some kernel versions (same rule as for ethtool, see gotcha G-18).
+`EINVAL` on some kernel versions.
 
 ```
 u8  cmd      @ 0   (IPVS_CMD_GET_INFO=15, IPVS_CMD_GET_SERVICE=4, IPVS_CMD_GET_DEST=8)
@@ -1542,17 +1568,19 @@ u16 reserved @ 2   (always 0)
 
 nlattr chain starts at byte offset 20 (`NLMSG_HDRLEN + sizeof(genlmsghdr)`).
 
-### 13.3  IPVS_CMD_GET_INFO Reply Attributes
+### 13.4  Top-Level Command Attribute Types
 
-| Effective attr type | Constant | Payload | Metric |
-|---|---|---|---|
-| 1 | `IPVS_INFO_ATTR_VERSION` | `u32` native-endian kernel IPVS version | not emitted |
-| 2 | `IPVS_INFO_ATTR_CONN_TAB_SIZE` | `u32` native-endian table capacity | `nft_ipvs_connection_table_size` gauge |
+Reply frames carry attrs inside one of two top-level nested containers:
 
-### 13.4  IPVS_CMD_GET_SERVICE Reply — Service Key Attributes
+| Type | Constant | Content |
+|---|---|---|
+| 1 | `IPVS_CMD_ATTR_SERVICE` | Nested `ipvs_svc_attrs` — one virtual service |
+| 2 | `IPVS_CMD_ATTR_DEST` | Nested `ipvs_dest_attrs` — one destination |
 
-Each reply frame carries one virtual service. Attribute types from
-`include/uapi/linux/ip_vs.h` `enum ipvs_svc_attrs`:
+### 13.5  IPVS_CMD_GET_SERVICE Reply — Service Key Attributes
+
+Each reply frame has an `IPVS_CMD_ATTR_SERVICE` (type=1) container. Inner
+attribute types from `include/uapi/linux/ip_vs.h` `enum ipvs_svc_attrs`:
 
 | Effective attr type | Constant | Payload | Notes |
 |---|---|---|---|
@@ -1561,9 +1589,17 @@ Each reply frame carries one virtual service. Attribute types from
 | 3 | `IPVS_SVC_ATTR_ADDR` | 4 bytes (AF_INET) or 16 bytes (AF_INET6); network byte order | VIP address |
 | 4 | `IPVS_SVC_ATTR_PORT` | `u16` **big-endian** (network byte order) | Virtual port |
 | 5 | `IPVS_SVC_ATTR_FWMARK` | `u32` native-endian | Mutually exclusive with ADDR+PORT |
-| 6 | `IPVS_SVC_ATTR_SCHED_NAME` | NUL-terminated ASCII | `sched` label in `nft_ipvs_service_info` |
-| 10 | `IPVS_SVC_ATTR_STATS` | nested; 32-bit counters | Fallback when STATS64 absent (kernel < 3.15) |
-| 11 | `IPVS_SVC_ATTR_STATS64` | nested; 64-bit counters | **Preferred**; always check for this first |
+| 6 | `IPVS_SVC_ATTR_SCHED_NAME` | NUL-terminated ASCII, max 15+NUL | `sched` label in `nft_ipvs_service_info` |
+| 7 | `IPVS_SVC_ATTR_FLAGS` | 8 bytes: `{u32 flags; u32 mask}` | Not emitted |
+| 8 | `IPVS_SVC_ATTR_TIMEOUT` | `u32` native-endian seconds | Not emitted |
+| 9 | `IPVS_SVC_ATTR_NETMASK` | `u32` native-endian | Not emitted |
+| 10 | `IPVS_SVC_ATTR_STATS` | nested; 32-bit counters | Fallback when STATS64 absent |
+| 11 | `IPVS_SVC_ATTR_PE_NAME` | NUL-terminated ASCII, max 16 | Not emitted |
+| 12 | `IPVS_SVC_ATTR_STATS64` | nested; 64-bit counters | **Preferred** |
+
+**IPVS_SVC_ATTR_STATS64 id is 12, not 11.** Type 11 is `IPVS_SVC_ATTR_PE_NAME`.
+Using 11 for STATS64 silently misidentifies PE_NAME bytes as a stats64 nested
+attr and produces garbage metrics.
 
 **IPVS_SVC_ATTR_PORT endianness:** `u16` in network byte order. Use
 `u16::from_be_bytes`. This is identical to other UAPI port fields.
@@ -1572,21 +1608,54 @@ Each reply frame carries one virtual service. Attribute types from
 (and `IPVS_SVC_ATTR_ADDR`/`IPVS_SVC_ATTR_PORT` are absent or zero), emit
 `vip=""` and `port="0x<fwmark_hex>"` as Prometheus labels.
 
-### 13.5  IPVS_CMD_GET_DEST Reply — Destination Attributes
+### 13.6  IPVS_CMD_GET_DEST Reply — Destination Attributes
+
+Each reply frame has an `IPVS_CMD_ATTR_DEST` (type=2) container. Inner
+attribute types from `enum ipvs_dest_attrs`:
 
 | Effective attr type | Constant | Payload | Notes |
 |---|---|---|---|
 | 1 | `IPVS_DEST_ATTR_ADDR` | 4 or 16 bytes; network byte order | Real-server address |
 | 2 | `IPVS_DEST_ATTR_PORT` | `u16` **big-endian** | Real-server port |
+| 3 | `IPVS_DEST_ATTR_FWD_METHOD` | `u32` native-endian | Forwarding method |
+| 4 | `IPVS_DEST_ATTR_WEIGHT` | `u32` native-endian | `nft_ipvs_dest_weight` gauge |
+| 5 | `IPVS_DEST_ATTR_U_THRESH` | `u32` | Upper threshold |
+| 6 | `IPVS_DEST_ATTR_L_THRESH` | `u32` | Lower threshold |
 | 7 | `IPVS_DEST_ATTR_ACTIVE_CONNS` | `u32` native-endian | `nft_ipvs_dest_active_connections` gauge |
 | 8 | `IPVS_DEST_ATTR_INACT_CONNS` | `u32` native-endian | `nft_ipvs_dest_inactive_connections` gauge |
-| 10 | `IPVS_DEST_ATTR_STATS` | nested; 32-bit | Fallback (kernel < 3.15) |
+| 9 | `IPVS_DEST_ATTR_PERSIST_CONNS` | `u32` native-endian | Not emitted |
+| 10 | `IPVS_DEST_ATTR_STATS` | nested; 32-bit | Fallback |
+| 11 | `IPVS_DEST_ATTR_ADDR_FAMILY` | `u16` native-endian | AF override for dest; use to infer addr size for fwmark services |
 | 12 | `IPVS_DEST_ATTR_STATS64` | nested; 64-bit | **Preferred** |
+| 13 | `IPVS_DEST_ATTR_TUN_TYPE` | `u8` | Not emitted |
+| 14 | `IPVS_DEST_ATTR_TUN_PORT` | `u16` | Not emitted |
+| 15 | `IPVS_DEST_ATTR_TUN_FLAGS` | `u16` | Not emitted |
 
-### 13.6  IPVS_SVC_ATTR_STATS64 / IPVS_DEST_ATTR_STATS64 Nested Attributes
+**AF inference for destinations:** Read `IPVS_DEST_ATTR_ADDR_FAMILY` (id=11)
+if present, fall back to the parent service's AF. Do not infer AF from the
+service VIP string (fails for fwmark services where vip is empty).
+
+### 13.7  GET_DEST Request — Service Key Nest
+
+A `GET_DEST` request must wrap the service key inside `IPVS_CMD_ATTR_SERVICE`
+(type=1) as a nested NLA. Minimum service key for ip:port services:
+
+```
+genlmsghdr{cmd=8, version=1, reserved=0}
+IPVS_CMD_ATTR_SERVICE(1) [NLA_NESTED]
+    IPVS_SVC_ATTR_AF(1)       u16 native  (AF_INET=2 / AF_INET6=10)
+    IPVS_SVC_ATTR_PROTOCOL(2) u16 native  (TCP=6 / UDP=17 / SCTP=132)
+    IPVS_SVC_ATTR_ADDR(3)     4 or 16 bytes network-order
+    IPVS_SVC_ATTR_PORT(4)     u16 big-endian
+```
+
+For fwmark services use `IPVS_SVC_ATTR_AF(1)` + `IPVS_SVC_ATTR_FWMARK(5)`.
+
+### 13.8  IPVS_SVC_ATTR_STATS64 / IPVS_DEST_ATTR_STATS64 Nested Attributes
 
 Both carry inner attribute type numbering from `enum ipvs_stats_attrs`. All
-values are `u64` native-endian:
+ten fields are **u64 native-endian** (written by kernel via `nla_put_u64_64bit`
+which uses the native type directly; no big-endian conversion needed).
 
 | Inner attr type | Constant | Payload | Metric (service-level) |
 |---|---|---|---|
@@ -1600,12 +1669,15 @@ values are `u64` native-endian:
 | 8 | `IPVS_STATS_ATTR_OUTPPS` | `u64` native | `nft_ipvs_outgoing_packets_per_second` gauge |
 | 9 | `IPVS_STATS_ATTR_INBPS` | `u64` native | `nft_ipvs_incoming_bytes_per_second` gauge |
 | 10 | `IPVS_STATS_ATTR_OUTBPS` | `u64` native | `nft_ipvs_outgoing_bytes_per_second` gauge |
+| 11 | `IPVS_STATS_ATTR_PAD` | padding | Skip |
 
-**STATS64 precedence rule:** Search for `IPVS_SVC_ATTR_STATS64` (type 11) or
-`IPVS_DEST_ATTR_STATS64` (type 12) first. If absent (kernel < 3.15), fall back
-to the 32-bit variants and widen u32 fields to u64 at parse time.
+**STATS64 precedence rule:** Search for `IPVS_SVC_ATTR_STATS64` (type **12**)
+or `IPVS_DEST_ATTR_STATS64` (type **12**) first. If absent, fall back to
+`IPVS_SVC_ATTR_STATS` (type **10**) / `IPVS_DEST_ATTR_STATS` (type **10**)
+and widen the u32 fields to u64 at parse time (u32 conns/inpkts/outpkts/cps
+and related; u64 inbytes/outbytes in the 32-bit variant).
 
-### 13.7  Runtime Gating Protocol
+### 13.9  Runtime Gating Protocol
 
 When `CTRL_CMD_GETFAMILY("IPVS\0")` returns `NLMSG_ERROR` with `error=-ENOENT`:
 
@@ -1616,14 +1688,21 @@ When `CTRL_CMD_GETFAMILY("IPVS\0")` returns `NLMSG_ERROR` with `error=-ENOENT`:
 4. Do **not** emit any `nft_ipvs_*` series.
 5. Do **not** increment `nft_scrape_collector_error_total`.
 
-### 13.8  Cardinality Guards
+### 13.10  Cardinality Guards
 
 | Config key | Default | Effect |
 |---|---|---|
 | `ipvs_max_services` | 512 | Abort service dump after this many services |
 | `ipvs_max_dests_per_service` | 256 | Abort dest query for a service after this many destinations |
 
-### 13.9  Parsing Gotchas
+### 13.11  IPVS_CMD_GET_INFO Reply Attributes
+
+| Effective attr type | Constant | Payload | Metric |
+|---|---|---|---|
+| 1 | `IPVS_INFO_ATTR_VERSION` | `u32` native-endian kernel IPVS version | not emitted |
+| 2 | `IPVS_INFO_ATTR_CONN_TAB_SIZE` | `u32` native-endian table capacity | `nft_ipvs_connection_table_size` gauge |
+
+### 13.12  Parsing Gotchas
 
 **[G-29] IPVS_SVC_ATTR_PORT and IPVS_DEST_ATTR_PORT are network byte order.**
 Both port fields are `u16` big-endian despite appearing in a `NETLINK_GENERIC`
@@ -1639,12 +1718,26 @@ fwmark service.
 
 **[G-32] IPVS STATS64 inner attrs share numbering with 32-bit STATS.**
 The inner attribute type values (1 through 10) are identical for both variants.
-The only difference is the payload width: 4 bytes (u32) vs 8 bytes (u64).
+The difference is payload width: 4 bytes (u32) vs 8 bytes (u64). All u64
+values are native-endian (host byte order); `nla_put_u64_64bit` writes them
+as a native type — no big-endian conversion needed.
 
 **[G-33] NLA_F_NESTED on IPVS stats nests.**
-`IPVS_SVC_ATTR_STATS64` (type 11) and `IPVS_DEST_ATTR_STATS64` (type 12) have
+`IPVS_SVC_ATTR_STATS64` (type 12) and `IPVS_DEST_ATTR_STATS64` (type 12) have
 `NLA_F_NESTED (0x8000)` set in their `nla_type` on the wire. Strip bit 15
 before comparing: `effective_type = nla_type & 0x1FFF`.
+
+**[G-34] GET_DEST missing service nest causes silent empty result.**
+The kernel `GET_DEST` handler calls `nlmsg_parse()` expecting service key attrs
+inside `IPVS_CMD_ATTR_SERVICE` (type=1). Writing attrs directly to the genl
+payload as top-level NLAs (without the outer nest) causes the kernel to return
+`EINVAL` or an empty multipart response. Always use `nla_nest_start` /
+`nla_nest_end` semantics when building the request buffer.
+
+**[G-35] IPVS_SVC_ATTR_PE_NAME is type 11, not STATS64.**
+`IPVS_SVC_ATTR_STATS64` has type **12**. Code that uses 11 for STATS64 will
+never match it from service replies and will silently interpret PE_NAME string
+bytes as stats64 nested attrs.
 
 ---
 

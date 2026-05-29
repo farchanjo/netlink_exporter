@@ -48,6 +48,8 @@ pub struct IpvsDestination {
     pub rip: String,
     /// Real server port as decimal string.
     pub rport: String,
+    /// Configured weight for this destination.
+    pub weight: u32,
     /// Current active connections.
     pub active_conns: u32,
     /// Current inactive connections.
