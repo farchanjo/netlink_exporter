@@ -4,10 +4,22 @@
 //!
 //! | Message | `nlmsg_type` | Purpose |
 //! |---|---|---|
-//! | `NFT_MSG_GETTABLE`  | `0x0A00` | Table dump — family + name |
-//! | `NFT_MSG_GETCHAIN`  | `0x0A01` | Chain dump — table + name + type/hook/policy |
-//! | `NFT_MSG_GETRULE`   | `0x0A04` | Rule dump (count only; no per-rule labels) |
-//! | `NFT_MSG_GETOBJ`    | `0x0A12` | Object dump — named counter bytes/packets |
+//! | `NFT_MSG_GETTABLE`  | `0x0A01` | Table dump — family + name |
+//! | `NFT_MSG_GETCHAIN`  | `0x0A04` | Chain dump — table + name + type/hook/policy |
+//! | `NFT_MSG_GETRULE`   | `0x0A07` | Rule dump (count only; no per-rule labels) |
+//! | `NFT_MSG_GETOBJ`    | `0x0A13` | Object dump — named counter bytes/packets |
+//!
+//! `nlmsg_type = (NFNL_SUBSYS_NFTABLES=10) << 8 | msg_type`.  The enum in
+//! `nf_tables.h` starts at 0 with `NFT_MSG_NEWTABLE`; GET variants are at
+//! positions 1, 4, 7, and 19 respectively (verified against Linux 6.17 UAPI).
+//!
+//! **All dumps require `NLM_F_REQUEST | NLM_F_DUMP (0x0301)`.**  Sending
+//! `NLM_F_REQUEST (0x0001)` alone produces `EINVAL (errno=22)` because the
+//! subsystem requires both `NLM_F_ROOT` and `NLM_F_MATCH` bits for dump mode.
+//!
+//! **Counter object bytes/packets are big-endian u64** (kernel serialises them
+//! via `nla_put_be64`).  Use `read_u64_be` — not `read_u64` — for
+//! `NFTA_COUNTER_BYTES` and `NFTA_COUNTER_PACKETS`.
 //!
 //! ## Metrics emitted
 //!
@@ -65,7 +77,7 @@ use nlx_ports::{
 
 use crate::{
     transport::{MAX_DUMP_RESTARTS, NLMSG_HDRLEN, NetlinkError, NetlinkSocket},
-    wire::{nested_attrs, parse_attrs, read_u32, read_u64},
+    wire::{nested_attrs, parse_attrs, read_u32, read_u64_be},
 };
 
 // ---------------------------------------------------------------------------
@@ -82,10 +94,17 @@ const NFGENMSG_LEN: usize = 4;
 const ATTRS_OFFSET: usize = NLMSG_HDRLEN + NFGENMSG_LEN;
 
 // NFNL_SUBSYS_NFTABLES = 10; nlmsg_type = (10 << 8) | msg_type
-const NFT_MSG_GETTABLE: u16 = (10u16 << 8) | 0;
-const NFT_MSG_GETCHAIN: u16 = (10u16 << 8) | 1;
-const NFT_MSG_GETRULE: u16 = (10u16 << 8) | 4;
-const NFT_MSG_GETOBJ: u16 = (10u16 << 8) | 18;
+//
+// nf_tables.h enum (starting at 0): NEWTABLE=0, GETTABLE=1, DELTABLE=2,
+// NEWCHAIN=3, GETCHAIN=4, DELCHAIN=5, NEWRULE=6, GETRULE=7, DELRULE=8,
+// NEWSET=9, GETSET=10, DELSET=11, NEWSETELEM=12, GETSETELEM=13, DELSETELEM=14,
+// NEWGEN=15, GETGEN=16, TRACE=17, NEWOBJ=18, GETOBJ=19.
+//
+// Resulting nlmsg_type values: 0x0A01, 0x0A04, 0x0A07, 0x0A13.
+const NFT_MSG_GETTABLE: u16 = (10u16 << 8) | 1; // 0x0A01
+const NFT_MSG_GETCHAIN: u16 = (10u16 << 8) | 4; // 0x0A04
+const NFT_MSG_GETRULE: u16 = (10u16 << 8) | 7; // 0x0A07
+const NFT_MSG_GETOBJ: u16 = (10u16 << 8) | 19; // 0x0A13
 
 // nft object type for named counters
 const NFT_OBJECT_COUNTER: u32 = 1;
@@ -341,10 +360,12 @@ fn parse_obj_frame(frame: &[u8]) -> Option<NftCounter> {
                 for data_attr in nested_attrs(attr.payload) {
                     match data_attr.ty {
                         NFTA_COUNTER_BYTES => {
-                            bytes = read_u64(data_attr.payload).unwrap_or(0);
+                            // Big-endian u64: kernel serialises via nla_put_be64.
+                            bytes = read_u64_be(data_attr.payload).unwrap_or(0);
                         }
                         NFTA_COUNTER_PACKETS => {
-                            packets = read_u64(data_attr.payload).unwrap_or(0);
+                            // Big-endian u64: kernel serialises via nla_put_be64.
+                            packets = read_u64_be(data_attr.payload).unwrap_or(0);
                         }
                         _ => {}
                     }
@@ -673,5 +694,60 @@ mod tests {
             .iter()
             .find(|s| s.name == "nft_nft_counter_packets_total");
         assert!(pkts_sample.is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // Wire constant correctness: values are derived from the nf_tables.h
+    // enum starting at 0 with NFT_MSG_NEWTABLE.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nft_msg_constants_match_kernel_enum() {
+        // NFNL_SUBSYS_NFTABLES = 10; positions: GETTABLE=1, GETCHAIN=4,
+        // GETRULE=7, GETOBJ=19.
+        assert_eq!(NFT_MSG_GETTABLE, 0x0A01, "GETTABLE must be 0x0A01");
+        assert_eq!(NFT_MSG_GETCHAIN, 0x0A04, "GETCHAIN must be 0x0A04");
+        assert_eq!(NFT_MSG_GETRULE, 0x0A07, "GETRULE must be 0x0A07");
+        assert_eq!(NFT_MSG_GETOBJ, 0x0A13, "GETOBJ must be 0x0A13");
+    }
+
+    // ------------------------------------------------------------------
+    // Counter bytes/packets are big-endian u64 (nla_put_be64 in kernel).
+    // Verify parse_obj_frame decodes big-endian correctly.
+    // ------------------------------------------------------------------
+
+    fn make_nested_nla(ty: u16, inner: &[u8]) -> Vec<u8> {
+        make_nla(ty | 0x8000u16, inner) // NLA_F_NESTED set in wire encoding
+    }
+
+    #[test]
+    fn parse_obj_frame_counter_bytes_big_endian() {
+        // Build NFTA_OBJ_DATA containing NFTA_COUNTER_BYTES = 0x0102_0304_0506_0708 (BE).
+        let bytes_be: u64 = 0x0102_0304_0506_0708;
+        let pkts_be: u64 = 0x0000_0000_0000_0042;
+
+        let bytes_nla = make_nla(NFTA_COUNTER_BYTES, &bytes_be.to_be_bytes());
+        let pkts_nla = make_nla(NFTA_COUNTER_PACKETS, &pkts_be.to_be_bytes());
+        let mut data_inner = bytes_nla;
+        data_inner.extend_from_slice(&pkts_nla);
+        let obj_data_nla = make_nested_nla(NFTA_OBJ_DATA, &data_inner);
+
+        let mut frame = vec![0u8; 4]; // nfgenmsg AF_UNSPEC
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_TABLE, b"filter\0"));
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_NAME, b"my_counter\0"));
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_TYPE, &1u32.to_ne_bytes())); // NFT_OBJECT_COUNTER
+        frame.extend_from_slice(&obj_data_nla);
+
+        let counter = parse_obj_frame(&frame).expect("should parse counter frame");
+        assert_eq!(counter.table, "filter");
+        assert_eq!(counter.name, "my_counter");
+        assert_eq!(
+            counter.bytes, bytes_be,
+            "bytes must be decoded as big-endian u64"
+        );
+        assert_eq!(
+            counter.packets, pkts_be,
+            "packets must be decoded as big-endian u64"
+        );
     }
 }

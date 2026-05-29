@@ -706,6 +706,39 @@ These attributes must **never** appear as Prometheus labels or metric keys:
 | `CTA_IP_*` | IP addresses; per-connection; unbounded |
 | `CTA_PROTO_SRC_PORT` / `CTA_PROTO_DST_PORT` | Port numbers; per-connection; unbounded |
 
+### 5.7  nlmsg_type Encoding for nftables (NFNL_SUBSYS_NFTABLES = 10)
+
+`nlmsg_type = (NFNL_SUBSYS_NFTABLES << 8) | msg_type`
+
+`NFNL_SUBSYS_NFTABLES = 10`
+
+The `nf_tables.h` enum starts at 0 with `NFT_MSG_NEWTABLE`. The GET variants are
+at the following positions in the C enum (verified against
+`include/uapi/linux/netfilter/nf_tables.h`):
+
+| Symbolic name | Enum value | `nlmsg_type` | Purpose |
+|---|---|---|---|
+| `NFT_MSG_GETTABLE` | `1` | `0x0A01` | Table dump — name + address family |
+| `NFT_MSG_GETCHAIN` | `4` | `0x0A04` | Chain dump — table + name + type/hook/policy |
+| `NFT_MSG_GETRULE`  | `7` | `0x0A07` | Rule dump (count only; no per-rule labels) |
+| `NFT_MSG_GETSET`   | `10` | `0x0A0A` | Set dump (not currently collected) |
+| `NFT_MSG_GETOBJ`   | `19` | `0x0A13` | Stateful object dump (named counters) |
+
+**Critical:** all six GET messages require `nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP = 0x0301`
+when issuing a full dump. Sending `NLM_F_REQUEST (0x0001)` alone produces
+`EINVAL (errno=22)` from the kernel because the subsystem validates that dump
+requests carry both `NLM_F_ROOT` and `NLM_F_MATCH` bits.
+
+**nlattr payload endianness for nftables:** unlike ctnetlink (section 5.2–5.6),
+all nftables-specific nlattr payloads are **native-endian** (little-endian on
+x86-64/aarch64). No big-endian reads are required for nftables attributes.
+
+**Object (counter) parsing path:** `NFTA_OBJ_DATA (type=4)` is a nested nlattr
+container whose inner attributes follow the `nft_counter_attributes` enum:
+`NFTA_COUNTER_BYTES (1)` and `NFTA_COUNTER_PACKETS (2)`, both `u64`
+**big-endian** (verified in the kernel nf_tables counter implementation —
+counter values are serialised via `nla_put_be64`).
+
 ---
 
 ## 6  NETLINK_SOCK_DIAG (family=4) — inet Socket Statistics
@@ -2206,7 +2239,7 @@ high byte of `nlmsg_type`.
 
 | Symbolic name | nlmsg_type | Purpose |
 |---|---|---|
-| `IPCTNL_MSG_EXP_GET` | `0x0200` | Full expectations table dump |
+| `IPCTNL_MSG_EXP_GET` | `0x0201` | Full expectations table dump |
 | `IPCTNL_MSG_EXP_GET_STATS_CPU` | `0x0203` | Per-CPU expectation counters |
 
 Both requests use the standard 20-byte layout: `nlmsghdr` (16 bytes) +

@@ -6,7 +6,15 @@
 //!
 //! | Message | `nlmsg_type` | Purpose |
 //! |---|---|---|
-//! | `IPCTNL_MSG_EXP_GET` | `0x0200` | Full expectation table dump |
+//! | `IPCTNL_MSG_EXP_GET` | `0x0201` | Full expectation table dump |
+//!
+//! `nlmsg_type = (NFNL_SUBSYS_CTNETLINK_EXP=2) << 8 | msg_type`.  The enum in
+//! `nfnetlink_conntrack.h` starts at 0 with `IPCTNL_MSG_EXP_NEW`; GET is at
+//! position 1 (verified against Linux 6.17 UAPI).
+//!
+//! **All dumps require `NLM_F_REQUEST | NLM_F_DUMP (0x0301)`.**  Sending
+//! `NLM_F_REQUEST (0x0001)` alone produces `EINVAL (errno=22)` because the
+//! subsystem requires both `NLM_F_ROOT` and `NLM_F_MATCH` bits for dump mode.
 //!
 //! ## Metrics emitted
 //!
@@ -61,7 +69,10 @@ const NETLINK_NETFILTER: i32 = 12;
 const NFGENMSG_LEN: usize = 4;
 
 // nlmsg_type: (NFNL_SUBSYS_CTNETLINK_EXP=2) << 8 | msg_type
-const IPCTNL_MSG_EXP_GET: u16 = (2u16 << 8) | 0;
+//
+// nfnetlink_conntrack.h enum: EXP_NEW=0, EXP_GET=1, EXP_DELETE=2,
+// EXP_GET_STATS_CPU=3.  Resulting nlmsg_type: 0x0201.
+const IPCTNL_MSG_EXP_GET: u16 = (2u16 << 8) | 1; // 0x0201
 
 // CTA_EXPECT_* attribute types (effective, flags stripped)
 const CTA_EXPECT_TUPLE: u16 = 2;
@@ -372,5 +383,20 @@ mod tests {
     fn nfgenmsg_unspec_correct() {
         let m = nfgenmsg_unspec();
         assert_eq!(m, [0u8, 0u8, 0u8, 0u8]);
+    }
+
+    // ------------------------------------------------------------------
+    // Wire constant correctness: IPCTNL_MSG_EXP_GET is at enum position 1
+    // (EXP_NEW=0, EXP_GET=1) inside NFNL_SUBSYS_CTNETLINK_EXP=2.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ipctnl_msg_exp_get_constant_matches_kernel_enum() {
+        // NFNL_SUBSYS_CTNETLINK_EXP = 2; IPCTNL_MSG_EXP_GET = 1 → 0x0201.
+        assert_eq!(
+            IPCTNL_MSG_EXP_GET,
+            0x0201,
+            "IPCTNL_MSG_EXP_GET must be 0x0201 — sending 0x0200 (EXP_NEW) causes EINVAL"
+        );
     }
 }
