@@ -56,6 +56,20 @@ The package version tracks the crate version (`0.1.0`).
   `drop_monitor` collector additionally needs `CAP_SYS_ADMIN`, which an operator
   must add to the unit (documented in the unit comments and the README).
 
+## Amendment (2026-05-29) — EnvironmentFile + Makefile target
+
+- **`/etc/default/nft_exporter`** is shipped as a second **conffile** and loaded by the
+  unit via `EnvironmentFile=-/etc/default/nft_exporter` (the `-` tolerates absence). This is
+  the Debian-idiomatic place for per-host service environment: operators set `NLX_*` overrides
+  there (which take precedence over the TOML) without editing the unit. The inline
+  `Environment=` line was removed from the unit in favour of this file.
+- **`make deb`** (root `Makefile`) is the entry point: it runs `release` (glibc
+  `--target x86_64-unknown-linux-gnu`, stripped) then `packaging/deb/build-deb.sh`. The
+  Makefile was also corrected to the real binary name (`netlink_exporter`) and glibc target;
+  its prior musl/`nft_exporter` targets were stale drift and were removed.
+
+Conffiles in the package: `/etc/nft_exporter/nft_exporter.toml` and `/etc/default/nft_exporter`.
+
 ## Validation
 
 - `dpkg-deb --info` / `--contents` on the built artifact; install on a Ubuntu

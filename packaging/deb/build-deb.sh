@@ -23,6 +23,7 @@ chmod 755 "$STAGE"   # mktemp defaults to 0700; the package root must be 0755
 install -D -m 0755 "$BIN"                       "$STAGE/usr/bin/netlink_exporter"
 install -D -m 0644 "$HERE/nft_exporter.service" "$STAGE/lib/systemd/system/nft_exporter.service"
 install -D -m 0644 "$HERE/nft_exporter.toml"    "$STAGE/etc/nft_exporter/nft_exporter.toml"
+install -D -m 0644 "$HERE/nft_exporter.default" "$STAGE/etc/default/nft_exporter"
 
 # --- DEBIAN metadata ---
 install -d -m 0755 "$STAGE/DEBIAN"
@@ -44,7 +45,7 @@ Description: Linux netlink Prometheus exporter
  default-on + 8 opt-in procfs/sysfs). Serves Prometheus text 0.0.4 on :9456.
 EOF
 
-printf '/etc/nft_exporter/nft_exporter.toml\n' > "$STAGE/DEBIAN/conffiles"
+printf '/etc/nft_exporter/nft_exporter.toml\n/etc/default/nft_exporter\n' > "$STAGE/DEBIAN/conffiles"
 
 for s in postinst prerm postrm; do
   install -m 0755 "$HERE/$s" "$STAGE/DEBIAN/$s"

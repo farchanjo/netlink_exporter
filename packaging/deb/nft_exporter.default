@@ -1,0 +1,24 @@
+# /etc/default/nft_exporter — environment for the nft_exporter systemd service.
+#
+# The unit loads this via `EnvironmentFile=-/etc/default/nft_exporter`.
+# These NLX_* variables override the TOML config (precedence: CLI > env > TOML).
+# Uncomment and edit as needed; restart the service after changes:
+#   systemctl restart nft_exporter
+
+# HTTP listen address for /metrics, /healthz, /ready.
+#NLX_LISTEN_ADDR=0.0.0.0:9456
+
+# Log level: trace | debug | info | warn | error
+NLX_LOG_LEVEL=info
+
+# Per-collector scrape timeout, milliseconds.
+#NLX_SCRAPE_TIMEOUT_MS=30000
+
+# Config file path (the package installs /etc/nft_exporter/nft_exporter.toml).
+#NLX_CONFIG_PATH=/etc/nft_exporter/nft_exporter.toml
+
+# Opt-in procfs/sysfs collectors (ADR-0027) — off by default. Examples:
+#NLX_COLLECTORS__NETSTAT=true
+#NLX_COLLECTORS__SOFTNET=true
+#NLX_COLLECTORS__NIC_PCIE=true
+# Note: NLX_COLLECTORS__DROP_MONITOR=true also needs CAP_SYS_ADMIN in the unit.
