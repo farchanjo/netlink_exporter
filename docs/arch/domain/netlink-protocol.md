@@ -2212,10 +2212,15 @@ The collector is opt-in by design (not in the default enabled list).
 The kernel family `.version = 2`. Sending `version=1` in genlmsghdr causes
 `EINVAL`. Probes that used `version=1` reported `available=0` on all kernels.
 
-**[G-34] NET_DM_CMD_CONFIG returns EBUSY when monitoring is active** (drop_monitor)
+**[G-34] CONFIG returns EBUSY / START returns EAGAIN when monitoring is active** (drop_monitor)
 On the second and subsequent scrapes, `NET_DM_CMD_CONFIG` is rejected with
-`EBUSY` (errno=16) or `EALREADY` (errno=114) because monitoring is already
-running. Both are silently ignored; proceed directly to `STATS_GET`.
+`EBUSY` (errno=16) because the trace is on, and `NET_DM_CMD_START` is rejected
+with `EAGAIN` (errno=11) — `set_all_monitor_traces()` returns `-EAGAIN` with
+"Trace state is already set to the requested value"
+(`net/core/drop_monitor.c:1227`), NOT `EBUSY`/`EALREADY`. All three errnos
+(`EBUSY` 16, `EAGAIN` 11, `EALREADY` 114) are silently ignored; proceed directly
+to `STATS_GET`. Live-verified on Ubuntu 24.04 / kernel 6.17.0-generic
+(`CONFIG_NET_DROP_MONITOR=y`).
 
 ---
 

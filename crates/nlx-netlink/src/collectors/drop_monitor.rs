@@ -130,6 +130,14 @@ const EBUSY: i32 = 16;
 /// some kernel versions.
 const EALREADY: i32 = 114;
 
+/// Kernel errno `EAGAIN` (11) — returned by `set_all_monitor_traces()` when the
+/// trace state already equals the requested value (kernel:
+/// "Trace state is already set to the requested value",
+/// `net/core/drop_monitor.c:1227`). This is the actual error `NET_DM_CMD_START`
+/// returns on the second and subsequent scrapes — NOT `EBUSY`/`EALREADY`. Safe
+/// to ignore: monitoring is already active, which is the desired outcome.
+const EAGAIN: i32 = 11;
+
 // ---------------------------------------------------------------------------
 // Public collector struct
 // ---------------------------------------------------------------------------
@@ -254,9 +262,10 @@ fn push_nla(buf: &mut Vec<u8>, ty: u16, payload: &[u8]) {
 
 /// Send `NET_DM_CMD_CONFIG` (summary mode) then `NET_DM_CMD_START`.
 ///
-/// Both commands require `CAP_NET_ADMIN`. Kernel errors `EBUSY` (16) and
-/// `EALREADY` (114) are silently ignored — they indicate monitoring is already
-/// active, which is the desired outcome.
+/// Both commands require `CAP_NET_ADMIN`. Kernel errors `EBUSY` (16, CONFIG
+/// while monitoring), `EAGAIN` (11, START when trace state already ON), and
+/// `EALREADY` (114) are silently ignored — they all indicate monitoring is
+/// already active, which is the desired outcome on every scrape after the first.
 ///
 /// `NLM_F_ACK` (flag value 4) is OR-d into the flags by `request_single` on
 /// top of `NLM_F_REQUEST`.  This ensures the kernel sends an acknowledgment
@@ -275,11 +284,13 @@ async fn start_monitoring(
     // NLM_F_ACK = 4 so the kernel sends an ack/err frame we can read.
     match sock.request_single(family_id, 4, &config_payload).await {
         Ok(_) => {}
-        Err(NetlinkError::KernelError { errno }) if errno == EBUSY || errno == EALREADY => {
+        Err(NetlinkError::KernelError { errno })
+            if errno == EBUSY || errno == EALREADY || errno == EAGAIN =>
+        {
             // Monitoring already active — CONFIG is rejected while monitoring is
             // running (kernel: "Cannot configure drop monitor during monitoring").
             // This is expected on the second and subsequent scrapes.
-            debug!(errno, "NET_DM_CMD_CONFIG EBUSY/EALREADY — monitoring already active");
+            debug!(errno, "NET_DM_CMD_CONFIG EBUSY/EALREADY/EAGAIN — monitoring already active");
         }
         Err(e) => return Err(e),
     }
@@ -289,8 +300,10 @@ async fn start_monitoring(
     let start_payload = genl_hdr(NET_DM_CMD_START).to_vec();
     match sock.request_single(family_id, 4, &start_payload).await {
         Ok(_) => {}
-        Err(NetlinkError::KernelError { errno }) if errno == EBUSY || errno == EALREADY => {
-            debug!(errno, "NET_DM_CMD_START EBUSY/EALREADY — already monitoring");
+        Err(NetlinkError::KernelError { errno })
+            if errno == EBUSY || errno == EALREADY || errno == EAGAIN =>
+        {
+            debug!(errno, "NET_DM_CMD_START EBUSY/EALREADY/EAGAIN — already monitoring");
         }
         Err(e) => return Err(e),
     }
