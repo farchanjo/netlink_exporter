@@ -1,0 +1,5 @@
+---
+# Per-project spec overrides. Optional - delete if defaults suffice.
+spec_root: docs/arch
+project: nft_exporter
+org: eonf

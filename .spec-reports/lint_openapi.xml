@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="lint_openapi" tests="1" failures="0" skipped="1"><testcase name="openapi" classname="lint_openapi"><skipped message="no OpenAPI documents found" /></testcase></testsuite>
