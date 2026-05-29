@@ -41,6 +41,7 @@ use tracing::{error, info, warn};
 use nlx_config::{CliArgs, ExporterConfig, load_config};
 use nlx_http::{AxumHttpAdapter, HttpAdapterConfig};
 use nlx_metrics::PrometheusRegistryAdapter;
+use nlx_netlink::collectors::drop_monitor::{DropCounters, setup_and_spawn_listener};
 use nlx_ports::driving::{HealthPort, ReadinessPort};
 
 mod scrape;
@@ -89,8 +90,13 @@ fn main() -> Result<()> {
 
 /// Main application logic extracted from `main` for testability.
 async fn run(config: ExporterConfig) -> Result<()> {
+    // --- shared lock-free drop-monitor counters (ADR-0020 hybrid model) ---
+    // Filled by the background NET_DM_GRP_ALERT multicast listener and read by
+    // the drop_monitor collector on every scrape.
+    let drop_counters = Arc::new(DropCounters::default());
+
     // --- build collector registry ---
-    let collector_registry = CollectorRegistry::from_config(&config);
+    let collector_registry = CollectorRegistry::from_config(&config, Arc::clone(&drop_counters));
 
     // --- run startup availability probes ---
     let mut availability: BTreeMap<String, bool> = BTreeMap::new();
@@ -104,6 +110,21 @@ async fn run(config: ExporterConfig) -> Result<()> {
         availability.insert(name, available);
     }
     let availability = Arc::new(availability);
+
+    // --- start the drop_monitor multicast listener (ADR-0026) ---
+    // MUST run BEFORE the capability drop: the privileged setup joins the NET_DM
+    // `events` multicast group, which is GENL_MCAST_CAP_SYS_ADMIN and therefore
+    // needs CAP_SYS_ADMIN (plus CAP_NET_ADMIN for CONFIG/START). The spawned
+    // recv loop itself needs no capabilities. Only started when NET_DM was
+    // available at probe time.
+    if availability.get("drop_monitor").copied().unwrap_or(false) {
+        match setup_and_spawn_listener(Arc::clone(&drop_counters)) {
+            Ok(()) => info!("drop_monitor multicast listener started"),
+            Err(e) => {
+                warn!(error = %e, "drop_monitor listener setup failed; drop totals unavailable");
+            }
+        }
+    }
 
     // --- drop capabilities to CAP_NET_ADMIN only (ADR-0009) ---
     if let Err(e) = drop_caps_to_net_admin() {

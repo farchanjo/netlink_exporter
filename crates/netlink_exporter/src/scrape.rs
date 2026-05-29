@@ -26,8 +26,9 @@ use nlx_config::ExporterConfig;
 use nlx_domain::metric::MetricSample;
 use nlx_netlink::collectors::{
     conntrack::ConntrackCollector, conntrack_expect::ConntrackExpectCollector,
-    devlink::DevlinkCollector, drop_monitor::DropMonitorCollector, ethtool::EthtoolCollector,
-    ipvs::IpvsCollector, nftables::NftablesCollector, rt::RtCollector,
+    devlink::DevlinkCollector,
+    drop_monitor::{DropCounters, DropMonitorCollector},
+    ethtool::EthtoolCollector, ipvs::IpvsCollector, nftables::NftablesCollector, rt::RtCollector,
     rt_extended::RtExtendedCollector, sockdiag::SockDiagCollector, tc::TcCollector,
     wireguard::WireguardCollector, xfrm::XfrmCollector,
 };
@@ -52,8 +53,10 @@ pub struct CollectorRegistry {
 impl CollectorRegistry {
     /// Build the collector set from the configuration's enable flags.
     ///
-    /// Collectors disabled by config are not instantiated.
-    pub fn from_config(config: &ExporterConfig) -> Self {
+    /// Collectors disabled by config are not instantiated. The `drop_monitor`
+    /// collector is wired to the shared [`DropCounters`] populated by the
+    /// background multicast listener (ADR-0020 hybrid model).
+    pub fn from_config(config: &ExporterConfig, drop_counters: Arc<DropCounters>) -> Self {
         let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
 
         macro_rules! push_if_enabled {
@@ -75,7 +78,9 @@ impl CollectorRegistry {
         push_if_enabled!("ipvs", IpvsCollector);
         push_if_enabled!("wireguard", WireguardCollector);
         push_if_enabled!("devlink", DevlinkCollector);
-        push_if_enabled!("drop_monitor", DropMonitorCollector);
+        if config.collector_enabled("drop_monitor") {
+            collectors.push(Box::new(DropMonitorCollector::with_counters(drop_counters)));
+        }
         push_if_enabled!("xfrm", XfrmCollector);
 
         Self {

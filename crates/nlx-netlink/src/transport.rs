@@ -209,7 +209,7 @@ impl NetlinkSocket {
     // -----------------------------------------------------------------------
 
     #[cfg(target_os = "linux")]
-    fn open_raw_fd(nl_family: i32) -> Result<OwnedFd> {
+    pub(crate) fn open_raw_fd(nl_family: i32) -> Result<OwnedFd> {
         use rustix::net::sockopt::set_socket_recv_buffer_size;
         use rustix::net::{
             AddressFamily, Protocol, SocketFlags, SocketType, netlink::SocketAddrNetlink,
@@ -260,7 +260,7 @@ impl NetlinkSocket {
 
     #[cfg(not(target_os = "linux"))]
     #[allow(clippy::unnecessary_wraps, reason = "stub must match Linux return type")]
-    fn open_raw_fd(_nl_family: i32) -> Result<OwnedFd> {
+    pub(crate) fn open_raw_fd(_nl_family: i32) -> Result<OwnedFd> {
         Err(NetlinkError::Open(
             "AF_NETLINK is only available on Linux".into(),
         ))
@@ -542,7 +542,7 @@ impl NetlinkSocket {
 /// is called; the CQE is consumed immediately after — so the contract is
 /// satisfied by construction.  Only one SQE is in flight at a time.
 #[cfg(target_os = "linux")]
-fn uring_send(
+pub(crate) fn uring_send(
     ring: &mut io_uring::IoUring,
     raw_fd: std::os::unix::io::RawFd,
     send_buf: &[u8],
@@ -600,7 +600,7 @@ fn uring_send(
 /// the contract is satisfied by construction.  Single-in-flight: no other SQE
 /// references this buffer.
 #[cfg(target_os = "linux")]
-fn uring_recv(
+pub(crate) fn uring_recv(
     ring: &mut io_uring::IoUring,
     raw_fd: std::os::unix::io::RawFd,
     recv_buf: &mut [u8],
