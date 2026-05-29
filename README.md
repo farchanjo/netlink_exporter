@@ -196,7 +196,7 @@ sequenceDiagram
     JS-->>SL: all ReadModels joined
     SL->>SL: post_process → MetricSnapshot
     SL-->>AXM: MetricSnapshot
-    AXM-->>P: OpenMetrics text\napplication/openmetrics-text; version=1.0.0
+    AXM-->>P: OpenMetrics text<br/>application/openmetrics-text version=1.0.0
 ```
 
 ---

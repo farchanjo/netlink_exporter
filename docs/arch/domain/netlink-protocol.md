@@ -1428,12 +1428,12 @@ sequenceDiagram
     participant U as nft_exporter
     participant K as Linux Kernel
 
-    Note over U,K: Phase 1 — Family resolution (OnceLock; ENOENT = runtime-gated)
+    Note over U,K: Phase 1 — Family resolution (OnceLock, ENOENT = runtime-gated)
     U->>K: nlmsghdr{type=16, flags=NLM_F_REQUEST|NLM_F_ACK}<br/>genlmsghdr{cmd=CTRL_CMD_GETFAMILY=3, version=2}<br/>CTRL_ATTR_FAMILY_NAME="IPVS\0"
-    K-->>U: CTRL_ATTR_FAMILY_ID (u16 LE) -> cached ipvs_family_id
-    Note over U: ENOENT -> available=false; emit nft_scrape_collector_available=0; stop
+    K-->>U: CTRL_ATTR_FAMILY_ID (u16 LE) → cached ipvs_family_id
+    Note over U: ENOENT → available=false, emit nft_scrape_collector_available=0, stop
 
-    Note over U,K: Phase 2 — Info (one unicast; NLM_F_REQUEST|NLM_F_ACK)
+    Note over U,K: Phase 2 — Info (one unicast, NLM_F_REQUEST|NLM_F_ACK)
     U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0005}<br/>genlmsghdr{cmd=IPVS_CMD_GET_INFO=15, version=1}
     K-->>U: IPVS_INFO_ATTR_CONN_TAB_SIZE u32
 
@@ -1589,10 +1589,10 @@ sequenceDiagram
     participant U as nft_exporter
     participant K as Linux Kernel
 
-    Note over U,K: Phase 1 — Family resolution (once per process, OnceLock<Option<u16>>)
+    Note over U,K: Phase 1 — Family resolution (once per process, OnceLock Option u16)
     U->>K: nlmsghdr{type=16, flags=NLM_F_REQUEST|NLM_F_ACK}<br/>genlmsghdr{cmd=CTRL_CMD_GETFAMILY=3, version=2}<br/>CTRL_ATTR_FAMILY_NAME="wireguard\0"
-    K-->>U: CTRL_ATTR_FAMILY_ID u16 LE -> cached as Some(family_id)
-    Note over U,K: ENOENT -> cache None; emit available=0; skip phases 2-3 on every scrape
+    K-->>U: CTRL_ATTR_FAMILY_ID u16 LE → cached as Some(family_id)
+    Note over U,K: ENOENT → cache None, emit available=0, skip phases 2-3 on every scrape
 
     Note over U,K: Phase 2 — Device dump (NLM_F_DUMP, one reply per WireGuard interface)
     U->>K: nlmsghdr{type=family_id, flags=NLM_F_REQUEST|NLM_F_DUMP}<br/>genlmsghdr{cmd=WG_CMD_GET_DEVICE=0, version=1, reserved=0}<br/>(no body attributes — dump all interfaces)
