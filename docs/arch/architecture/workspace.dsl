@@ -1,5 +1,16 @@
 workspace "nft_exporter" "C4 architecture model for nft_exporter — a Rust 2024-edition static-musl Linux netlink Prometheus exporter." {
 
+    # DRIFT NOTE (2026-05-29): this C4 model predates the ADR-0023 runtime rewrite
+    # and is materially out of sync with the implementation. Known divergences to
+    # fix in a dedicated refresh: runtime is monoio + io_uring (NOT tokio/JoinSet);
+    # HTTP is a hand-rolled monoio HTTP/1 server (NOT axum); netlink uses the
+    # direct wire protocol with NO high-level crates (rustables/rtnetlink/ethtool/
+    # netlink-packet-* are gone); config env prefix is NLX_ (NOT NFT_EXPORTER_);
+    # there are 13 native collectors + 8 opt-in procfs/sysfs collectors (nlx-procfs,
+    # ADR-0027: softnet, netstat, softirq, irq, sockstat, nic_bql, nic_pcie,
+    # nic_temp) — NOT "six". The authoritative, in-sync artifacts are the ADRs and
+    # docs/arch/schemas/metric_contract.cue (cue-vet clean).
+
     model {
 
         # ── External actors ─────────────────────────────────────────────────

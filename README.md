@@ -230,6 +230,26 @@ Runtime-gated collectors emit `nft_scrape_collector_available{collector}=0` when
 their kernel subsystem is absent and return `HTTP 200` without error, so `nft_up`
 is unaffected by missing optional modules (ADR-0015).
 
+### procfs/sysfs collectors — opt-in (ADR-0027)
+
+These cover Linux network signals that have **no netlink API** (stack pressure,
+IP/TCP MIB, IRQ accounting, NIC hardware health). They are the only readers of
+`/proc` and `/sys`, isolated in the `nlx-procfs` crate behind a fixed path
+allowlist, and ship **disabled by default** — enable per collector in config
+(`[collectors] softnet = true`, …). Everything else stays native-API-only
+(ADR-0025).
+
+| Collector | Source | Key metrics | Default |
+|---|---|---|:---:|
+| `softnet` | `/proc/net/softnet_stat` | `nft_softnet_dropped_total{cpu}`, `nft_softnet_time_squeeze_total{cpu}`, `nft_softnet_backlog_length{cpu}` | off |
+| `netstat` | `/proc/net/snmp` + `/proc/net/netstat` | `nft_netstat{protocol,field}` (TCP/IP/UDP/ICMP MIB: RetransSegs, ListenDrops, …) | off |
+| `softirq` | `/proc/softirqs` | `nft_softirq_total{cpu,kind}` (`net_rx`/`net_tx`) | off |
+| `irq` | `/proc/interrupts` | `nft_irq_total{irq,device}` (per-IRQ, summed across CPUs) | off |
+| `sockstat` | `/proc/net/sockstat` | `nft_sockstat{protocol,key}` (TCP mem pages, orphans, tw) | off |
+| `nic_bql` | sysfs `byte_queue_limits` | `nft_nic_bql_limit_bytes{device}`, `nft_nic_bql_inflight_bytes{device}` | off |
+| `nic_pcie` | sysfs `device/{current_link_*,aer_dev_*}` | `nft_nic_pcie_link_speed_gts{device}`, `nft_nic_pcie_aer_correctable_total{device,kind}` (PFs only; VFs skipped) | off |
+| `nic_temp` | sysfs `device/hwmon/*/temp*_input` | `nft_nic_temperature_celsius{device,sensor}` | off |
+
 ---
 
 ## Metrics sample — nftables counters

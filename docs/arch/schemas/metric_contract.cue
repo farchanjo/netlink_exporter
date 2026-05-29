@@ -45,7 +45,7 @@ package schemas
 // Every entry in the metric_contract list below conforms to this schema.
 #MetricDescriptor: {
 	// context is the bounded-context slug that owns this metric.
-	context: "rtnetlink" | "traffic-control" | "conntrack" | "nftables" | "sock-diag" | "ethtool" | "self" | "xfrm-ipsec" | "ipvs" | "wireguard" | "devlink" | "drop-monitor" | "rtnetlink-extended"
+	context: "rtnetlink" | "traffic-control" | "conntrack" | "nftables" | "sock-diag" | "ethtool" | "self" | "xfrm-ipsec" | "ipvs" | "wireguard" | "devlink" | "drop-monitor" | "rtnetlink-extended" | "softnet" | "netstat" | "softirq" | "irq" | "sockstat" | "nic-bql" | "nic-pcie" | "nic-temp"
 
 	// metric is the full Prometheus metric name (nft_ prefix enforced).
 	metric: #MetricName
@@ -224,6 +224,40 @@ metric_contract: #MetricContract & [
 	{context: "conntrack", metric: "nft_conntrack_expectation_new_total", type: "counter", unit: "none", labels: [], cardinality_bound: "1", help: "Total conntrack expectations created across all CPUs. Sourced from nf_ct_exp_stat.new field (offset 0, u32 native-endian) summed across all IPCTNL_MSG_EXP_GET_STATS_CPU reply frames (nlmsg_type=0x0203). Zero when subsystem unavailable."},
 	{context: "conntrack", metric: "nft_conntrack_expectation_delete_total", type: "counter", unit: "none", labels: [], cardinality_bound: "1", help: "Total conntrack expectations deleted across all CPUs. Sourced from nf_ct_exp_stat.delete field (offset 4, u32 native-endian) summed via IPCTNL_MSG_EXP_GET_STATS_CPU. Zero when subsystem unavailable."},
 	{context: "conntrack", metric: "nft_conntrack_expectation_new_failed_total", type: "counter", unit: "none", labels: [], cardinality_bound: "1", help: "Total conntrack expectation allocation failures across all CPUs. Sourced from nf_ct_exp_stat.new_failed field (offset 8, u32 native-endian) summed via IPCTNL_MSG_EXP_GET_STATS_CPU. Zero when subsystem unavailable."},
+
+	// --- softnet context (ADR-0027: /proc/net/softnet_stat; opt-in, default off) ---
+	{context: "softnet", metric: "nft_softnet_processed_total", type: "counter", unit: "packets", labels: ["cpu"], cardinality_bound: "~|CPUs| (one per online CPU)", help: "Packets processed in the per-CPU softirq receive path (softnet_stat column 0)."},
+	{context: "softnet", metric: "nft_softnet_dropped_total", type: "counter", unit: "packets", labels: ["cpu"], cardinality_bound: "~|CPUs|", help: "Packets dropped because the per-CPU backlog queue was full (softnet_stat column 1)."},
+	{context: "softnet", metric: "nft_softnet_time_squeeze_total", type: "counter", unit: "none", labels: ["cpu"], cardinality_bound: "~|CPUs|", help: "Times the NAPI poll loop ran out of budget/time with work remaining (softnet_stat column 2)."},
+	{context: "softnet", metric: "nft_softnet_received_rps_total", type: "counter", unit: "packets", labels: ["cpu"], cardinality_bound: "~|CPUs|", help: "Times this CPU was woken to process packets steered via RPS (softnet_stat column 9)."},
+	{context: "softnet", metric: "nft_softnet_flow_limit_count_total", type: "counter", unit: "none", labels: ["cpu"], cardinality_bound: "~|CPUs|", help: "Packets dropped by the flow-limit mechanism (softnet_stat column 10; CONFIG_NET_FLOW_LIMIT)."},
+	{context: "softnet", metric: "nft_softnet_backlog_length", type: "gauge", unit: "none", labels: ["cpu"], cardinality_bound: "~|CPUs|", help: "Current per-CPU backlog queue length (softnet_stat column 11; input + process queues)."},
+
+	// --- netstat context (ADR-0027: /proc/net/snmp + /proc/net/netstat; opt-in) ---
+	{context: "netstat", metric: "nft_netstat", type: "gauge", unit: "none", labels: ["protocol", "field"], cardinality_bound: "~150 fixed by the kernel MIB definitions (Ip/Icmp/Tcp/Udp/UdpLite + TcpExt/IpExt + optional MPTcpExt)", help: "Linux IP/TCP/UDP/ICMP MIB counter value from /proc/net/snmp and /proc/net/netstat. protocol is the MIB block (Tcp, TcpExt, IpExt, ...); field is the counter name (e.g. RetransSegs, ListenDrops). Gauge to faithfully carry signed values like Tcp MaxConn=-1."},
+
+	// --- softirq context (ADR-0027: /proc/softirqs; opt-in) ---
+	{context: "softirq", metric: "nft_softirq_total", type: "counter", unit: "none", labels: ["cpu", "kind"], cardinality_bound: "~2 x |CPUs| (kind in net_rx, net_tx)", help: "Network softirq invocations per CPU (NET_RX/NET_TX rows of /proc/softirqs). kind is net_rx or net_tx."},
+
+	// --- irq context (ADR-0027: /proc/interrupts; opt-in) ---
+	{context: "irq", metric: "nft_irq_total", type: "counter", unit: "none", labels: ["irq", "device"], cardinality_bound: "~|hardware IRQs| (numeric IRQ rows only; per-CPU counts summed into one series per IRQ — never per-CPU per-IRQ). Hundreds on multi-NIC SR-IOV hosts.", help: "Total hardware interrupts delivered for an IRQ, summed across all CPUs (/proc/interrupts). device is the controller/driver description; symbolic arch counters (NMI, LOC, ...) are excluded."},
+
+	// --- sockstat context (ADR-0027: /proc/net/sockstat; opt-in) ---
+	{context: "sockstat", metric: "nft_sockstat", type: "gauge", unit: "none", labels: ["protocol", "key"], cardinality_bound: "~12 fixed (sockets/used, tcp/{inuse,orphan,tw,alloc,mem}, udp/{inuse,mem}, ...)", help: "Socket subsystem usage from /proc/net/sockstat. protocol is the block (sockets, tcp, udp, frag, ...); key is the field (inuse, orphan, tw, mem, ...). Note: tcp/mem is in memory pages, not bytes."},
+
+	// --- nic-bql context (ADR-0027: sysfs byte_queue_limits; opt-in) ---
+	{context: "nic-bql", metric: "nft_nic_bql_limit_bytes", type: "gauge", unit: "bytes", labels: ["device"], cardinality_bound: "~|devices| (summed across the device's tx queues)", help: "Sum of the per-TX-queue Byte Queue Limits (BQL) ceiling across a device's queues (sysfs queues/tx-*/byte_queue_limits/limit)."},
+	{context: "nic-bql", metric: "nft_nic_bql_inflight_bytes", type: "gauge", unit: "bytes", labels: ["device"], cardinality_bound: "~|devices|", help: "Sum of bytes currently queued to the device across its TX queues (sysfs queues/tx-*/byte_queue_limits/inflight)."},
+
+	// --- nic-pcie context (ADR-0027: sysfs PCIe link + AER; physical functions only) ---
+	{context: "nic-pcie", metric: "nft_nic_pcie_link_speed_gts", type: "gauge", unit: "none", labels: ["device"], cardinality_bound: "~|physical-function NICs| (SR-IOV VFs skipped via device/physfn)", help: "PCIe current link speed in GT/s (sysfs device/current_link_speed). Detects link down-train."},
+	{context: "nic-pcie", metric: "nft_nic_pcie_link_width", type: "gauge", unit: "none", labels: ["device"], cardinality_bound: "~|physical-function NICs|", help: "PCIe current link width in lanes (sysfs device/current_link_width)."},
+	{context: "nic-pcie", metric: "nft_nic_pcie_aer_correctable_total", type: "counter", unit: "none", labels: ["device", "kind"], cardinality_bound: "~|PFs| x ~8 AER bit kinds; VFs skipped", help: "PCIe AER correctable error event count per bit (sysfs device/aer_dev_correctable). kind is the lowercased error bit (rxerr, badtlp, ...); the TOTAL_* summary line is skipped."},
+	{context: "nic-pcie", metric: "nft_nic_pcie_aer_fatal_total", type: "counter", unit: "none", labels: ["device", "kind"], cardinality_bound: "~|PFs| x AER bit kinds; VFs skipped", help: "PCIe AER fatal uncorrectable error event count per bit (sysfs device/aer_dev_fatal)."},
+	{context: "nic-pcie", metric: "nft_nic_pcie_aer_nonfatal_total", type: "counter", unit: "none", labels: ["device", "kind"], cardinality_bound: "~|PFs| x AER bit kinds; VFs skipped", help: "PCIe AER non-fatal uncorrectable error event count per bit (sysfs device/aer_dev_nonfatal)."},
+
+	// --- nic-temp context (ADR-0027: sysfs hwmon; opt-in) ---
+	{context: "nic-temp", metric: "nft_nic_temperature_celsius", type: "gauge", unit: "none", labels: ["device", "sensor"], cardinality_bound: "~|NICs| x sensors per NIC", help: "NIC hardware temperature in degrees Celsius (sysfs device/hwmon/hwmon*/temp*_input, millidegrees / 1000). sensor combines the hwmon chip name and temp index."},
 ]
 
 // ---------------------------------------------------------------------------
