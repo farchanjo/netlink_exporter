@@ -43,6 +43,27 @@ pub struct CollectorFlags {
     /// Enable the `softnet` collector (`/proc/net/softnet_stat`; per-CPU softirq
     /// backlog drops + `time_squeeze`). Reads procfs — **default off** (ADR-0027).
     pub softnet: bool,
+    /// Enable the `netstat` collector (`/proc/net/snmp` + `/proc/net/netstat`;
+    /// IP/TCP/UDP/ICMP MIB). Reads procfs — **default off** (ADR-0027).
+    pub netstat: bool,
+    /// Enable the `softirq` collector (`/proc/softirqs`; per-CPU `NET_RX`/`NET_TX`).
+    /// Reads procfs — **default off** (ADR-0027).
+    pub softirq: bool,
+    /// Enable the `irq` collector (`/proc/interrupts`; per-IRQ counts summed
+    /// across CPUs). Reads procfs — **default off** (ADR-0027).
+    pub irq: bool,
+    /// Enable the `sockstat` collector (`/proc/net/sockstat`; socket memory /
+    /// orphans). Reads procfs — **default off** (ADR-0027).
+    pub sockstat: bool,
+    /// Enable the `nic_bql` collector (sysfs byte-queue-limits per device).
+    /// Reads sysfs — **default off** (ADR-0027).
+    pub nic_bql: bool,
+    /// Enable the `nic_pcie` collector (sysfs `PCIe` link speed/width + AER errors).
+    /// Reads sysfs — **default off** (ADR-0027).
+    pub nic_pcie: bool,
+    /// Enable the `nic_temp` collector (sysfs hwmon NIC temperature).
+    /// Reads sysfs — **default off** (ADR-0027).
+    pub nic_temp: bool,
 }
 
 impl Default for CollectorFlags {
@@ -74,6 +95,13 @@ impl Default for CollectorFlags {
             // ADR-0027: procfs/sysfs collectors are opt-in — default off so the
             // exporter stays native-API-only unless the operator relaxes it.
             softnet: false,
+            netstat: false,
+            softirq: false,
+            irq: false,
+            sockstat: false,
+            nic_bql: false,
+            nic_pcie: false,
+            nic_temp: false,
         }
     }
 }
@@ -119,10 +147,18 @@ mod tests {
     #[test]
     fn procfs_collectors_default_to_false() {
         let flags = CollectorFlags::default();
-        assert!(
-            !flags.softnet,
-            "softnet (procfs) must default to false (opt-in)"
-        );
+        for (name, on) in [
+            ("softnet", flags.softnet),
+            ("netstat", flags.netstat),
+            ("softirq", flags.softirq),
+            ("irq", flags.irq),
+            ("sockstat", flags.sockstat),
+            ("nic_bql", flags.nic_bql),
+            ("nic_pcie", flags.nic_pcie),
+            ("nic_temp", flags.nic_temp),
+        ] {
+            assert!(!on, "{name} (procfs/sysfs) must default to false (opt-in)");
+        }
     }
 }
 
@@ -199,6 +235,13 @@ impl nlx_ports::driven::ConfigPort for ExporterConfig {
             "drop_monitor" => self.collectors.drop_monitor,
             "xfrm" => self.collectors.xfrm,
             "softnet" => self.collectors.softnet,
+            "netstat" => self.collectors.netstat,
+            "softirq" => self.collectors.softirq,
+            "irq" => self.collectors.irq,
+            "sockstat" => self.collectors.sockstat,
+            "nic_bql" => self.collectors.nic_bql,
+            "nic_pcie" => self.collectors.nic_pcie,
+            "nic_temp" => self.collectors.nic_temp,
             _ => false,
         }
     }

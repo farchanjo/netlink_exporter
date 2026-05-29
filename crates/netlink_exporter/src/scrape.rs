@@ -46,7 +46,11 @@ use nlx_ports::{
     driving::ScrapeTriggerPort,
     error::CollectError,
 };
-use nlx_procfs::softnet::SoftnetCollector;
+use nlx_procfs::{
+    irq::IrqCollector, netstat::NetstatCollector, nic_bql::NicBqlCollector,
+    nic_pcie::NicPcieCollector, nic_temp::NicTempCollector, sockstat::SockstatCollector,
+    softirq::SoftirqCollector, softnet::SoftnetCollector,
+};
 use tracing::error;
 
 // ---------------------------------------------------------------------------
@@ -97,6 +101,13 @@ impl CollectorRegistry {
 
         // procfs/sysfs collectors (ADR-0027) — opt-in, default off.
         push_if_enabled!("softnet", SoftnetCollector);
+        push_if_enabled!("netstat", NetstatCollector);
+        push_if_enabled!("softirq", SoftirqCollector);
+        push_if_enabled!("irq", IrqCollector);
+        push_if_enabled!("sockstat", SockstatCollector);
+        push_if_enabled!("nic_bql", NicBqlCollector);
+        push_if_enabled!("nic_pcie", NicPcieCollector);
+        push_if_enabled!("nic_temp", NicTempCollector);
 
         Self {
             inner: Arc::new(collectors),
