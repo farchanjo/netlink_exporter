@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain (stable >= 1.87)
         uses: dtolnay/rust-toolchain@stable
@@ -56,7 +56,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.linker }}
 
       - name: Cache Cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -110,7 +110,7 @@ jobs:
           cat nft_exporter-${{ matrix.artifact_suffix }}.sha256
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nft_exporter-${{ matrix.artifact_suffix }}
           path: |
@@ -136,16 +136,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download x86_64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nft_exporter-x86_64
           path: dist/linux/amd64
 
       - name: Download aarch64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: nft_exporter-aarch64
           path: dist/linux/arm64
@@ -157,13 +157,13 @@ jobs:
           chmod +x dist/linux/amd64/nft_exporter dist/linux/arm64/nft_exporter
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.IMAGE_REGISTRY }}
           username: ${{ github.actor }}
@@ -171,7 +171,7 @@ jobs:
 
       - name: Extract Docker metadata (tags and labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -183,7 +183,7 @@ jobs:
 
       - name: Build and push multi-arch container image
         id: build-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -240,9 +240,9 @@ jobs:
       # DSC-003: trivy-action pinned to commit SHA instead of @master.
       # TODO: replace the placeholder SHA below with the verified commit SHA for the
       # desired release of aquasecurity/trivy-action (https://github.com/aquasecurity/trivy-action/releases).
-      # Example: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37
+      # Example: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37  # TODO: verify SHA for trivy-action v0.31.0+
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # TODO: verify SHA for trivy-action v0.31.0+
         with:
           image-ref: >-
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-push-container.outputs.image_digest }}
@@ -254,7 +254,7 @@ jobs:
 
       - name: Upload Trivy SARIF report to GitHub Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
 
@@ -273,12 +273,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: nft_exporter-*
           path: release-assets
@@ -318,7 +318,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           body: ${{ steps.release-notes.outputs.notes }}
