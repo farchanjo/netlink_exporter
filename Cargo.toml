@@ -113,4 +113,8 @@ arithmetic_side_effects = "warn"
 # This does NOT affect test or dev profiles (SEC-PRIV-001, ADR-0009).
 # ---------------------------------------------------------------------------
 [profile.release]
-panic = "abort"
+opt-level     = 3          # full speed optimization (netlink parse/encode hot path)
+lto           = "fat"      # cross-crate link-time optimization
+codegen-units = 1          # maximize optimization (slower build, faster/smaller binary)
+strip         = "symbols"  # strip symbols from the shipped binary
+panic         = "abort"    # SEC-PRIV-001 / ADR-0009: abort on unrecoverable panic
