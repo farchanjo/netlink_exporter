@@ -28,3 +28,6 @@ Cargo.lock.orig
 # Local env
 .env
 .env.local
+
+# local /metrics capture artifact (verification only)
+.metrics_capture.txt
