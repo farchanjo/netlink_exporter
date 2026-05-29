@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nlx-domain",
+    "crates/nlx-ports",
+    "crates/nlx-netlink",
+    "crates/nlx-metrics",
+    "crates/nlx-http",
+    "crates/nlx-config",
+    "crates/netlink_exporter",
+]
+
+# ADR-0003: edition 2024, MSRV 1.87
+[workspace.package]
+edition = "2024"
+rust-version = "1.87"
+authors = ["eonf"]
+license = "MIT OR Apache-2.0"
+
+# ---------------------------------------------------------------------------
+# Shared dependency table — all workspace crates reference these via
+# `{ workspace = true }` to keep version pins in one place.
+# ADR-0011: direct wire protocol stack (rustix, linux-raw-sys, zerocopy,
+#           bytemuck, byteorder).
+# ADR-0014: tokio 1.52 + mio 1.0 confined to driven adapters only.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# --- wire protocol (ADR-0011) ---
+rustix          = { version = "1.1", features = ["net", "process"] }
+linux-raw-sys   = { version = "0.12", features = ["general", "net", "netlink"] }
+zerocopy        = { version = "0.8", features = ["derive"] }
+bytemuck        = { version = "1.25", features = ["derive"] }
+byteorder       = { version = "1.5" }
+
+# --- async runtime (ADR-0014 — DRIVEN ADAPTERS + BINARY ONLY) ---
+tokio           = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "signal"] }
+mio             = { version = "1.0", features = ["os-poll", "os-ext"] }
+
+# --- HTTP exposition (ADR-0010) ---
+axum            = { version = "0.8" }
+tower           = { version = "0.5" }
+
+# --- metrics (ADR-0006) ---
+prometheus-client = { version = "0.24" }
+
+# --- privilege (ADR-0009) ---
+caps            = { version = "0.5" }
+
+# --- configuration (ADR-0013/0015) ---
+figment         = { version = "0.10", features = ["toml", "env"] }
+clap            = { version = "4", features = ["derive", "env"] }
+
+# --- serialisation ---
+serde           = { version = "1", features = ["derive"] }
+
+# --- error handling ---
+thiserror       = { version = "2" }
+anyhow          = { version = "1" }
+
+# --- tracing ---
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- parsing ---
+regex           = { version = "1.11" }
+toml            = { version = "0.8" }
+
+# --- workspace-internal ---
+nlx-domain      = { path = "crates/nlx-domain" }
+nlx-ports       = { path = "crates/nlx-ports" }
+nlx-netlink     = { path = "crates/nlx-netlink" }
+nlx-metrics     = { path = "crates/nlx-metrics" }
+nlx-http        = { path = "crates/nlx-http" }
+nlx-config      = { path = "crates/nlx-config" }
+
+# ---------------------------------------------------------------------------
+# Shared lint baseline — Layer A (rustc), B (clippy pedantic), C (deny list)
+# All workspace members inherit via `[lints] workspace = true`.
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code            = "warn"   # warn; every block requires a SAFETY comment
+missing_docs           = "warn"
+unused_must_use        = "deny"
+future_incompatible    = { level = "deny", priority = -1 }
+nonstandard_style      = { level = "deny", priority = -1 }
+rust_2018_idioms       = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+pedantic               = { level = "warn", priority = -1 }
+# Layer B — promote critical pedantic subsets to deny
+missing_errors_doc     = "deny"
+missing_panics_doc     = "deny"
+# Layer C — blanket deny
+unwrap_used            = "deny"
+expect_used            = "deny"
+panic                  = "deny"
+indexing_slicing       = "warn"
+arithmetic_side_effects = "warn"

@@ -1,0 +1,78 @@
+//! Scrape lifecycle state machine.
+//!
+//! Encodes the allowed transitions for a single Prometheus scrape:
+//! `Idle → Running → Done | Failed`.  The state machine is domain-pure;
+//! it carries no runtime handles or timers.
+
+use std::time::Instant;
+
+/// Current state of one scrape attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrapeLifecycle {
+    /// No scrape in progress.
+    Idle,
+    /// A scrape is currently running; `started_at` records the wall-clock
+    /// instant for timeout enforcement.
+    Running {
+        /// Wall-clock instant when this scrape started.
+        started_at: Instant,
+    },
+    /// Scrape completed successfully.
+    Done {
+        /// Duration of the scrape.
+        duration_secs: f64,
+    },
+    /// Scrape failed; a stale snapshot is being served.
+    Failed {
+        /// Human-readable failure reason.
+        reason: String,
+    },
+}
+
+impl ScrapeLifecycle {
+    /// Returns `true` if no scrape is in progress.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    /// Returns `true` if a scrape is currently running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+
+    /// Transition to `Running`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current state is not `Idle`.
+    #[must_use]
+    pub fn start(self) -> Self {
+        assert!(self.is_idle(), "can only start from Idle state");
+        Self::Running {
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Transition to `Done` by computing elapsed duration from `started_at`.
+    ///
+    /// Returns `self` unchanged if the current state is not `Running`.
+    #[must_use]
+    pub fn complete(self) -> Self {
+        match self {
+            Self::Running { started_at } => Self::Done {
+                duration_secs: started_at.elapsed().as_secs_f64(),
+            },
+            other => other,
+        }
+    }
+
+    /// Transition to `Failed`.
+    #[must_use]
+    pub fn fail(self, reason: impl Into<String>) -> Self {
+        Self::Failed {
+            reason: reason.into(),
+        }
+    }
+}

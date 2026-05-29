@@ -1,0 +1,26 @@
+[package]
+name        = "nlx-netlink"
+version     = "0.1.0"
+edition.workspace    = true
+rust-version.workspace = true
+authors.workspace    = true
+license.workspace    = true
+description = "Driven infrastructure adapters: AF_NETLINK socket transport + per-subsystem collectors (ADR-0011, ADR-0014)."
+
+# ADR-0014: tokio + mio are CONFINED to this crate and the binary composition
+# root.  They MUST NOT appear in nlx-domain or nlx-ports.
+[dependencies]
+nlx-domain   = { workspace = true }
+nlx-ports    = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "net", "time", "macros", "sync", "io-util"] }
+mio          = { workspace = true }
+rustix       = { workspace = true }
+linux-raw-sys = { workspace = true }
+zerocopy     = { workspace = true }
+bytemuck     = { workspace = true }
+byteorder    = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+
+[lints]
+workspace = true

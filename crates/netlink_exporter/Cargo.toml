@@ -1,0 +1,29 @@
+[package]
+name        = "netlink_exporter"
+version     = "0.1.0"
+edition.workspace    = true
+rust-version.workspace = true
+authors.workspace    = true
+license.workspace    = true
+description = "Composition root binary: wires all adapters, drops Linux capabilities to CAP_NET_ADMIN, and runs the HTTP server."
+
+[[bin]]
+name = "netlink_exporter"
+path = "src/main.rs"
+
+[dependencies]
+nlx-domain   = { workspace = true }
+nlx-ports    = { workspace = true }
+nlx-netlink  = { workspace = true }
+nlx-metrics  = { workspace = true }
+nlx-http     = { workspace = true }
+nlx-config   = { workspace = true }
+tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+anyhow       = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+caps         = { workspace = true }
+clap         = { workspace = true }
+
+[lints]
+workspace = true

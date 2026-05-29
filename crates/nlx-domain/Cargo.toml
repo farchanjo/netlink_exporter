@@ -1,0 +1,22 @@
+[package]
+name        = "nlx-domain"
+version     = "0.1.0"
+edition.workspace    = true
+rust-version.workspace = true
+authors.workspace    = true
+license.workspace    = true
+description = "Pure domain model: ReadModels, value objects, ScrapeLifecycle, MetricSample. No runtime or infrastructure deps (ADR-0002, ADR-0014)."
+
+[dependencies]
+# Only stdlib-tier dependencies; zero infra crates.
+# thiserror for domain error types; serde for value-object serialisation in
+# tests only (no runtime dependency on any serde registry).
+thiserror = { workspace = true }
+serde     = { workspace = true }
+
+# NOTE: tokio, mio, rustix, axum, prometheus-client are FORBIDDEN in this
+# crate (ADR-0002, ADR-0014). The hexagonal.rego policy and cargo deny enforce
+# this at CI time.
+
+[lints]
+workspace = true

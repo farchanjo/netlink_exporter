@@ -1,0 +1,18 @@
+[package]
+name        = "nlx-ports"
+version     = "0.1.0"
+edition.workspace    = true
+rust-version.workspace = true
+authors.workspace    = true
+license.workspace    = true
+description = "Hexagonal port traits (driving + driven). No infra deps — domain-core only (ADR-0002, ADR-0014)."
+
+# HEXAGONAL INVARIANT (hexagonal.rego): this crate MUST NOT depend on tokio,
+# mio, axum, prometheus-client, rustix, linux-raw-sys, zerocopy, bytemuck,
+# byteorder, clap, figment, or serde_json.
+[dependencies]
+nlx-domain = { workspace = true }
+thiserror  = { workspace = true }
+
+[lints]
+workspace = true
