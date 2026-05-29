@@ -18,6 +18,27 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Job 0: Architecture invariants — lock-free (ADR-0023) + native-API (ADR-0025)
+  # ---------------------------------------------------------------------------
+  invariants:
+    name: Architecture invariants (lock-free + native-API)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No Mutex/RwLock — ADR-0023 lock-free invariant
+        run: |
+          if grep -rnE 'std::sync::(Mutex|RwLock)|parking_lot::' crates --include='*.rs'; then
+            echo "::error::lock found — ADR-0023 requires lock-free (arc-swap + atomics)"; exit 1
+          fi
+          echo "ok: no Mutex/RwLock"
+      - name: No /proc or /sys reads — ADR-0025 native-API-only
+        run: |
+          if grep -rnE '"/(proc|sys)/' crates --include='*.rs'; then
+            echo "::error::/proc or /sys string literal in exporter code — ADR-0025 native-API-only"; exit 1
+          fi
+          echo "ok: no procfs/sysfs reads"
+
+  # ---------------------------------------------------------------------------
   # Job 1: Spec validation (CUE vet + Gherkin syntax + full fast lane)
   # ---------------------------------------------------------------------------
   spec-validate:
