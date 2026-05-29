@@ -166,7 +166,16 @@ fn escape_help(s: &str) -> String {
     out
 }
 
-/// Escape a label value: `\` → `\\`, `"` → `\"`, newline → `\n`.
+/// Escape a label value per the `OpenMetrics` text-format spec.
+///
+/// Defined escapes: `\` → `\\`, `"` → `\"`, newline → `\n`.
+///
+/// Non-printable ASCII control characters below `U+0020` (other than the
+/// newline `U+000A` which receives its own escape above) are **stripped**.
+/// The OpenMetrics/Prometheus text format defines no escape sequence for
+/// arbitrary control bytes; including them unescaped causes spec-violating
+/// output that parsers may reject or misinterpret.  Stripping is the safe
+/// conforming choice (SEC-INFO-002).
 fn escape_label_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -174,6 +183,8 @@ fn escape_label_value(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            // Strip non-printable ASCII controls (U+0000–U+001F excluding \n).
+            c if (c as u32) < 0x20 => {}
             other => out.push(other),
         }
     }
@@ -230,13 +241,20 @@ fn write_f64(out: &mut String, v: f64) -> Result<(), std::fmt::Error> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    reason = "test code; panics on unexpected failure are intentional"
-)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        reason = "test code; panics on unexpected failure are intentional"
+    )]
+
     use super::*;
     use std::collections::BTreeMap;
+
+    // -----------------------------------------------------------------------
+    // Existing regression tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn round_trip_gauge_and_counter() {
@@ -277,5 +295,227 @@ mod tests {
     fn escape_label_value_special_chars() {
         assert_eq!(escape_label_value(r#"a\"b"#), r#"a\\\"b"#);
         assert_eq!(escape_label_value("a\nb"), r"a\nb");
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-013: encode_samples edge cases
+    // -----------------------------------------------------------------------
+
+    /// Empty label map must produce a bare `name value` line with no `{…}`.
+    #[test]
+    fn encode_samples_empty_labels() {
+        let samples = vec![MetricSample::gauge(
+            "nft_up",
+            "Exporter up.",
+            BTreeMap::new(),
+            1.0,
+        )];
+        let text = encode_samples(&samples).expect("encode ok");
+        // Must NOT contain braces for empty label set.
+        assert!(
+            !text.contains('{'),
+            "empty label set must not emit braces: {text}"
+        );
+        assert!(
+            text.contains("nft_up 1"),
+            "bare sample line missing: {text}"
+        );
+    }
+
+    /// Label value containing a double-quote must be `\"` in the output.
+    #[test]
+    fn encode_samples_label_value_quote_escape() {
+        let mut labels = BTreeMap::new();
+        labels.insert("iface".to_owned(), r#"eth"0"#.to_owned());
+        let samples = vec![MetricSample::gauge("nft_rx", "RX bytes.", labels, 0.0)];
+        let text = encode_samples(&samples).expect("encode ok");
+        assert!(
+            text.contains(r#"iface="eth\"0""#),
+            "quote not escaped in output: {text}"
+        );
+    }
+
+    /// Label value containing a backslash must be `\\` in the output.
+    #[test]
+    fn encode_samples_label_value_backslash_escape() {
+        let mut labels = BTreeMap::new();
+        labels.insert("path".to_owned(), r"a\b".to_owned());
+        let samples = vec![MetricSample::gauge("nft_rx", "RX bytes.", labels, 0.0)];
+        let text = encode_samples(&samples).expect("encode ok");
+        assert!(
+            text.contains(r#"path="a\\b""#),
+            "backslash not escaped in output: {text}"
+        );
+    }
+
+    /// Label value containing a newline must be `\n` (literal two chars) in
+    /// the output — a raw newline inside a label value would break parsers.
+    #[test]
+    fn encode_samples_label_value_newline_escape() {
+        let mut labels = BTreeMap::new();
+        labels.insert("desc".to_owned(), "line1\nline2".to_owned());
+        let samples = vec![MetricSample::gauge("nft_rx", "RX bytes.", labels, 0.0)];
+        let text = encode_samples(&samples).expect("encode ok");
+        assert!(
+            text.contains(r#"desc="line1\nline2""#),
+            "newline not escaped in output: {text}"
+        );
+    }
+
+    /// Label value containing ASCII control chars (< 0x20, excluding \n)
+    /// must be stripped — SEC-INFO-002.
+    #[test]
+    fn encode_samples_label_value_control_chars_stripped() {
+        // NUL (0x00), BEL (0x07), TAB (0x09) embedded.
+        let value = "a\x00b\x07c\x09d".to_owned();
+        let mut labels = BTreeMap::new();
+        labels.insert("v".to_owned(), value);
+        let samples = vec![MetricSample::gauge("nft_rx", "RX bytes.", labels, 0.0)];
+        let text = encode_samples(&samples).expect("encode ok");
+        // Control chars must not appear in the output (newlines are structural).
+        assert!(
+            !text.chars().any(|c| (c as u32) < 0x20 && c != '\n'),
+            "control char leaked into output: {text:?}"
+        );
+        // The printable characters must survive.
+        assert!(
+            text.contains(r#"v="abcd""#),
+            "printable chars not preserved: {text}"
+        );
+    }
+
+    /// A counter metric name must appear with `_total` suffix in the sample
+    /// line when the name already carries it (no double-suffix).
+    #[test]
+    fn encode_samples_counter_total_suffix_present() {
+        let samples = vec![MetricSample::counter(
+            "nft_scrape_errors_total",
+            "Total errors.",
+            BTreeMap::new(),
+            42,
+        )];
+        let text = encode_samples(&samples).expect("encode ok");
+        // Exactly one occurrence of the name in the sample line.
+        let sample_line = text
+            .lines()
+            .find(|l| !l.starts_with('#'))
+            .expect("sample line present");
+        assert!(
+            sample_line.starts_with("nft_scrape_errors_total "),
+            "counter sample line must carry _total suffix: {sample_line}"
+        );
+        assert!(
+            !sample_line.contains("nft_scrape_errors_total_total"),
+            "double _total suffix emitted: {sample_line}"
+        );
+    }
+
+    /// `# HELP` and `# TYPE` lines must appear before the first sample line
+    /// for every metric group.
+    #[test]
+    fn encode_samples_help_type_emission_order() {
+        let samples = vec![
+            MetricSample::gauge("metric_a", "Help A.", BTreeMap::new(), 1.0),
+            MetricSample::gauge("metric_b", "Help B.", BTreeMap::new(), 2.0),
+        ];
+        let text = encode_samples(&samples).expect("encode ok");
+
+        for name in &["metric_a", "metric_b"] {
+            let help_pos = text
+                .find(&format!("# HELP {name}"))
+                .expect("HELP line present");
+            let type_pos = text
+                .find(&format!("# TYPE {name}"))
+                .expect("TYPE line present");
+            // First non-comment line that starts with the metric name.
+            let sample_pos = text
+                .lines()
+                .filter(|l| l.starts_with(name))
+                .find_map(|l| text.find(l))
+                .expect("sample line present");
+            assert!(help_pos < sample_pos, "HELP must precede sample for {name}");
+            assert!(type_pos < sample_pos, "TYPE must precede sample for {name}");
+        }
+    }
+
+    /// Multiple samples for the same metric name must all appear under a
+    /// single `# HELP` / `# TYPE` header pair (stable group + dedup of headers).
+    #[test]
+    fn encode_samples_stable_sort_and_dedup_headers() {
+        let mut labels_a = BTreeMap::new();
+        labels_a.insert("iface".to_owned(), "eth0".to_owned());
+        let mut labels_b = BTreeMap::new();
+        labels_b.insert("iface".to_owned(), "eth1".to_owned());
+
+        // Intentionally insert in reverse label order; BTreeMap sorts keys.
+        let samples = vec![
+            MetricSample::counter("nft_rx_total", "RX bytes total.", labels_b.clone(), 200),
+            MetricSample::counter("nft_rx_total", "RX bytes total.", labels_a.clone(), 100),
+        ];
+        let text = encode_samples(&samples).expect("encode ok");
+
+        // Exactly one HELP and one TYPE header for the metric name.
+        let help_count = text.matches("# HELP nft_rx_total").count();
+        let type_count = text.matches("# TYPE nft_rx_total").count();
+        assert_eq!(help_count, 1, "duplicate HELP headers: {text}");
+        assert_eq!(type_count, 1, "duplicate TYPE headers: {text}");
+
+        // Both sample lines present.
+        assert!(
+            text.contains(r#"nft_rx_total{iface="eth0"} 100"#),
+            "eth0 sample missing: {text}"
+        );
+        assert!(
+            text.contains(r#"nft_rx_total{iface="eth1"} 200"#),
+            "eth1 sample missing: {text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests for escape_label_value (direct function coverage)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn escape_label_value_nul_stripped() {
+        assert_eq!(escape_label_value("a\x00b"), "ab");
+    }
+
+    #[test]
+    fn escape_label_value_tab_stripped() {
+        // TAB (0x09) is a control char < 0x20; must be stripped.
+        assert_eq!(escape_label_value("a\tb"), "ab");
+    }
+
+    #[test]
+    fn escape_label_value_bel_stripped() {
+        assert_eq!(escape_label_value("a\x07b"), "ab");
+    }
+
+    #[test]
+    fn escape_label_value_cr_stripped() {
+        // CR (0x0D) must be stripped.
+        assert_eq!(escape_label_value("a\rb"), "ab");
+    }
+
+    #[test]
+    fn escape_label_value_printable_ascii_unchanged() {
+        let s = "hello world! 123 @#$%^&*()-=+[]|;:',.<>?/`~";
+        assert_eq!(escape_label_value(s), s);
+    }
+
+    #[test]
+    fn escape_label_value_multibyte_unicode_unchanged() {
+        // Multi-byte Unicode codepoints (>= U+0080) must pass through unchanged.
+        let s = "interface: cafe/Munchen";
+        assert_eq!(escape_label_value(s), s);
+    }
+
+    #[test]
+    fn escape_label_value_combined() {
+        // Mix of backslash, quote, newline, control chars, and plain text.
+        // input:    a \ b " c \n d \x00 e \x1f e
+        // expected: a \\ b \" c \n d          e      e   (controls stripped)
+        let input = "a\\b\"c\nd\x00e\x1fe";
+        assert_eq!(escape_label_value(input), r#"a\\b\"c\ndee"#);
     }
 }
