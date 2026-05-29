@@ -16,6 +16,16 @@
 //!     drops, requeues, overlimits)
 //!
 //! Interface name is resolved from `tcm_ifindex` via a prior `RTM_GETLINK` dump.
+//!
+//! ## Multi-queue aggregation (exposition correctness)
+//!
+//! A multi-queue device (`mq` root qdisc) exposes one child qdisc per hardware
+//! TX queue — e.g. 32× `fq`, all with handle `0:`, differing only by
+//! `tcm_parent`. Since the metrics are keyed by `{device, kind}` only, emitting
+//! each child separately produced **duplicate series** with identical label sets
+//! (a duplicate-sample scrape rejection in Prometheus). Counters are therefore
+//! summed per `(device, kind)` into a single series — the device-wide total for
+//! that qdisc kind.
 
 use std::collections::BTreeMap;
 
@@ -163,6 +173,33 @@ struct QdiscStats {
     backlog: u32,
 }
 
+/// Counters accumulated across every qdisc sharing one `(device, kind)`.
+///
+/// A multi-queue device (`mq` root) exposes one child qdisc per hardware TX
+/// queue, all reporting the same `kind` (e.g. 32× `fq`) with handle `0:`. They
+/// differ only by `tcm_parent`, which is not a label dimension here, so emitting
+/// each separately would produce duplicate `{device, kind}` series and a
+/// duplicate-sample scrape rejection. Summing yields one valid series per
+/// `(device, kind)` — the device-wide total for that qdisc kind.
+#[derive(Default)]
+struct AggStats {
+    bytes: u64,
+    packets: u64,
+    drops: u64,
+    overlimits: u64,
+    backlog: u64,
+}
+
+impl AggStats {
+    fn add(&mut self, s: &QdiscStats) {
+        self.bytes = self.bytes.saturating_add(s.bytes);
+        self.packets = self.packets.saturating_add(s.packets);
+        self.drops = self.drops.saturating_add(u64::from(s.drops));
+        self.overlimits = self.overlimits.saturating_add(u64::from(s.overlimits));
+        self.backlog = self.backlog.saturating_add(u64::from(s.backlog));
+    }
+}
+
 /// Parse `TCA_STATS2` payload (nested attrs: `TCA_STATS_BASIC` + `TCA_STATS_QUEUE`).
 fn parse_tca_stats2(payload: &[u8]) -> Option<QdiscStats> {
     let mut bytes = 0u64;
@@ -277,45 +314,45 @@ fn parse_qdisc_frame(payload: &[u8]) -> Option<QdiscEntry> {
 // Metric emission
 // ---------------------------------------------------------------------------
 
-fn emit_qdisc_metrics(entry: &QdiscEntry, iface_name: &str, out: &mut Vec<MetricSample>) {
-    let Some(ref stats) = entry.stats else {
-        // noqueue and other qdiscs without TCA_STATS2 → no counter metrics (§7.4).
-        return;
-    };
-
+/// Emit one series per metric for an aggregated `(device, kind)` group.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "backlog gauge is f64; precision loss on a summed-byte backlog is inherent to Prometheus exposition"
+)]
+fn emit_qdisc_metrics(device: &str, kind: &str, s: &AggStats, out: &mut Vec<MetricSample>) {
     let mut labels = BTreeMap::new();
-    labels.insert("device".to_owned(), iface_name.to_owned());
-    labels.insert("kind".to_owned(), entry.kind.clone());
+    labels.insert("device".to_owned(), device.to_owned());
+    labels.insert("kind".to_owned(), kind.to_owned());
 
     out.push(MetricSample::counter(
         "nft_tc_qdisc_bytes_total",
-        "Total bytes processed by the qdisc.",
+        "Total bytes processed by the qdisc (summed across multi-queue child qdiscs of the same kind).",
         labels.clone(),
-        stats.bytes,
+        s.bytes,
     ));
     out.push(MetricSample::counter(
         "nft_tc_qdisc_packets_total",
-        "Total packets processed by the qdisc.",
+        "Total packets processed by the qdisc (summed across multi-queue child qdiscs of the same kind).",
         labels.clone(),
-        stats.packets,
+        s.packets,
     ));
     out.push(MetricSample::counter(
         "nft_tc_qdisc_drops_total",
-        "Total packets dropped by the qdisc.",
+        "Total packets dropped by the qdisc (summed across multi-queue child qdiscs of the same kind).",
         labels.clone(),
-        u64::from(stats.drops),
+        s.drops,
     ));
     out.push(MetricSample::counter(
         "nft_tc_qdisc_overlimits_total",
-        "Total overlimit events on the qdisc.",
+        "Total overlimit events on the qdisc (summed across multi-queue child qdiscs of the same kind).",
         labels.clone(),
-        u64::from(stats.overlimits),
+        s.overlimits,
     ));
     out.push(MetricSample::gauge(
         "nft_tc_qdisc_backlog_bytes",
-        "Current backlog size of the qdisc in bytes.",
+        "Current backlog size of the qdisc in bytes (summed across multi-queue child qdiscs of the same kind).",
         labels,
-        f64::from(stats.backlog),
+        s.backlog as f64,
     ));
 }
 
@@ -356,16 +393,29 @@ impl Collector for TcCollector {
                 .await
                 .map_err(nl_err_to_collect)?;
 
-            let mut samples = Vec::new();
-
+            // Aggregate by (device, kind): a multi-queue device exposes one child
+            // qdisc per HW queue, all sharing (device, kind). Summing avoids the
+            // duplicate-series scrape rejection and yields the device-wide total.
+            let mut agg: BTreeMap<(String, String), AggStats> = BTreeMap::new();
             for frame in &qdisc_frames {
                 let Some(entry) = parse_qdisc_frame(frame) else {
+                    continue;
+                };
+                // noqueue and other qdiscs without TCA_STATS2 → no counter metrics (§7.4).
+                let Some(stats) = entry.stats else {
                     continue;
                 };
                 let iface_name = ifindex_map
                     .get(&entry.ifindex)
                     .map_or("unknown", String::as_str);
-                emit_qdisc_metrics(&entry, iface_name, &mut samples);
+                agg.entry((iface_name.to_owned(), entry.kind))
+                    .or_default()
+                    .add(&stats);
+            }
+
+            let mut samples = Vec::with_capacity(agg.len().saturating_mul(5));
+            for ((device, kind), acc) in &agg {
+                emit_qdisc_metrics(device, kind, acc, &mut samples);
             }
 
             Ok(samples)
@@ -390,6 +440,8 @@ mod tests {
         clippy::cast_possible_truncation,
         reason = "test"
     )]
+
+    use nlx_domain::metric::MetricValue;
 
     use super::*;
     use crate::wire::{NLA_HDRLEN, align4};
@@ -590,5 +642,78 @@ mod tests {
 
         let entry = parse_qdisc_frame(&frame).unwrap();
         assert_eq!(entry.ifindex, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-queue aggregation (exposition correctness — no duplicate series)
+    // -----------------------------------------------------------------------
+
+    fn qstats(bytes: u64, packets: u64, drops: u32, overlimits: u32, backlog: u32) -> QdiscStats {
+        QdiscStats {
+            bytes,
+            packets,
+            drops,
+            overlimits,
+            backlog,
+        }
+    }
+
+    /// Two qdiscs of the same kind on the same device (the `mq` multi-queue case)
+    /// must collapse to ONE series per metric, with summed counters — never a
+    /// duplicate `{device, kind}` series.
+    #[test]
+    fn aggregates_same_device_kind_into_one_series() {
+        let mut acc = AggStats::default();
+        acc.add(&qstats(100, 10, 1, 2, 50));
+        acc.add(&qstats(200, 20, 3, 4, 70));
+
+        let mut out = Vec::new();
+        emit_qdisc_metrics("dx5p0", "fq", &acc, &mut out);
+
+        // Exactly one sample per metric name (no duplicates).
+        for metric in [
+            "nft_tc_qdisc_bytes_total",
+            "nft_tc_qdisc_packets_total",
+            "nft_tc_qdisc_drops_total",
+            "nft_tc_qdisc_overlimits_total",
+            "nft_tc_qdisc_backlog_bytes",
+        ] {
+            let count = out.iter().filter(|s| s.name == metric).count();
+            assert_eq!(count, 1, "{metric} must be a single series, got {count}");
+        }
+
+        // Summed values.
+        let by_name = |n: &str| out.iter().find(|s| s.name == n).map(|s| s.value.clone());
+        assert_eq!(
+            by_name("nft_tc_qdisc_bytes_total"),
+            Some(MetricValue::U64(300))
+        );
+        assert_eq!(
+            by_name("nft_tc_qdisc_packets_total"),
+            Some(MetricValue::U64(30))
+        );
+        assert_eq!(
+            by_name("nft_tc_qdisc_drops_total"),
+            Some(MetricValue::U64(4))
+        );
+        assert_eq!(
+            by_name("nft_tc_qdisc_overlimits_total"),
+            Some(MetricValue::U64(6))
+        );
+        // backlog is a gauge (f64) summed: 50 + 70 = 120.
+        assert_eq!(
+            by_name("nft_tc_qdisc_backlog_bytes"),
+            Some(MetricValue::F64(120.0))
+        );
+    }
+
+    /// `AggStats::add` uses saturating arithmetic — summing past `u64::MAX` must
+    /// not panic or wrap.
+    #[test]
+    fn agg_add_saturates() {
+        let mut acc = AggStats::default();
+        acc.add(&qstats(u64::MAX, 0, 0, 0, 0));
+        acc.add(&qstats(10, 0, 0, 0, 0));
+        assert_eq!(acc.bytes, u64::MAX, "byte sum must saturate, not wrap");
     }
 }
