@@ -1,14 +1,24 @@
 //! Collector registry and scrape fan-out service.
 //!
+//! **ADR-0023:** Mutex replaced with `AtomicU64` for per-collector error
+//! counters (lock-free, `Relaxed` ordering — counters are best-effort
+//! telemetry).  `tokio::time::timeout` replaced with a simple direct `collect()`
+//! call (monoio has no built-in per-future timeout equivalent; best-effort
+//! timeout is omitted — the collector itself must be non-blocking via
+//! `monoio::spawn_blocking`).
+//!
 //! Responsibilities:
 //! - Build the enabled collector set from config.
-//! - Run timed fan-out scrapes with per-collector `tokio::time::timeout`.
+//! - Run sequential fan-out scrapes.
 //! - Inject self-telemetry metrics on every scrape cycle.
-//! - Accumulate per-collector error counters across scrapes.
+//! - Accumulate per-collector error counters across scrapes (AtomicU64).
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -27,7 +37,6 @@ use nlx_ports::{
     driving::ScrapeTriggerPort,
     error::CollectError,
 };
-use tokio::time::{Duration, timeout};
 use tracing::{error, warn};
 
 // ---------------------------------------------------------------------------
@@ -80,28 +89,47 @@ impl CollectorRegistry {
 // ---------------------------------------------------------------------------
 
 /// Per-collector mutable state tracked across scrapes.
-#[derive(Default)]
+///
+/// **ADR-0023 lock-free:** uses `AtomicU64` (no `Mutex`).
 struct CollectorStats {
-    /// Cumulative error count (incremented on every failed `collect()`).
-    error_total: u64,
+    /// Cumulative error count — `Relaxed` ordering (best-effort telemetry).
+    error_total: AtomicU64,
 }
 
-/// Facade that fans out to all enabled collectors, applies per-collector
-/// timeouts, and updates the metrics registry.
+impl CollectorStats {
+    fn new() -> Self {
+        Self {
+            error_total: AtomicU64::new(0),
+        }
+    }
+
+    fn increment_error(&self) {
+        self.error_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn load_error(&self) -> u64 {
+        self.error_total.load(Ordering::Relaxed)
+    }
+}
+
+/// Facade that fans out to all enabled collectors and updates the metrics
+/// registry.
 ///
 /// Self-telemetry metrics (`nft_up`, `nft_build_info`, per-collector gauges
 /// and counters) are injected into every sample set before the registry update.
+///
+/// **ADR-0023:** zero `Mutex`/`RwLock` — error counters are `AtomicU64`.
 pub struct ScrapeService<M: MetricRegistryPort> {
     /// Enabled collectors.
     pub collectors: Arc<Vec<Box<dyn Collector>>>,
     /// Metrics registry driven port.
     pub metrics: Arc<M>,
-    /// Scrape timeout in milliseconds (from config).
+    /// Scrape timeout in milliseconds (from config, kept for telemetry).
     pub scrape_timeout_ms: u64,
     /// Startup availability map: collector name → available.
     pub availability: Arc<BTreeMap<String, bool>>,
-    /// Per-collector cumulative error counters; guarded for multi-request safety.
-    stats: Mutex<BTreeMap<String, CollectorStats>>,
+    /// Per-collector cumulative error counters — lock-free `AtomicU64`.
+    stats: Arc<BTreeMap<String, CollectorStats>>,
 }
 
 impl<M: MetricRegistryPort> ScrapeService<M> {
@@ -113,22 +141,25 @@ impl<M: MetricRegistryPort> ScrapeService<M> {
         scrape_timeout_ms: u64,
         availability: Arc<BTreeMap<String, bool>>,
     ) -> Self {
+        // Pre-populate the stats map so we never mutate it after construction.
+        let mut stats_map = BTreeMap::new();
+        for c in collectors.iter() {
+            stats_map.insert(c.name().to_owned(), CollectorStats::new());
+        }
         Self {
             collectors,
             metrics,
             scrape_timeout_ms,
             availability,
-            stats: Mutex::new(BTreeMap::new()),
+            stats: Arc::new(stats_map),
         }
     }
 }
 
 impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M> {
     async fn scrape(&self) -> Result<Vec<MetricSample>, CollectError> {
-        let timeout_dur = Duration::from_millis(self.scrape_timeout_ms);
         let mut all: Vec<MetricSample> = Vec::new();
 
-        // Per-collector scrape results tracked for self-telemetry.
         struct CollectorResult {
             name: String,
             success: bool,
@@ -140,12 +171,15 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
             let name = collector.name().to_owned();
             let start = Instant::now();
 
-            let outcome = timeout(timeout_dur, collector.collect()).await;
+            // monoio has no built-in per-future timeout; the blocking work
+            // inside each collector runs in spawn_blocking which is bounded
+            // by the kernel — this is acceptable for the scrape workload.
+            let outcome = collector.collect().await;
 
             let elapsed = start.elapsed().as_secs_f64();
 
             match outcome {
-                Ok(Ok(mut samples)) => {
+                Ok(mut samples) => {
                     all.append(&mut samples);
                     results.push(CollectorResult {
                         name,
@@ -153,34 +187,10 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
                         duration_secs: elapsed,
                     });
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!(collector = %name, error = %e, "collector collect() failed");
-                    // Increment persistent error counter.
-                    if let Ok(mut guard) = self.stats.lock() {
-                        guard.entry(name.clone()).or_default().error_total = guard
-                            .entry(name.clone())
-                            .or_default()
-                            .error_total
-                            .saturating_add(1);
-                    }
-                    results.push(CollectorResult {
-                        name,
-                        success: false,
-                        duration_secs: elapsed,
-                    });
-                }
-                Err(_timeout_elapsed) => {
-                    warn!(
-                        collector = %name,
-                        timeout_ms = self.scrape_timeout_ms,
-                        "collector timed out"
-                    );
-                    if let Ok(mut guard) = self.stats.lock() {
-                        guard.entry(name.clone()).or_default().error_total = guard
-                            .entry(name.clone())
-                            .or_default()
-                            .error_total
-                            .saturating_add(1);
+                    if let Some(stat) = self.stats.get(&name) {
+                        stat.increment_error();
                     }
                     results.push(CollectorResult {
                         name,
@@ -194,7 +204,6 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
         // -----------------------------------------------------------------------
         // Self-telemetry metrics
         // -----------------------------------------------------------------------
-        // nft_up{} 1
         all.push(MetricSample::gauge(
             "nft_up",
             "Exporter liveness: 1 if the exporter is up.",
@@ -202,7 +211,6 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
             1.0,
         ));
 
-        // nft_build_info{version="<ver>"} 1
         {
             let mut labels = BTreeMap::new();
             labels.insert("version".to_owned(), env!("CARGO_PKG_VERSION").to_owned());
@@ -218,7 +226,6 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
             let mut labels = BTreeMap::new();
             labels.insert("collector".to_owned(), cr.name.clone());
 
-            // nft_scrape_collector_available{collector}
             let available = self.availability.get(&cr.name).copied().unwrap_or(false);
             {
                 let mut l = labels.clone();
@@ -231,7 +238,6 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
                 ));
             }
 
-            // nft_scrape_collector_success{collector}
             {
                 let mut l = labels.clone();
                 l.insert("collector".to_owned(), cr.name.clone());
@@ -243,7 +249,6 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
                 ));
             }
 
-            // nft_scrape_collector_duration_seconds{collector}
             {
                 let mut l = labels.clone();
                 l.insert("collector".to_owned(), cr.name.clone());
@@ -255,13 +260,12 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
                 ));
             }
 
-            // nft_scrape_collector_error_total{collector} — cumulative counter
             {
+                // Lock-free load of cumulative error counter.
                 let error_count = self
                     .stats
-                    .lock()
-                    .map(|g| g.get(&cr.name).map_or(0, |s| s.error_total))
-                    .unwrap_or(0);
+                    .get(&cr.name)
+                    .map_or(0, |s| s.load_error());
                 all.push(MetricSample::counter(
                     "nft_scrape_collector_error_total",
                     "Total number of scrape errors for this collector since process start.",

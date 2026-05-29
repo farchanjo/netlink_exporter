@@ -7,11 +7,12 @@ authors.workspace    = true
 license.workspace    = true
 description = "Driving HTTP adapter: Axum server exposing /metrics, /healthz, /ready on port 9456 (ADR-0010)."
 
+# ADR-0023: axum + tokio + tower REMOVED; replaced by monoio hand-rolled HTTP/1.
+# monoio-http/service-async deferred (ADR-0023 deviation: hand-rolled approach
+# avoids pulling ByteDance-internal crates with limited community docs).
 [dependencies]
 nlx-ports  = { workspace = true }
-axum       = { workspace = true }
-tokio      = { workspace = true, features = ["rt", "macros", "net"] }
-tower      = { workspace = true }
+monoio     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
 

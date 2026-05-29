@@ -1,8 +1,13 @@
 //! Driving (left-side) port traits.
 //!
-//! These traits are called by inbound adapters (e.g., the Axum HTTP adapter)
+//! These traits are called by inbound adapters (e.g., the monoio HTTP adapter)
 //! to trigger application-core behaviour.  Implementations live in the
 //! application core or in the composition root.
+//!
+//! **ADR-0023:** `Send` bound removed from returned futures — monoio is a
+//! thread-per-core (!Send) runtime.  The traits still require `Send + Sync` on
+//! the implementing type so that `Arc<dyn ScrapeTriggerPort>` can be shared
+//! across monoio `spawn` tasks on the same thread.
 
 use nlx_domain::metric::MetricSample;
 
@@ -24,7 +29,7 @@ pub trait ScrapeTriggerPort: Send + Sync {
     /// self-telemetry metrics and do not propagate as `Err`.
     fn scrape(
         &self,
-    ) -> impl std::future::Future<Output = Result<Vec<MetricSample>, CollectError>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<MetricSample>, CollectError>>;
 }
 
 /// Liveness probe port.
@@ -33,7 +38,7 @@ pub trait ScrapeTriggerPort: Send + Sync {
 /// exporter process is alive and its internal state machine is consistent.
 pub trait HealthPort: Send + Sync {
     /// Returns `true` if the exporter is alive.
-    fn is_healthy(&self) -> impl std::future::Future<Output = bool> + Send;
+    fn is_healthy(&self) -> impl std::future::Future<Output = bool>;
 }
 
 /// Readiness probe port.
@@ -43,5 +48,5 @@ pub trait HealthPort: Send + Sync {
 /// scrape requests.
 pub trait ReadinessPort: Send + Sync {
     /// Returns `true` if the exporter is ready to serve traffic.
-    fn is_ready(&self) -> impl std::future::Future<Output = bool> + Send;
+    fn is_ready(&self) -> impl std::future::Future<Output = bool>;
 }

@@ -11,6 +11,7 @@ description = "Composition root binary: wires all adapters, drops Linux capabili
 name = "netlink_exporter"
 path = "src/main.rs"
 
+# ADR-0023: tokio REMOVED; monoio + arc-swap replace it.
 [dependencies]
 nlx-domain   = { workspace = true }
 nlx-ports    = { workspace = true }
@@ -18,7 +19,8 @@ nlx-netlink  = { workspace = true }
 nlx-metrics  = { workspace = true }
 nlx-http     = { workspace = true }
 nlx-config   = { workspace = true }
-tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+monoio       = { workspace = true }
+arc-swap     = { workspace = true }
 anyhow       = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }

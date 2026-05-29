@@ -10,12 +10,18 @@
 //! Rust's AFIT (async fn in traits) does not yet yield object-safe traits
 //! (stabilised Rust 1.75, but `dyn Trait` dispatch requires explicit
 //! `Pin<Box<dyn Future>>` return types until the feature matures in a later
-//! release).  This trait uses explicit `Pin<Box<dyn Future<Output=…> + Send>>`
-//! returns so that `Box<dyn Collector>` collections compile correctly in the
+//! release).  This trait uses explicit `Pin<Box<dyn Future<Output=…>>>` returns
+//! so that `Box<dyn Collector>` collections compile correctly in the
 //! composition root.  Implementors may use `async fn` bodies that internally
 //! return `Box::pin(async move { … })`.
 //!
-//! Neither `tokio` nor `mio` types appear in any signature (ADR-0014).
+//! **ADR-0023:** The `Send` bound has been removed from `BoxFuture` because
+//! monoio is a thread-per-core !Send runtime.  Collectors run on a single
+//! monoio thread; cross-thread sharing uses `arc_swap::ArcSwap` (lock-free RCU)
+//! rather than `Send` futures.
+//!
+//! Neither tokio, mio, axum, nor any runtime type appears in any signature
+//! (ADR-0014 / ADR-0023).
 
 use std::{future::Future, pin::Pin};
 
@@ -23,13 +29,22 @@ use crate::error::CollectError;
 use nlx_domain::metric::MetricSample;
 
 /// Heap-allocated boxed future alias used by object-safe async methods.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+///
+/// Note: no `Send` bound — monoio is thread-per-core (!Send futures permitted).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Strategy trait implemented by every netlink collector.
 ///
 /// The application core calls [`collect`] on each enabled collector during a
 /// scrape cycle and aggregates the returned [`MetricSample`] stream into the
 /// `MetricRegistryPort`.
+///
+/// `Send + Sync` are required so that `Arc<Vec<Box<dyn Collector>>>` can be
+/// held by `ScrapeService` which must itself be `Send + Sync` (it is wrapped
+/// in `Arc` and passed to monoio spawned tasks).  The collector structs are
+/// all unit structs or contain only atomic primitives — they are trivially
+/// `Send + Sync`.  The `BoxFuture` they return is `!Send` (no `Send` bound),
+/// which is correct for the monoio single-thread executor.
 ///
 /// [`collect`]: Collector::collect
 pub trait Collector: Send + Sync {

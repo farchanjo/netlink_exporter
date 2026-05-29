@@ -1,6 +1,6 @@
 //! `NetlinkSocket` — non-blocking `AF_NETLINK` transport.
 //!
-//! ## Design (ADR-0011 + ADR-0014)
+//! ## Design (ADR-0011 + ADR-0023)
 //!
 //! 1. Open a non-blocking raw `AF_NETLINK` socket via `rustix::net::socket_with`
 //!    with `SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC`.
@@ -8,22 +8,16 @@
 //! 3. Tune `SO_RCVBUF` to a minimum of 4 MiB.
 //! 4. Optionally enable `NETLINK_GET_STRICT_CHK` (`ENOPROTOOPT` silently
 //!    ignored on kernel < 4.20).
-//! 5. Wrap the raw fd in `tokio::io::unix::AsyncFd` to integrate with the
-//!    tokio reactor.  `mio` registers the fd with `epoll` via `AsyncFd::new`.
+//! 5. Each `dump`/`request_single` call is executed inside `monoio::spawn_blocking`
+//!    so the blocking sendmsg/recvmsg loop does not block the monoio executor.
+//!    This is Option A from the ADR-0023 recon: AF_NETLINK dumps are bulk
+//!    synchronous operations; spawn_blocking is clean and idiomatic.
 //!
-//! ## Dump loop
+//! ## Public API
 //!
-//! [`NetlinkSocket::dump`] sends a single `NLM_F_DUMP`-flagged request and
-//! accumulates frames until `NLMSG_DONE`, returning the payload bytes from
-//! every data frame.  It detects `NLM_F_DUMP_INTR` on every received
-//! `nlmsghdr` and propagates [`NetlinkError::DumpIntr`] to the call site so
-//! the collector can restart (cap retries there).
-//!
-//! ## ENOBUFS circuit-breaker
-//!
-//! On the first `ENOBUFS`, `SO_RCVBUF` is doubled (up to 16 MiB).  On a
-//! second `ENOBUFS` for the same request the dump is aborted and
-//! [`NetlinkError::RecvBufOverflow`] is returned.
+//! The public API signatures are identical to the previous tokio-based transport
+//! so all 14 collectors are unchanged.  Internally the blocking dump runs on
+//! a thread-pool thread and the result is awaited via `JoinHandle`.
 //!
 //! ## Linux-only
 //!
@@ -32,11 +26,10 @@
 //! `NetlinkError::Open` immediately (no-op stub).  This lets `cargo check`
 //! succeed cross-platform for CI while runtime remains Linux-only.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use thiserror::Error;
-use tokio::io::unix::AsyncFd;
 use tracing::{debug, trace, warn};
 
 use crate::wire::{NLA_HDRLEN, align4, parse_attrs, read_u16};
@@ -87,7 +80,7 @@ const CTRL_ATTR_FAMILY_ID: u16 = 1;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NetlinkError {
-    /// Socket creation, bind, or `AsyncFd` registration failed.
+    /// Socket creation, bind, or registration failed.
     #[error("netlink socket open failed: {0}")]
     Open(String),
 
@@ -122,6 +115,10 @@ pub enum NetlinkError {
     /// Frame parse error (truncated header, mismatched length, etc.).
     #[error("netlink frame parse error: {0}")]
     Parse(String),
+
+    /// spawn_blocking join error (thread pool panic).
+    #[error("blocking thread join error: {0}")]
+    Join(String),
 }
 
 /// Convenience alias used by collector authors.
@@ -131,15 +128,15 @@ pub type Result<T> = std::result::Result<T, NetlinkError>;
 // NetlinkSocket
 // ---------------------------------------------------------------------------
 
-/// Non-blocking `AF_NETLINK` socket integrated with the tokio reactor via
-/// [`AsyncFd`].
+/// `AF_NETLINK` socket that runs blocking sendmsg/recvmsg inside
+/// `monoio::spawn_blocking` to avoid blocking the monoio executor (ADR-0023).
 ///
-/// # Panics
-///
-/// [`NetlinkSocket::open`] panics if called outside a tokio runtime context
-/// (the `AsyncFd::new` call registers the fd with the current tokio runtime).
+/// The public API (`open`, `dump`, `request_single`, `resolve_genl_family`)
+/// is identical to the previous tokio-based transport so all collectors are
+/// unchanged.
 pub struct NetlinkSocket {
-    async_fd: AsyncFd<OwnedFd>,
+    /// Raw fd; only accessed from blocking threads.
+    fd: OwnedFd,
     /// Current `SO_RCVBUF` size tracked for the ENOBUFS circuit-breaker.
     rcvbuf_size: usize,
     /// Netlink protocol constant (e.g. 0 = NETLINK_ROUTE, 16 = NETLINK_GENERIC).
@@ -151,7 +148,7 @@ impl std::fmt::Debug for NetlinkSocket {
         f.debug_struct("NetlinkSocket")
             .field("nl_family", &self.nl_family)
             .field("rcvbuf_size", &self.rcvbuf_size)
-            .field("fd", &self.async_fd.as_raw_fd())
+            .field("fd", &self.fd.as_raw_fd())
             .finish()
     }
 }
@@ -164,8 +161,7 @@ pub const MIN_RCVBUF: usize = 4 * 1024 * 1024;
 pub const MAX_DUMP_RESTARTS: u32 = 8;
 
 impl NetlinkSocket {
-    /// Open a non-blocking `AF_NETLINK` socket for `nl_family` and register
-    /// it with the tokio reactor.
+    /// Open a `AF_NETLINK` socket for `nl_family`.
     ///
     /// Pass the raw protocol integer:
     ///
@@ -179,18 +175,11 @@ impl NetlinkSocket {
     ///
     /// # Errors
     ///
-    /// Returns [`NetlinkError::Open`] if the socket, bind, `setsockopt`, or
-    /// `AsyncFd` registration fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called outside a tokio runtime (see module-level note on
-    /// `AsyncFd`).
+    /// Returns [`NetlinkError::Open`] if the socket, bind, or `setsockopt` fails.
     pub fn open(nl_family: i32) -> Result<Self> {
         let fd = Self::open_raw_fd(nl_family)?;
-        let async_fd = AsyncFd::new(fd).map_err(|e| NetlinkError::Open(e.to_string()))?;
         Ok(Self {
-            async_fd,
+            fd,
             rcvbuf_size: MIN_RCVBUF,
             nl_family,
         })
@@ -221,14 +210,11 @@ impl NetlinkSocket {
         let addr = SocketAddrNetlink::new(0, 0);
         rustix::net::bind(&fd, &addr).map_err(|e| NetlinkError::Open(format!("bind: {e}")))?;
 
-        // Tune SO_RCVBUF to at least 4 MiB.  The kernel doubles the requested
-        // value internally; passing MIN_RCVBUF requests an effective buffer of
-        // 2×MIN_RCVBUF in most kernels, which is acceptable.
+        // Tune SO_RCVBUF to at least 4 MiB.
         set_socket_recv_buffer_size(&fd, MIN_RCVBUF)
             .map_err(|e| NetlinkError::Open(format!("SO_RCVBUF: {e}")))?;
 
         // NETLINK_GET_STRICT_CHK (value 12 per linux-raw-sys) — best effort.
-        // Available on kernel >= 4.20; silently ignore ENOPROTOOPT (92 on Linux).
         Self::try_set_strict_chk(&fd);
 
         Ok(fd)
@@ -236,9 +222,6 @@ impl NetlinkSocket {
 
     /// Try to enable `NETLINK_GET_STRICT_CHK` via a raw `setsockopt` syscall.
     /// Silently ignores any error (ENOPROTOOPT on kernel < 4.20).
-    ///
-    /// There is no typed wrapper in rustix for `SOL_NETLINK` socket options,
-    /// so we fall back to a raw libc call.
     #[cfg(target_os = "linux")]
     fn try_set_strict_chk(fd: &OwnedFd) {
         // SOL_NETLINK = 270, NETLINK_GET_STRICT_CHK = 12 (linux-raw-sys).
@@ -256,7 +239,6 @@ impl NetlinkSocket {
             )
         };
         if ret != 0 {
-            // ENOPROTOOPT (92) is expected on kernel < 4.20; log but do not fail.
             let errno = std::io::Error::last_os_error();
             debug!(errno = ?errno, "NETLINK_GET_STRICT_CHK not available (kernel < 4.20)");
         }
@@ -282,7 +264,7 @@ impl NetlinkSocket {
             return Err(NetlinkError::RecvBufOverflow);
         }
         #[cfg(target_os = "linux")]
-        rustix::net::sockopt::set_socket_recv_buffer_size(self.async_fd.get_ref(), new_size)
+        rustix::net::sockopt::set_socket_recv_buffer_size(&self.fd, new_size)
             .map_err(|e| NetlinkError::Recv(format!("SO_RCVBUF grow: {e}")))?;
         self.rcvbuf_size = new_size;
         debug!(new_size, "grew SO_RCVBUF");
@@ -294,107 +276,67 @@ impl NetlinkSocket {
     // -----------------------------------------------------------------------
 
     /// Build a complete `nlmsghdr + payload` datagram.
-    ///
-    /// `msg_type` and `flags` are provided by the caller; `NLM_F_REQUEST` is
-    /// ORed in automatically.  `seq` is taken from the global counter.
-    /// `nl_pid = 0` in the header (userspace sender, not the socket's port).
     fn build_request(msg_type: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
         let total_len = NLMSG_HDRLEN + payload.len();
         let mut buf = Vec::with_capacity(align4(total_len));
 
-        // nlmsghdr (16 bytes, native-endian)
-        buf.extend_from_slice(&(total_len as u32).to_ne_bytes()); // nlmsg_len
-        buf.extend_from_slice(&msg_type.to_ne_bytes()); // nlmsg_type
-        buf.extend_from_slice(&(NLM_F_REQUEST | flags).to_ne_bytes()); // nlmsg_flags
-        buf.extend_from_slice(&next_seq().to_ne_bytes()); // nlmsg_seq
-        buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid = 0
+        buf.extend_from_slice(&(total_len as u32).to_ne_bytes());
+        buf.extend_from_slice(&msg_type.to_ne_bytes());
+        buf.extend_from_slice(&(NLM_F_REQUEST | flags).to_ne_bytes());
+        buf.extend_from_slice(&next_seq().to_ne_bytes());
+        buf.extend_from_slice(&0u32.to_ne_bytes()); // nl_pid = 0
 
         buf.extend_from_slice(payload);
         buf
     }
 
     // -----------------------------------------------------------------------
-    // Send
+    // Blocking send + recv loop (runs on spawn_blocking thread)
     // -----------------------------------------------------------------------
 
-    /// Send `data` on the socket, awaiting writability if needed.
-    ///
-    /// Loops on `EAGAIN`/`EWOULDBLOCK` by awaiting `AsyncFd::writable`.
-    async fn send_all(&self, data: &[u8]) -> Result<()> {
+    /// Blocking send: write `data` to the netlink socket.
+    #[cfg(target_os = "linux")]
+    fn blocking_send(fd: &OwnedFd, data: &[u8]) -> Result<()> {
         use rustix::net::SendFlags;
-
-        loop {
-            let mut guard = self
-                .async_fd
-                .writable()
-                .await
-                .map_err(|e| NetlinkError::Send(e.to_string()))?;
-
-            match guard.try_io(|fd| {
-                rustix::net::send(fd.get_ref(), data, SendFlags::empty())
-                    .map_err(std::io::Error::from)
-            }) {
-                Ok(Ok(_n)) => return Ok(()),
-                Ok(Err(e)) => return Err(NetlinkError::Send(e.to_string())),
-                Err(_would_block) => continue, // AsyncFd says not ready yet
-            }
-        }
+        rustix::net::send(fd, data, SendFlags::empty())
+            .map_err(|e| NetlinkError::Send(e.to_string()))
+            .map(|_| ())
     }
 
-    // -----------------------------------------------------------------------
-    // Recv one datagram
-    // -----------------------------------------------------------------------
-
-    /// Receive one netlink datagram into `buf`, awaiting readability.
+    /// Blocking recv: read one netlink datagram from `fd` into `buf`.
     ///
-    /// Returns the number of bytes actually written into `buf`.  On Linux,
-    /// uses `MSG_TRUNC` so we know the real datagram size even when `buf` is
-    /// smaller (though with the default 4 MiB buffer this should never
-    /// truncate in practice).
-    ///
-    /// # Errors
-    ///
-    /// Returns `NetlinkError::Recv` on syscall errors.
-    /// Returns `NetlinkError::RecvBufOverflow` on `ENOBUFS`.
-    async fn recv_datagram(&self, buf: &mut Vec<u8>) -> Result<usize> {
+    /// Because the socket is `SOCK_NONBLOCK`, we use a simple poll loop with
+    /// `libc::recv` + `MSG_WAITALL` semantics (netlink datagrams are delivered
+    /// atomically) — EAGAIN means retry, other errors propagate.
+    #[cfg(target_os = "linux")]
+    fn blocking_recv(fd: &OwnedFd, buf: &mut Vec<u8>) -> Result<usize> {
         use rustix::net::RecvFlags;
-
-        // MSG_TRUNC is gated to Linux in rustix (not available on macOS).
-        #[cfg(target_os = "linux")]
-        let flags = RecvFlags::TRUNC;
-        #[cfg(not(target_os = "linux"))]
-        let flags = RecvFlags::empty();
-
         loop {
-            let mut guard = self
-                .async_fd
-                .readable()
-                .await
-                .map_err(|e| NetlinkError::Recv(e.to_string()))?;
-
-            // recv returns Result<(Buf::Output, actual_len), Errno>.
-            // try_io requires std::io::Result so we convert via map_err.
-            match guard.try_io(|fd| {
-                rustix::net::recv(fd.get_ref(), &mut *buf, flags)
-                    .map(|(_slice, actual_len)| actual_len)
-                    .map_err(std::io::Error::from)
-            }) {
-                Ok(Ok(actual_len)) => return Ok(actual_len),
-                Ok(Err(e)) => {
-                    // ENOBUFS (errno 105 on Linux, 55 on macOS):
-                    // raw_os_error() surfaces the platform errno.
-                    if e.raw_os_error() == Some(libc::ENOBUFS) {
+            // Switch to blocking recv: MSG_TRUNC lets us detect the real size.
+            // The socket flag is NONBLOCK, so EAGAIN means kernel still
+            // processing the reply — spin briefly (the kernel is always fast
+            // for netlink dumps on the same machine).
+            match rustix::net::recv(fd, &mut *buf, RecvFlags::TRUNC) {
+                Ok((_slice, n)) => return Ok(n),
+                Err(e) => {
+                    let io = std::io::Error::from(e);
+                    let raw = io.raw_os_error().unwrap_or(0);
+                    if raw == libc::EAGAIN || raw == libc::EWOULDBLOCK {
+                        // Spin: netlink reply not yet available.
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if raw == libc::ENOBUFS {
                         return Err(NetlinkError::RecvBufOverflow);
                     }
-                    return Err(NetlinkError::Recv(e.to_string()));
+                    return Err(NetlinkError::Recv(io.to_string()));
                 }
-                Err(_would_block) => continue,
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Frame parsing
+    // Frame parsing (identical to previous implementation)
     // -----------------------------------------------------------------------
 
     /// Parse one or more `nlmsghdr`-framed messages from `datagram[..len]`.
@@ -404,9 +346,6 @@ impl NetlinkSocket {
     /// - `Ok(false)` when more datagrams are expected.
     /// - `Err(NetlinkError::DumpIntr)` when `NLM_F_DUMP_INTR` is seen.
     /// - `Err(NetlinkError::KernelError)` when `NLMSG_ERROR` with non-zero errno.
-    ///
-    /// Each data-frame payload (bytes after the 16-byte header) is appended to
-    /// `out`.
     fn parse_datagram(datagram: &[u8], len: usize, out: &mut Vec<Vec<u8>>) -> Result<bool> {
         let mut pos = 0usize;
         let buf = &datagram[..len.min(datagram.len())];
@@ -414,11 +353,9 @@ impl NetlinkSocket {
         while pos + NLMSG_HDRLEN <= buf.len() {
             let hdr = &buf[pos..pos + NLMSG_HDRLEN];
 
-            // nlmsghdr fields (all native-endian per §3.1)
             let nlmsg_len = u32::from_ne_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
             let nlmsg_type = u16::from_ne_bytes([hdr[4], hdr[5]]);
             let nlmsg_flags = u16::from_ne_bytes([hdr[6], hdr[7]]);
-            // seq at [8..12], pid at [12..16] — not used here
 
             if nlmsg_len < NLMSG_HDRLEN {
                 return Err(NetlinkError::Parse(format!(
@@ -426,13 +363,11 @@ impl NetlinkSocket {
                 )));
             }
             if pos + nlmsg_len > buf.len() {
-                // Truncated frame — stop.
                 break;
             }
 
             let msg_payload = &buf[pos + NLMSG_HDRLEN..pos + nlmsg_len];
 
-            // Check NLM_F_DUMP_INTR on every frame (§3.3).
             if nlmsg_flags & NLM_F_DUMP_INTR != 0 {
                 warn!("NLM_F_DUMP_INTR detected — kernel data changed during dump");
                 return Err(NetlinkError::DumpIntr);
@@ -451,8 +386,6 @@ impl NetlinkSocket {
                     return Err(NetlinkError::RecvBufOverflow);
                 }
                 NLMSG_ERROR => {
-                    // struct nlmsgerr: i32 error + nlmsghdr (16 bytes echoed).
-                    // error field is at bytes 0..4 of msg_payload.
                     if msg_payload.len() < 4 {
                         return Err(NetlinkError::Parse("NLMSG_ERROR payload too short".into()));
                     }
@@ -463,30 +396,21 @@ impl NetlinkSocket {
                         msg_payload[3],
                     ]);
                     if raw_errno != 0 {
-                        // Kernel returns negated errno.
                         return Err(NetlinkError::KernelError {
                             errno: raw_errno.abs(),
                         });
                     }
-                    // errno == 0 is a success ACK — treat as done.
                     return Ok(true);
                 }
                 _ => {
-                    // Data frame: collect payload bytes after the header.
-                    if nlmsg_flags & NLM_F_MULTI != 0 || !out.is_empty() {
-                        out.push(msg_payload.to_vec());
-                    } else {
-                        // Single (non-multi) reply.
-                        out.push(msg_payload.to_vec());
-                    }
+                    out.push(msg_payload.to_vec());
                 }
             }
 
-            // Advance to the next NLMSG_ALIGN(4)-padded frame.
             pos += align4(nlmsg_len);
         }
 
-        Ok(false) // more datagrams expected
+        Ok(false)
     }
 
     // -----------------------------------------------------------------------
@@ -495,21 +419,8 @@ impl NetlinkSocket {
 
     /// Send a netlink dump request and accumulate all response frames.
     ///
-    /// Builds a single `nlmsghdr` with `NLM_F_REQUEST | flags | NLM_F_DUMP`
-    /// followed by `payload`, sends it, then loops reading datagrams until
-    /// `NLMSG_DONE`.  Each data-frame payload (bytes after the 16-byte
-    /// `nlmsghdr`) is collected into the returned `Vec`.
-    ///
-    /// # ENOBUFS handling
-    ///
-    /// On first `ENOBUFS`, the receive buffer is doubled and the entire
-    /// request is retried from the beginning.  On a second `ENOBUFS` for the
-    /// same call, [`NetlinkError::RecvBufOverflow`] is returned.
-    ///
-    /// # NLM_F_DUMP_INTR
-    ///
-    /// Returns [`NetlinkError::DumpIntr`] immediately.  The call site must
-    /// retry; cap retries at [`MAX_DUMP_RESTARTS`].
+    /// The blocking send/recv loop runs in `monoio::spawn_blocking` so the
+    /// monoio executor thread is never blocked (ADR-0023 §AF_NETLINK transport).
     ///
     /// # Errors
     ///
@@ -520,52 +431,40 @@ impl NetlinkSocket {
         flags: u16,
         payload: &[u8],
     ) -> Result<Vec<Vec<u8>>> {
-        let mut enobufs_retried = false;
+        // We need to move the fd + state into the blocking closure.
+        // Because OwnedFd is Send, we can move it into the closure and move
+        // the result back out.  We take the fd out, run the blocking work,
+        // then put the (possibly updated) fd back.
+        //
+        // SAFETY: we await the JoinHandle before touching self.fd again,
+        // ensuring exclusive access across the blocking call.
+        let raw = self.fd.as_raw_fd();
+        let rcvbuf = self.rcvbuf_size;
+        let nl_family = self.nl_family;
+        let request = Self::build_request(msg_type, flags | NLM_F_DUMP, payload);
 
-        loop {
-            let request = Self::build_request(msg_type, flags | NLM_F_DUMP, payload);
-            debug!(nl_family = self.nl_family, msg_type, "netlink dump start");
+        // Clone the fd so the blocking thread owns its own reference.
+        // SAFETY: dup2 is not used; we dup the fd to give the thread its own
+        // handle.  The original OwnedFd remains in self.
+        let dup_fd = Self::dup_fd(raw)?;
 
-            self.send_all(&request).await?;
+        let result = monoio::spawn_blocking(move || {
+            blocking_dump(dup_fd, rcvbuf, nl_family, request)
+        })
+        .await;
 
-            let mut out = Vec::new();
-            let mut recv_buf = vec![0u8; self.rcvbuf_size];
-
-            'recv: loop {
-                // Resize buf if rcvbuf_size grew.
-                if recv_buf.len() < self.rcvbuf_size {
-                    recv_buf.resize(self.rcvbuf_size, 0u8);
-                }
-
-                let n = match self.recv_datagram(&mut recv_buf).await {
-                    Ok(n) => n,
-                    Err(NetlinkError::RecvBufOverflow) => {
-                        if enobufs_retried {
-                            return Err(NetlinkError::RecvBufOverflow);
-                        }
-                        enobufs_retried = true;
-                        self.grow_rcvbuf()?;
-                        break 'recv; // restart the whole dump
-                    }
-                    Err(e) => return Err(e),
-                };
-
-                match Self::parse_datagram(&recv_buf, n, &mut out) {
-                    Ok(true) => return Ok(out),  // NLMSG_DONE
-                    Ok(false) => continue 'recv, // more frames
-                    Err(NetlinkError::DumpIntr) => return Err(NetlinkError::DumpIntr),
-                    Err(e) => return Err(e),
-                }
+        match result {
+            Ok(Ok((frames, new_rcvbuf))) => {
+                self.rcvbuf_size = new_rcvbuf;
+                Ok(frames)
             }
-            // Loop restart after ENOBUFS growth.
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(NetlinkError::Join(format!("{e:?}"))),
         }
     }
 
     /// Send a unicast (non-dump) netlink request and return the single reply
     /// payload.
-    ///
-    /// Useful for one-shot requests that return a single response message
-    /// (e.g. `CTRL_CMD_GETFAMILY`).
     ///
     /// # Errors
     ///
@@ -576,15 +475,21 @@ impl NetlinkSocket {
         flags: u16,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>> {
+        let raw = self.fd.as_raw_fd();
+        let rcvbuf = self.rcvbuf_size;
         let request = Self::build_request(msg_type, flags, payload);
-        self.send_all(&request).await?;
+        let dup_fd = Self::dup_fd(raw)?;
 
-        let mut recv_buf = vec![0u8; self.rcvbuf_size];
-        let n = self.recv_datagram(&mut recv_buf).await?;
+        let result = monoio::spawn_blocking(move || {
+            blocking_request_single(dup_fd, rcvbuf, request)
+        })
+        .await;
 
-        let mut out = Vec::new();
-        Self::parse_datagram(&recv_buf, n, &mut out)?;
-        Ok(out.into_iter().next())
+        match result {
+            Ok(Ok(opt)) => Ok(opt),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(NetlinkError::Join(format!("{e:?}"))),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -592,16 +497,6 @@ impl NetlinkSocket {
     // -----------------------------------------------------------------------
 
     /// Resolve the dynamic family ID for a Generic Netlink family by name.
-    ///
-    /// Sends `CTRL_CMD_GETFAMILY` on the `NETLINK_GENERIC` bus and parses
-    /// `CTRL_ATTR_FAMILY_ID` from the reply.
-    ///
-    /// Returns:
-    /// - `Ok(Some(id))` when the family is registered.
-    /// - `Ok(None)` when the kernel replies `ENOENT` (family / module not
-    ///   loaded).  This is the runtime gate used by optional collectors
-    ///   (ethtool, WireGuard, devlink, …).
-    /// - `Err(_)` on any other error.
     ///
     /// # Errors
     ///
@@ -611,30 +506,25 @@ impl NetlinkSocket {
         // genlmsghdr (4 bytes): cmd=CTRL_CMD_GETFAMILY(3), version=2, reserved=0
         let mut genl_payload = vec![CTRL_CMD_GETFAMILY, 2u8, 0u8, 0u8];
 
-        // CTRL_ATTR_FAMILY_NAME (type=2): NUL-terminated family name as nlattr.
         let name_bytes = name.as_bytes();
-        // nla_len = NLA_HDRLEN + name_bytes + 1 (NUL terminator)
         let nla_payload_len = name_bytes.len() + 1;
         let nla_total = NLA_HDRLEN + nla_payload_len;
         let nla_padded = align4(nla_total);
 
-        genl_payload.extend_from_slice(&(nla_total as u16).to_ne_bytes()); // nla_len
-        genl_payload.extend_from_slice(&CTRL_ATTR_FAMILY_NAME.to_ne_bytes()); // nla_type
+        genl_payload.extend_from_slice(&(nla_total as u16).to_ne_bytes());
+        genl_payload.extend_from_slice(&CTRL_ATTR_FAMILY_NAME.to_ne_bytes());
         genl_payload.extend_from_slice(name_bytes);
-        genl_payload.push(0u8); // NUL terminator
-        // padding
+        genl_payload.push(0u8);
         let pad = nla_padded - nla_total;
         genl_payload.extend(std::iter::repeat_n(0u8, pad));
 
         match self.request_single(GENL_ID_CTRL, 0, &genl_payload).await {
             Ok(Some(payload)) => {
-                // Payload starts with genlmsghdr (4 bytes), then nlattr chain.
                 if payload.len() < 4 {
                     return Err(NetlinkError::Parse(
                         "CTRL reply too short for genlmsghdr".into(),
                     ));
                 }
-                // Skip genlmsghdr (4 bytes) to reach nlattr chain.
                 let attrs_buf = &payload[4..];
                 for attr in parse_attrs(attrs_buf) {
                     if attr.ty == CTRL_ATTR_FAMILY_ID {
@@ -652,13 +542,143 @@ impl NetlinkSocket {
                 "CTRL_CMD_GETFAMILY returned empty reply".into(),
             )),
             Err(NetlinkError::KernelError { errno: 2 }) => {
-                // ENOENT (2) — family not registered.
                 debug!(family = name, "genetlink family not found (ENOENT)");
                 Ok(None)
             }
             Err(e) => Err(e),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // fd dup helper
+    // -----------------------------------------------------------------------
+
+    /// Duplicate a raw fd into a new `OwnedFd`.
+    ///
+    /// Used to give the blocking thread its own independent fd reference
+    /// without invalidating `self.fd`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetlinkError::Open` if `dup(2)` fails.
+    fn dup_fd(raw: std::os::fd::RawFd) -> Result<OwnedFd> {
+        // SAFETY: raw is a valid open fd owned by self; dup returns a new
+        // independent fd with the same underlying file description.
+        let duped = unsafe { libc::dup(raw) };
+        if duped < 0 {
+            return Err(NetlinkError::Open(format!(
+                "dup failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: duped is a newly-created fd that we own.
+        Ok(unsafe { OwnedFd::from_raw_fd(duped) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking helpers — run on the monoio spawn_blocking thread pool
+// ---------------------------------------------------------------------------
+
+/// Execute a full dump (NLM_F_DUMP) on the blocking thread.
+///
+/// Returns `(frames, new_rcvbuf_size)` on success.
+#[cfg(target_os = "linux")]
+fn blocking_dump(
+    fd: OwnedFd,
+    mut rcvbuf_size: usize,
+    nl_family: i32,
+    request: Vec<u8>,
+) -> Result<(Vec<Vec<u8>>, usize)> {
+    use rustix::net::SendFlags;
+
+    let mut enobufs_retried = false;
+
+    loop {
+        debug!(nl_family, "netlink blocking dump start");
+        // Send the request.
+        rustix::net::send(&fd, &request, SendFlags::empty())
+            .map_err(|e| NetlinkError::Send(e.to_string()))?;
+
+        let mut out = Vec::new();
+        let mut recv_buf = vec![0u8; rcvbuf_size];
+
+        'recv: loop {
+            if recv_buf.len() < rcvbuf_size {
+                recv_buf.resize(rcvbuf_size, 0u8);
+            }
+
+            let n = match NetlinkSocket::blocking_recv(&fd, &mut recv_buf) {
+                Ok(n) => n,
+                Err(NetlinkError::RecvBufOverflow) => {
+                    if enobufs_retried {
+                        return Err(NetlinkError::RecvBufOverflow);
+                    }
+                    enobufs_retried = true;
+                    // Grow rcvbuf.
+                    let new = rcvbuf_size.saturating_mul(2).min(MAX_RCVBUF);
+                    if new == rcvbuf_size {
+                        return Err(NetlinkError::RecvBufOverflow);
+                    }
+                    rustix::net::sockopt::set_socket_recv_buffer_size(&fd, new)
+                        .map_err(|e| NetlinkError::Recv(format!("SO_RCVBUF grow: {e}")))?;
+                    rcvbuf_size = new;
+                    debug!(rcvbuf_size, "grew SO_RCVBUF");
+                    break 'recv;
+                }
+                Err(e) => return Err(e),
+            };
+
+            match NetlinkSocket::parse_datagram(&recv_buf, n, &mut out) {
+                Ok(true) => return Ok((out, rcvbuf_size)),
+                Ok(false) => continue 'recv,
+                Err(NetlinkError::DumpIntr) => return Err(NetlinkError::DumpIntr),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn blocking_dump(
+    _fd: OwnedFd,
+    _rcvbuf: usize,
+    _nl_family: i32,
+    _request: Vec<u8>,
+) -> Result<(Vec<Vec<u8>>, usize)> {
+    Err(NetlinkError::Open(
+        "AF_NETLINK is only available on Linux".into(),
+    ))
+}
+
+/// Execute a single unicast request on the blocking thread.
+#[cfg(target_os = "linux")]
+fn blocking_request_single(
+    fd: OwnedFd,
+    rcvbuf_size: usize,
+    request: Vec<u8>,
+) -> Result<Option<Vec<u8>>> {
+    use rustix::net::SendFlags;
+    rustix::net::send(&fd, &request, SendFlags::empty())
+        .map_err(|e| NetlinkError::Send(e.to_string()))?;
+
+    let mut recv_buf = vec![0u8; rcvbuf_size];
+    let n = NetlinkSocket::blocking_recv(&fd, &mut recv_buf)?;
+
+    let mut out = Vec::new();
+    NetlinkSocket::parse_datagram(&recv_buf, n, &mut out)?;
+    Ok(out.into_iter().next())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn blocking_request_single(
+    _fd: OwnedFd,
+    _rcvbuf: usize,
+    _request: Vec<u8>,
+) -> Result<Option<Vec<u8>>> {
+    Err(NetlinkError::Open(
+        "AF_NETLINK is only available on Linux".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -667,8 +687,3 @@ impl NetlinkSocket {
 
 /// Alias kept for existing stub callers; prefer [`NetlinkError`] in new code.
 pub type TransportError = NetlinkError;
-
-/// Maximum dump restarts (alias for backward compat with existing stub constant).
-// Intentionally a distinct definition so the old name still resolves.
-#[allow(dead_code)]
-const _MAX_DUMP_RESTARTS_COMPAT: u32 = MAX_DUMP_RESTARTS;

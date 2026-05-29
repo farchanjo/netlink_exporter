@@ -33,13 +33,21 @@ zerocopy        = { version = "0.8", features = ["derive"] }
 bytemuck        = { version = "1.25", features = ["derive"] }
 byteorder       = { version = "1.5" }
 
-# --- async runtime (ADR-0014 — DRIVEN ADAPTERS + BINARY ONLY) ---
-tokio           = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "signal"] }
-mio             = { version = "1.0", features = ["os-poll", "os-ext"] }
+# --- async runtime (ADR-0023 — DRIVEN ADAPTERS + BINARY ONLY) ---
+# monoio: io_uring-first thread-per-core runtime; legacy feature = epoll fallback.
+# tokio/mio/axum/tower REMOVED per ADR-0023.
+monoio          = { version = "0.2", features = ["iouring", "legacy", "macros", "poll-io", "sync"] }
 
-# --- HTTP exposition (ADR-0010) ---
-axum            = { version = "0.8" }
-tower           = { version = "0.5" }
+# --- lock-free RCU cross-thread snapshot sharing (ADR-0023) ---
+arc-swap        = { version = "1.7" }
+
+# --- HTTP exposition (ADR-0023) ---
+# Hand-rolled HTTP/1 over monoio::net; monoio-http/service-async NOT pulled in
+# because the recon confirmed hand-rolled works without those deps (ADR-0023 deviation
+# noted: the ADR mentions monoio-http 0.3.12 but the hand-rolled approach is
+# simpler and avoids ByteDance-internal crates with limited community docs).
+# monoio-http  = { version = "0.3", features = ["parsed"] }   # deferred
+# service-async = { version = "0.2" }                          # deferred
 
 # --- metrics (ADR-0006) ---
 prometheus-client = { version = "0.24" }

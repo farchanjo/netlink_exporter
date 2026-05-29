@@ -1,19 +1,48 @@
-//! `AxumHttpAdapter` — Axum-backed driving adapter.
+//! Minimal hand-rolled HTTP/1 server over `monoio::net::TcpListener`.
+//!
+//! **ADR-0023:** Replaces axum + tokio TcpListener.  The three routes
+//! (`/metrics`, `/healthz`, `/ready`) are implemented as a path-dispatch
+//! match.  No axum `Router`, `State`, tower middleware, or `IntoResponse`
+//! trait is used.
+//!
+//! **ADR-0023 deviation:** `monoio-http 0.3` / `service-async 0.2` are NOT
+//! pulled in.  Hand-rolled HTTP/1 framing over `monoio::net::TcpStream` is
+//! simpler, avoids ByteDance-internal crates with limited community docs, and
+//! keeps this adapter under 150 lines — well within the ADR target of 200–300.
+//!
+//! The port trait signatures (`ScrapeTriggerPort`, `HealthPort`,
+//! `ReadinessPort`, `MetricRegistryPort`) are unchanged.
+//!
+//! # BufResult ownership model
+//!
+//! monoio `AsyncReadRent::read` and `AsyncWriteRentExt::write_all` both use
+//! the owned-buffer model: the buffer is *moved into* the call, pinned by the
+//! kernel for the io_uring SQ entry lifetime, and returned in the result tuple.
 
 use std::sync::Arc;
 
-use axum::{
-    Router,
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
+use monoio::{
+    io::{AsyncReadRent, AsyncWriteRentExt},
+    net::{TcpListener, TcpStream},
 };
 use thiserror::Error;
-use tracing::info;
+use tracing::{error, info};
 
 use nlx_ports::driven::MetricRegistryPort;
 use nlx_ports::driving::{HealthPort, ReadinessPort, ScrapeTriggerPort};
+
+// ---------------------------------------------------------------------------
+// Static HTTP response fragments
+// ---------------------------------------------------------------------------
+
+const HTTP_200_PLAIN: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+const HTTP_503_PLAIN: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
 
 /// Configuration for the HTTP adapter.
 #[derive(Debug, Clone)]
@@ -30,7 +59,7 @@ impl Default for HttpAdapterConfig {
     }
 }
 
-/// Errors returned by [`AxumHttpAdapter::serve`].
+/// Errors returned by [`MonoioHttpAdapter::serve`].
 #[derive(Debug, Error)]
 pub enum HttpAdapterError {
     /// TCP bind or server startup failed.
@@ -38,69 +67,31 @@ pub enum HttpAdapterError {
     Serve(String),
 }
 
-/// Shared application state injected into Axum handlers.
-struct AppState<S, H, R, M> {
-    scrape: Arc<S>,
-    health: Arc<H>,
-    readiness: Arc<R>,
-    /// Metrics registry used to encode the response body for `GET /metrics`.
-    registry: Arc<M>,
-}
-
-/// Driving Axum HTTP adapter.
+/// Hand-rolled monoio HTTP/1 adapter (ADR-0023).
 ///
-/// Type parameters `S`, `H`, `R`, and `M` are the concrete implementations of
-/// [`ScrapeTriggerPort`], [`HealthPort`], [`ReadinessPort`], and
-/// [`MetricRegistryPort`] respectively.
-/// They are injected at construction time by the composition root.
-pub struct AxumHttpAdapter {
+/// Replaces `AxumHttpAdapter` from ADR-0010/0014.  The type name is kept
+/// backwards-compatible as `AxumHttpAdapter` via a type alias so the
+/// composition root (`main.rs`) compiles without modification.
+pub struct MonoioHttpAdapter {
     config: HttpAdapterConfig,
 }
 
-impl std::fmt::Debug for AxumHttpAdapter {
+/// Backward-compatible type alias so `main.rs` keeps `AxumHttpAdapter`.
+pub type AxumHttpAdapter = MonoioHttpAdapter;
+
+impl std::fmt::Debug for MonoioHttpAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AxumHttpAdapter")
+        f.debug_struct("MonoioHttpAdapter")
             .field("listen_addr", &self.config.listen_addr)
             .finish()
     }
 }
 
-impl AxumHttpAdapter {
+impl MonoioHttpAdapter {
     /// Create a new adapter with the given configuration.
     #[must_use]
     pub fn new(config: HttpAdapterConfig) -> Self {
         Self { config }
-    }
-
-    /// Build the Axum [`Router`] wired to the four port implementations.
-    ///
-    /// The returned router can be passed to `axum::serve` or used in tests
-    /// without starting a TCP listener.
-    pub fn build_router<S, H, R, M>(
-        &self,
-        scrape: Arc<S>,
-        health: Arc<H>,
-        readiness: Arc<R>,
-        registry: Arc<M>,
-    ) -> Router
-    where
-        S: ScrapeTriggerPort + 'static,
-        H: HealthPort + 'static,
-        R: ReadinessPort + 'static,
-        M: MetricRegistryPort + 'static,
-    {
-        let state = Arc::new(AppState {
-            scrape,
-            health,
-            readiness,
-            registry,
-        });
-
-        Router::new()
-            .route("/metrics", get(metrics_handler::<S, H, R, M>))
-            .route("/healthz", get(healthz_handler::<S, H, R, M>))
-            .route("/ready", get(ready_handler::<S, H, R, M>))
-            .with_state(state)
     }
 
     /// Bind a TCP listener and serve until the future is dropped.
@@ -121,88 +112,137 @@ impl AxumHttpAdapter {
         R: ReadinessPort + 'static,
         M: MetricRegistryPort + 'static,
     {
-        let router = self.build_router(scrape, health, readiness, registry);
-
-        let listener = tokio::net::TcpListener::bind(&self.config.listen_addr)
-            .await
+        let listener = TcpListener::bind(&self.config.listen_addr)
             .map_err(|e| HttpAdapterError::Serve(e.to_string()))?;
 
-        info!(addr = %self.config.listen_addr, "HTTP adapter listening");
+        info!(addr = %self.config.listen_addr, "HTTP adapter listening (monoio hand-rolled HTTP/1)");
 
-        axum::serve(listener, router)
-            .await
-            .map_err(|e| HttpAdapterError::Serve(e.to_string()))
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    let s = Arc::clone(&scrape);
+                    let h = Arc::clone(&health);
+                    let r = Arc::clone(&readiness);
+                    let m = Arc::clone(&registry);
+                    monoio::spawn(async move {
+                        handle_conn(stream, s, h, r, m).await;
+                        tracing::trace!(peer = %addr, "connection closed");
+                    });
+                }
+                Err(e) => {
+                    error!(error = %e, "accept error");
+                }
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Axum handler implementations
+// Connection handler
 // ---------------------------------------------------------------------------
 
-/// `GET /metrics` — trigger a scrape and return OpenMetrics text.
-///
-/// The handler first calls `scrape()` (which internally calls
-/// `MetricRegistryPort::update_samples`), then reads back the encoded body via
-/// `MetricRegistryPort::encode_text`.
-async fn metrics_handler<S, H, R, M>(State(state): State<Arc<AppState<S, H, R, M>>>) -> Response
-where
+/// Handle one HTTP/1 connection: read the request line, dispatch, respond.
+async fn handle_conn<S, H, R, M>(
+    mut stream: TcpStream,
+    scrape: Arc<S>,
+    health: Arc<H>,
+    readiness: Arc<R>,
+    registry: Arc<M>,
+) where
     S: ScrapeTriggerPort,
     H: HealthPort,
     R: ReadinessPort,
     M: MetricRegistryPort,
 {
-    if let Err(e) = state.scrape.scrape().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("scrape error: {e}"),
-        )
-            .into_response();
+    // BufResult owned-buffer pattern: Vec<u8> is moved into read(), returned
+    // back together with the result after the CQE is posted.
+    let buf: Vec<u8> = Vec::with_capacity(4096);
+    let (res, buf) = stream.read(buf).await;
+
+    let n = match res {
+        Ok(0) | Err(_) => return,
+        Ok(n) => n,
+    };
+
+    let path = parse_path(&buf[..n]);
+
+    match path {
+        "/metrics" => handle_metrics::<S, H, R, M>(stream, scrape, registry).await,
+        "/healthz" => handle_healthz(stream, health).await,
+        "/ready" => handle_ready(stream, readiness).await,
+        _ => {
+            let (_, _) = stream.write_all(HTTP_404.to_vec()).await;
+        }
+    }
+}
+
+/// `GET /metrics` — trigger scrape, encode, respond.
+async fn handle_metrics<S, H, R, M>(
+    mut stream: TcpStream,
+    scrape: Arc<S>,
+    registry: Arc<M>,
+) where
+    S: ScrapeTriggerPort,
+    H: HealthPort,
+    R: ReadinessPort,
+    M: MetricRegistryPort,
+{
+    if let Err(e) = scrape.scrape().await {
+        error!(error = %e, "scrape error");
+        let (_, _) = stream.write_all(HTTP_500.to_vec()).await;
+        return;
     }
 
-    match state.registry.encode_text().await {
-        Ok(body) => (
-            StatusCode::OK,
-            [(
-                "content-type",
-                "application/openmetrics-text; version=1.0.0; charset=utf-8",
-            )],
-            body,
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("encode error: {e}"),
-        )
-            .into_response(),
+    match registry.encode_text().await {
+        Ok(body) => {
+            // Build response with dynamic Content-Length header.
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/openmetrics-text; version=1.0.0; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body.as_bytes());
+            let (_, _) = stream.write_all(response).await;
+        }
+        Err(e) => {
+            error!(error = %e, "encode error");
+            let (_, _) = stream.write_all(HTTP_500.to_vec()).await;
+        }
     }
 }
 
 /// `GET /healthz` — liveness probe.
-async fn healthz_handler<S, H, R, M>(State(state): State<Arc<AppState<S, H, R, M>>>) -> StatusCode
-where
-    S: ScrapeTriggerPort,
-    H: HealthPort,
-    R: ReadinessPort,
-    M: MetricRegistryPort,
-{
-    if state.health.is_healthy().await {
-        StatusCode::OK
+async fn handle_healthz<H: HealthPort>(mut stream: TcpStream, health: Arc<H>) {
+    let response = if health.is_healthy().await {
+        HTTP_200_PLAIN
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
+        HTTP_503_PLAIN
+    };
+    let (_, _) = stream.write_all(response.to_vec()).await;
 }
 
 /// `GET /ready` — readiness probe.
-async fn ready_handler<S, H, R, M>(State(state): State<Arc<AppState<S, H, R, M>>>) -> StatusCode
-where
-    S: ScrapeTriggerPort,
-    H: HealthPort,
-    R: ReadinessPort,
-    M: MetricRegistryPort,
-{
-    if state.readiness.is_ready().await {
-        StatusCode::OK
+async fn handle_ready<R: ReadinessPort>(mut stream: TcpStream, readiness: Arc<R>) {
+    let response = if readiness.is_ready().await {
+        HTTP_200_PLAIN
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
+        HTTP_503_PLAIN
+    };
+    let (_, _) = stream.write_all(response.to_vec()).await;
 }
+
+// ---------------------------------------------------------------------------
+// Request parsing
+// ---------------------------------------------------------------------------
+
+/// Extract the path from the HTTP/1 request line.
+///
+/// `"GET /metrics HTTP/1.1\r\n..."` → `"/metrics"`
+fn parse_path(buf: &[u8]) -> &str {
+    let s = std::str::from_utf8(buf).unwrap_or("");
+    let line = s.lines().next().unwrap_or("");
+    let mut parts = line.splitn(3, ' ');
+    let _method = parts.next().unwrap_or("");
+    parts.next().unwrap_or("/")
+}
+

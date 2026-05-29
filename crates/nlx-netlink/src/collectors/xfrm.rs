@@ -2,15 +2,19 @@
 //!
 //! Netlink family: `NETLINK_XFRM` (6).
 //! Messages used:
-//!   - `XFRM_MSG_GETSA` (0x0007) — SA dump
-//!   - `XFRM_MSG_GETPOLICY` (0x0009) — Policy dump
+//!   - `XFRM_MSG_GETSA` (0x0007) — SA dump → `nft_xfrm_sa_count`
+//!   - `XFRM_MSG_GETPOLICY` (0x0009) — Policy dump → `nft_xfrm_sp_count`
 //!   - `XFRM_MSG_GETSADINFO` (0x0011) — SAD hash counters + availability probe
 //!   - `XFRM_MSG_GETSPDINFO` (0x0012) — SPD hash counters
-//! Supplemental source: `/proc/net/xfrm_stat` (pre-aggregated by kernel, no
-//! CAP_NET_ADMIN required — §12.7).
+//!
+//! **ADR-0023 NATIVE-API ONLY:** `/proc/net/xfrm_stat` has been **removed**.
+//! The MIB error counters it exposes (XfrmInError, XfrmOutError, …) have no
+//! netlink path — they are only available via procfs.  Per ADR-0023 §6
+//! ("NATIVE API ONLY"), procfs reads are forbidden in exporter code.
+//! The `nft_xfrm_stat_total` metric family is dropped from this collector.
 //!
 //! Wire reference: netlink-protocol.md §12.
-//! ADR refs: ADR-0011, ADR-0014, ADR-0016.
+//! ADR refs: ADR-0011, ADR-0023.
 //!
 //! ## Metrics produced
 //!
@@ -22,7 +26,6 @@
 //! | `nft_xfrm_sad_hash_max` | — | gauge |
 //! | `nft_xfrm_spd_hash_count` | — | gauge |
 //! | `nft_xfrm_spd_hash_max` | — | gauge |
-//! | `nft_xfrm_stat_total` | `{counter}` | counter |
 
 use std::collections::BTreeMap;
 
@@ -95,42 +98,9 @@ const XFRM_SADINFO_MIN: usize = 8;
 /// Minimum body size of `xfrm_spdinfo` (8 bytes: spdhcnt u32 + spdhmcnt u32).
 const XFRM_SPDINFO_MIN: usize = 8;
 
-// ---------------------------------------------------------------------------
-// /proc/net/xfrm_stat key set (§12.7)
-//
-// Fixed kernel ABI set — 26 keys. Unknown keys are silently ignored for
-// forward-compatibility with future kernel versions.
-// ---------------------------------------------------------------------------
-
-/// Compile-time list of all known `/proc/net/xfrm_stat` counter names.
-const XFRM_STAT_KEYS: &[&str; 26] = &[
-    "XfrmInError",
-    "XfrmInBufferError",
-    "XfrmInHdrError",
-    "XfrmInNoStates",
-    "XfrmInStateProtoError",
-    "XfrmInStateModeError",
-    "XfrmInStateSeqError",
-    "XfrmInStateExpired",
-    "XfrmInStateMismatch",
-    "XfrmInStateInvalid",
-    "XfrmInTmplMismatch",
-    "XfrmInNoPols",
-    "XfrmInPolBlock",
-    "XfrmInPolError",
-    "XfrmOutError",
-    "XfrmOutBundleGenError",
-    "XfrmOutBundleCheckError",
-    "XfrmOutNoStates",
-    "XfrmOutStateProtoError",
-    "XfrmOutStateModeError",
-    "XfrmOutStateSeqError",
-    "XfrmOutStateExpired",
-    "XfrmOutPolBlock",
-    "XfrmOutPolDead",
-    "XfrmOutPolError",
-    "XfrmFwdHdrError",
-];
+// /proc/net/xfrm_stat REMOVED — ADR-0023 §NATIVE API ONLY.
+// The MIB error counters (XfrmInError, XfrmOutError, etc.) have no netlink
+// path; procfs reads are forbidden in exporter code per ADR-0023.
 
 // ---------------------------------------------------------------------------
 // Label helpers (§12.3, §12.4)
@@ -403,27 +373,7 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
         Err(e) => return Err(CollectError::Io(e.to_string())),
     }
 
-    // ── /proc/net/xfrm_stat (§12.7) ─────────────────────────────────────────
-    // Blocking filesystem read; must be wrapped in `spawn_blocking`.
-    match tokio::task::spawn_blocking(read_xfrm_stat).await {
-        Ok(Ok(stat_map)) => {
-            for (key, val) in stat_map {
-                let mut lc = BTreeMap::new();
-                lc.insert("counter".into(), key.into());
-                samples.push(MetricSample::counter(
-                    "nft_xfrm_stat_total",
-                    "XFRM subsystem error counters from /proc/net/xfrm_stat",
-                    lc,
-                    val,
-                ));
-            }
-        }
-        Ok(Err(e)) => {
-            // procfs unavailable (e.g. non-Linux or CONFIG_XFRM disabled).
-            debug!(error = %e, "/proc/net/xfrm_stat read failed; skipping");
-        }
-        Err(e) => return Err(CollectError::Io(format!("spawn_blocking panic: {e}"))),
-    }
+    // nft_xfrm_stat_total omitted — no netlink path for MIB counters (ADR-0023).
 
     Ok(samples)
 }
@@ -452,36 +402,4 @@ async fn dump_with_restarts(
     Err(CollectError::DumpIntr)
 }
 
-// ---------------------------------------------------------------------------
-// /proc/net/xfrm_stat parser (blocking, called inside spawn_blocking)
-// ---------------------------------------------------------------------------
-
-/// Read and parse `/proc/net/xfrm_stat`.
-///
-/// Returns a map of known counter names → u64 values.
-/// Unknown keys are silently ignored for forward-compatibility.
-///
-/// # Errors
-///
-/// Returns `std::io::Error` when the file cannot be read (absent on non-Linux
-/// or when `CONFIG_XFRM` is disabled).
-fn read_xfrm_stat() -> std::io::Result<BTreeMap<&'static str, u64>> {
-    let text = std::fs::read_to_string("/proc/net/xfrm_stat")?;
-    let mut result: BTreeMap<&'static str, u64> = BTreeMap::new();
-
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        let key = match parts.next() {
-            Some(k) => k,
-            None => continue,
-        };
-        let val: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-
-        // Only emit known keys — unknown keys silently ignored.
-        if let Some(&static_key) = XFRM_STAT_KEYS.iter().find(|&&k| k == key) {
-            result.insert(static_key, val);
-        }
-    }
-
-    Ok(result)
-}
+// /proc/net/xfrm_stat parser removed per ADR-0023 §NATIVE API ONLY.

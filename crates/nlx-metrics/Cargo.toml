@@ -7,10 +7,12 @@ authors.workspace    = true
 license.workspace    = true
 description = "Driven metrics adapter: prometheus-client OpenMetrics text exposition implementing MetricRegistryPort (ADR-0006)."
 
+# ADR-0023: prometheus-client retained but not on hot path.
+# arc-swap replaces Mutex for lock-free encoded text storage.
 [dependencies]
 nlx-domain        = { workspace = true }
 nlx-ports         = { workspace = true }
-prometheus-client = { workspace = true }
+arc-swap          = { workspace = true }
 thiserror         = { workspace = true }
 
 [lints]

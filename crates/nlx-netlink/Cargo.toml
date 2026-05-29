@@ -5,16 +5,16 @@ edition.workspace    = true
 rust-version.workspace = true
 authors.workspace    = true
 license.workspace    = true
-description = "Driven infrastructure adapters: AF_NETLINK socket transport + per-subsystem collectors (ADR-0011, ADR-0014)."
+description = "Driven infrastructure adapters: AF_NETLINK socket transport + per-subsystem collectors (ADR-0011, ADR-0023)."
 
-# ADR-0014: tokio + mio are CONFINED to this crate and the binary composition
-# root.  They MUST NOT appear in nlx-domain or nlx-ports.
+# ADR-0023: monoio (io_uring-first) replaces tokio + mio in this crate.
+# poll-io feature enables spawn_blocking for the blocking AF_NETLINK dump path.
+# tokio and mio are REMOVED per ADR-0023.
 [dependencies]
 nlx-domain   = { workspace = true }
 nlx-ports    = { workspace = true }
 libc         = { workspace = true }
-tokio        = { workspace = true, features = ["rt", "net", "time", "macros", "sync", "io-util"] }
-mio          = { workspace = true }
+monoio       = { workspace = true, features = ["sync"] }
 rustix       = { workspace = true }
 linux-raw-sys = { workspace = true }
 zerocopy     = { workspace = true }

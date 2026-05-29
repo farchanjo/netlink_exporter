@@ -14,12 +14,21 @@
 //! **Decision**: hand-encode the Prometheus text format from `MetricSample`
 //! values.  This produces spec-compliant output, keeps the adapter simple, and
 //! avoids forcing the domain model to conform to the library's type constraints.
-//! The `prometheus-client` dependency is retained for potential future use but
-//! no longer participates in the hot path.
+//!
+//! # ADR-0023 — lock-free storage
+//!
+//! The encoded body is now stored in `arc_swap::ArcSwap<Arc<str>>` (RCU).
+//! `update_samples` does an atomic `store()`; `encode_text` does a wait-free
+//! `load()`.  No `Mutex` or `RwLock` is used anywhere in this adapter.
+
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use nlx_domain::metric::{MetricKind, MetricSample, MetricValue};
 use nlx_ports::driven::MetricRegistryPort;
-use std::{collections::BTreeMap, fmt::Write as FmtWrite, sync::Mutex};
+use std::collections::BTreeMap;
+use std::fmt::Write as FmtWrite;
 use thiserror::Error;
 
 /// Errors emitted by the prometheus-client adapter.
@@ -28,13 +37,6 @@ pub enum RegistryError {
     /// Text encoding failed.
     #[error("OpenMetrics encode error: {0}")]
     Encode(String),
-    /// Registry is poisoned (Mutex was poisoned by a panicking thread).
-    ///
-    /// Constructed by helpers that return this type directly; the
-    /// `MetricRegistryPort` impl converts to `String` via `map_err`.
-    #[allow(dead_code)]
-    #[error("metric registry lock poisoned")]
-    LockPoisoned,
 }
 
 /// Driven adapter that maps [`MetricSample`]s into Prometheus/OpenMetrics text.
@@ -43,9 +45,12 @@ pub enum RegistryError {
 /// call.  The HTTP `/metrics` handler reads it via
 /// [`MetricRegistryPort::encode_text`].  Snapshot semantics: each call to
 /// `update_samples` fully replaces the stored body.
+///
+/// **Lock-free (ADR-0023):** uses `ArcSwap<Arc<str>>` (RCU) — zero `Mutex` /
+/// `RwLock`.  Writers do one atomic pointer swap; readers do one wait-free load.
 pub struct PrometheusRegistryAdapter {
-    /// Latest encoded Prometheus text body.
-    encoded: Mutex<String>,
+    /// Latest encoded Prometheus text body; updated atomically by `update_samples`.
+    encoded: ArcSwap<Arc<str>>,
 }
 
 impl std::fmt::Debug for PrometheusRegistryAdapter {
@@ -59,7 +64,7 @@ impl PrometheusRegistryAdapter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            encoded: Mutex::new(String::new()),
+            encoded: ArcSwap::new(Arc::new(Arc::from(""))),
         }
     }
 }
@@ -73,20 +78,15 @@ impl Default for PrometheusRegistryAdapter {
 impl MetricRegistryPort for PrometheusRegistryAdapter {
     async fn update_samples(&self, samples: Vec<MetricSample>) -> Result<(), String> {
         let text = encode_samples(&samples).map_err(|e| e.to_string())?;
-        let mut guard = self
-            .encoded
-            .lock()
-            .map_err(|_| "metric registry lock poisoned".to_owned())?;
-        *guard = text;
+        // Atomic RCU store — no lock, no blocking, safe from any thread.
+        self.encoded.store(Arc::new(Arc::from(text.as_str())));
         Ok(())
     }
 
     async fn encode_text(&self) -> Result<String, String> {
-        let guard = self
-            .encoded
-            .lock()
-            .map_err(|_| "metric registry lock poisoned".to_owned())?;
-        Ok(guard.clone())
+        // Wait-free load — returns a guard that keeps the Arc alive.
+        let guard = self.encoded.load();
+        Ok(guard.as_ref().to_string())
     }
 }
 
@@ -105,9 +105,6 @@ impl MetricRegistryPort for PrometheusRegistryAdapter {
 /// Returns [`RegistryError::Encode`] if string formatting fails (practically
 /// infallible for in-memory `String` writes, but propagated for correctness).
 fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
-    // Group: name → (help, kind, Vec<(labels, value)>)
-    // BTreeMap preserves insertion order among names that differ; we want
-    // stable output so use BTreeMap keyed by name.
     let mut groups: BTreeMap<&'static str, GroupEntry<'_>> = BTreeMap::new();
 
     for sample in samples {
@@ -122,7 +119,6 @@ fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
     let mut out = String::with_capacity(samples.len().saturating_mul(64));
 
     for (name, group) in &groups {
-        // Escape the help string: backslash and newline must be escaped.
         let help_escaped = escape_help(group.help);
         write!(out, "# HELP {name} {help_escaped}\n")
             .map_err(|e| RegistryError::Encode(e.to_string()))?;
@@ -135,8 +131,7 @@ fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
         }
     }
 
-    // OpenMetrics spec: body MUST end with "# EOF\n" when using the
-    // application/openmetrics-text content type.
+    // OpenMetrics spec: body MUST end with "# EOF\n".
     out.push_str("# EOF\n");
 
     Ok(out)
@@ -186,8 +181,6 @@ fn escape_label_value(s: &str) -> String {
 }
 
 /// Write one `name{labels} value` line into `out`.
-///
-/// Labels are sourced from a `BTreeMap` so they are already sorted.
 fn write_sample_line(
     out: &mut String,
     name: &str,
@@ -220,8 +213,7 @@ fn write_sample_line(
     Ok(())
 }
 
-/// Write an f64 in a Prometheus-compatible way: NaN → `NaN`, ±Inf →
-/// `+Inf`/`-Inf`, otherwise standard decimal.
+/// Write an f64 in a Prometheus-compatible way.
 fn write_f64(out: &mut String, v: f64) -> Result<(), std::fmt::Error> {
     if v.is_nan() {
         out.push_str("NaN");
