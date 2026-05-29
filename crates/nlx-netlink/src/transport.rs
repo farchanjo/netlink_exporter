@@ -809,9 +809,14 @@ fn blocking_request_single(
     uring_send(&mut ring, raw_fd, &request)?;
 
     // --- IORING_OP_RECV loop ---
-    // IOU-07: loop until parse_datagram returns Ok(true) so that multi-part
-    // unicast replies (NLM_F_MULTI + NLMSG_DONE in a separate datagram) are
-    // fully consumed before we return the first payload frame.
+    // A `request_single` reply is a SINGLE (non-dump) message: `CTRL_CMD_GETFAMILY`,
+    // GETSADINFO, an `NLM_F_ACK`, etc.  Such a reply carries NO `NLMSG_DONE`
+    // terminator, so `parse_datagram` returns `Ok(false)` after pushing the
+    // payload.  We must therefore return as soon as we have a frame — looping
+    // until `Ok(true)` (DONE) would block forever on the next recv (the bug that
+    // hung the first genetlink probe at startup).  We still return on `Ok(true)`
+    // for the ACK/error case (empty `out` → `None`), and skip empty datagrams
+    // (e.g. a lone `NLMSG_NOOP`) by recving again.
     let buf_len = rcvbuf_size.max(RECV_BUF_LEN);
     let mut recv_buf = vec![0u8; buf_len];
     let mut out: Vec<Vec<u8>> = Vec::new();
@@ -819,7 +824,8 @@ fn blocking_request_single(
     loop {
         let n = uring_recv(&mut ring, raw_fd, &mut recv_buf)?;
 
-        if NetlinkSocket::parse_datagram(&recv_buf, n, &mut out)? {
+        let done = NetlinkSocket::parse_datagram(&recv_buf, n, &mut out)?;
+        if done || !out.is_empty() {
             return Ok(out.into_iter().next());
         }
     }

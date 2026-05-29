@@ -20,6 +20,21 @@
 //!
 //! Labels: `{interface}` for device info; `{interface, peer}` for per-peer
 //! metrics (peer = truncated sha256 of pubkey — 16 hex chars).
+//!
+//! ## MC-004: volatile device state
+//!
+//! `listen_port` and `fwmark` are runtime-mutable and are **not** embedded as
+//! label dimensions on `nft_wireguard_device_info`.  Instead they are emitted
+//! as separate gauges (`nft_wireguard_device_listen_port`,
+//! `nft_wireguard_device_fwmark`) so that changes do not multiply label sets
+//! in Prometheus.
+//!
+//! ## TC-006: peer cap
+//!
+//! `WireguardCollector::new(max_peers)` enforces a configurable upper bound on
+//! the number of peers emitted per device.  Peers beyond the cap are silently
+//! dropped (the total count is still observable via
+//! `nft_wireguard_device_peer_count`).
 
 use std::collections::BTreeMap;
 
@@ -64,7 +79,27 @@ const WGPEER_A_TX_BYTES: u16 = 8;
 // WGPEER_A_ALLOWEDIPS = 9 — DISCARDED (per-peer routing prefixes, ADR-0005).
 
 /// Adapter implementing [`NetlinkWireguardPort`] and [`Collector`] for `WireGuard`.
-pub struct WireguardCollector;
+///
+/// `max_peers` caps the number of peers emitted per device (TC-006).  The
+/// default is 1 000 (matches `ExporterConfig::wireguard_max_peers` default).
+pub struct WireguardCollector {
+    /// Maximum number of peers to emit metrics for per `WireGuard` interface.
+    max_peers: usize,
+}
+
+impl WireguardCollector {
+    /// Create a collector that emits at most `max_peers` peers per interface.
+    #[must_use]
+    pub fn new(max_peers: usize) -> Self {
+        Self { max_peers }
+    }
+}
+
+impl Default for WireguardCollector {
+    fn default() -> Self {
+        Self { max_peers: 1_000 }
+    }
+}
 
 impl NetlinkWireguardPort for WireguardCollector {
     async fn dump_devices(&self) -> Result<Vec<WireguardDevice>, DomainError> {
@@ -139,7 +174,8 @@ impl Collector for WireguardCollector {
                 let Some(dev) = parse_device(&frame[4..]) else {
                     continue;
                 };
-                push_device_metrics(&mut out, &dev, now_secs);
+                // TC-006: enforce the configured peer cap before metric emission.
+                push_device_metrics(&mut out, &dev, now_secs, self.max_peers);
             }
             Ok(out)
         })
@@ -330,23 +366,50 @@ fn pubkey_hash(key: &[u8]) -> String {
     clippy::cast_precision_loss,
     reason = "handshake age math; f64/i64 seconds within representable range"
 )]
-fn push_device_metrics(out: &mut Vec<MetricSample>, dev: &WireguardDevice, now_secs: i64) {
-    // Device info gauge.
-    let mut dev_labels = BTreeMap::new();
-    dev_labels.insert("interface".to_owned(), dev.if_name.clone());
+fn push_device_metrics(
+    out: &mut Vec<MetricSample>,
+    dev: &WireguardDevice,
+    now_secs: i64,
+    max_peers: usize,
+) {
+    // MC-004: device_info carries only the stable interface name label.
+    // listen_port and fwmark are runtime-mutable — they are emitted as
+    // separate gauges so that a port or fwmark change does not create a new
+    // label-set stale series in Prometheus.
+    let mut base_labels = BTreeMap::new();
+    base_labels.insert("interface".to_owned(), dev.if_name.clone());
+
     out.push(MetricSample::gauge(
         "nft_wireguard_device_info",
-        "WireGuard device metadata (listen port and fwmark).",
-        {
-            let mut m = dev_labels.clone();
-            m.insert("listen_port".to_owned(), dev.listen_port.to_string());
-            m.insert("fwmark".to_owned(), dev.fwmark.to_string());
-            m
-        },
+        "WireGuard device presence (always 1 when the interface exists).",
+        base_labels.clone(),
         1.0,
     ));
 
-    for peer in &dev.peers {
+    out.push(MetricSample::gauge(
+        "nft_wireguard_device_listen_port",
+        "WireGuard device UDP listen port; 0 when unbound.",
+        base_labels.clone(),
+        f64::from(dev.listen_port),
+    ));
+
+    out.push(MetricSample::gauge(
+        "nft_wireguard_device_fwmark",
+        "WireGuard device firewall mark; 0 when unset.",
+        base_labels.clone(),
+        f64::from(dev.fwmark),
+    ));
+
+    // Emit total peer count (before cap) so operators can detect truncation.
+    out.push(MetricSample::gauge(
+        "nft_wireguard_device_peer_count",
+        "Total number of WireGuard peers configured on this interface (before max_peers cap).",
+        base_labels.clone(),
+        dev.peers.len() as f64,
+    ));
+
+    // TC-006: apply the configured peer cap.
+    for peer in dev.peers.iter().take(max_peers) {
         let mut peer_labels = BTreeMap::new();
         peer_labels.insert("interface".to_owned(), dev.if_name.clone());
         peer_labels.insert("peer".to_owned(), peer.peer_id.clone());
@@ -384,5 +447,319 @@ fn push_device_metrics(out: &mut Vec<MetricSample>, dev: &WireguardDevice, now_s
             peer_labels,
             f64::from(peer.persistent_keepalive_secs),
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests (TC-006)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::panic,
+    clippy::float_cmp,
+    reason = "test"
+)]
+mod tests {
+    use nlx_domain::metric::MetricValue;
+
+    use super::*;
+    use crate::wire::{NLA_HDRLEN, align4};
+
+    // -----------------------------------------------------------------------
+    // NLA construction helpers
+    // -----------------------------------------------------------------------
+
+    fn make_nla(ty: u16, payload: &[u8]) -> Vec<u8> {
+        let nla_len = NLA_HDRLEN + payload.len();
+        let padded = align4(nla_len);
+        let mut out = Vec::with_capacity(padded);
+        out.extend_from_slice(&(nla_len as u16).to_ne_bytes());
+        out.extend_from_slice(&ty.to_ne_bytes());
+        out.extend_from_slice(payload);
+        out.resize(padded, 0u8);
+        out
+    }
+
+    fn make_nested(ty: u16, inner: &[u8]) -> Vec<u8> {
+        make_nla(ty | 0x8000, inner)
+    }
+
+    // -----------------------------------------------------------------------
+    // Security: WGDEVICE_A_PRIVATE_KEY / WGPEER_A_PRESHARED_KEY never appear
+    // in WireguardDevice / WireguardPeer (TC-006-A).
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal PEERS attr containing one peer with public + preshared keys.
+    fn make_peer_with_keys(pubkey: &[u8; 32], psk: &[u8; 32]) -> Vec<u8> {
+        let mut peer_attrs = Vec::new();
+        peer_attrs.extend(make_nla(WGPEER_A_PUBLIC_KEY, pubkey));
+        peer_attrs.extend(make_nla(WGPEER_A_PRESHARED_KEY, psk));
+        peer_attrs.extend(make_nla(WGPEER_A_RX_BYTES, &100u64.to_ne_bytes()));
+        peer_attrs.extend(make_nla(WGPEER_A_TX_BYTES, &200u64.to_ne_bytes()));
+        // A single peer container is one nested NLA inside WGDEVICE_A_PEERS.
+        make_nested(0, &peer_attrs) // type=0 for the container; parser uses payload
+    }
+
+    /// Build a device frame with a peer carrying both key attrs.
+    fn make_device_frame(ifname: &[u8], pubkey: &[u8; 32], psk: &[u8; 32]) -> Vec<u8> {
+        let peer_container = make_peer_with_keys(pubkey, psk);
+        let peers_nla = make_nested(WGDEVICE_A_PEERS, &peer_container);
+
+        let mut attrs = Vec::new();
+        attrs.extend(make_nla(WGDEVICE_A_IFNAME, ifname));
+        attrs.extend(make_nla(WGDEVICE_A_LISTEN_PORT, &51820u16.to_ne_bytes()));
+        attrs.extend(make_nla(WGDEVICE_A_FWMARK, &0u32.to_ne_bytes()));
+        attrs.extend(peers_nla);
+        attrs
+    }
+
+    /// TC-006-A: private key and preshared key must not appear in parsed structs.
+    ///
+    /// `WireguardDevice` and `WireguardPeer` contain no raw key fields by design.
+    /// The parser discards `WGDEVICE_A_PRIVATE_KEY` and `WGPEER_A_PRESHARED_KEY`
+    /// on sight.  This test confirms the struct fields are absent (the type system
+    /// enforces this; the test makes the invariant explicit and detectable as doc).
+    #[test]
+    fn private_key_and_psk_not_in_parsed_structs() {
+        let pubkey = [0xABu8; 32];
+        let psk = [0xCDu8; 32];
+
+        let attrs = make_device_frame(b"wg0\0", &pubkey, &psk);
+        let dev = parse_device(&attrs).expect("must parse");
+
+        // WireguardDevice has no raw key field — verified by field enumeration.
+        let WireguardDevice {
+            if_name,
+            listen_port,
+            fwmark,
+            peers,
+        } = &dev;
+        assert_eq!(if_name, "wg0");
+        assert_eq!(*listen_port, 51820);
+        assert_eq!(*fwmark, 0);
+        assert_eq!(peers.len(), 1);
+
+        // WireguardPeer has no raw key field.
+        let WireguardPeer {
+            peer_id,
+            rx_bytes,
+            tx_bytes,
+            last_handshake_secs,
+            persistent_keepalive_secs,
+            endpoint_present,
+        } = &peers[0];
+        // peer_id is the FNV hash — not the raw key.
+        assert_ne!(
+            peer_id.as_bytes(),
+            &pubkey[..],
+            "peer_id must not be raw pubkey"
+        );
+        assert_eq!(peer_id.len(), 16, "peer_id must be 16 hex chars");
+        assert_eq!(*rx_bytes, 100);
+        assert_eq!(*tx_bytes, 200);
+        // No last-handshake time sent → None.
+        assert!(last_handshake_secs.is_none());
+        assert_eq!(*persistent_keepalive_secs, 0);
+        assert!(!endpoint_present);
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-006-B: tv_sec == 0 → last_handshake_secs == None ("never")
+    // -----------------------------------------------------------------------
+
+    fn make_peer_with_hs(pubkey: &[u8; 32], tv_sec: u64) -> Vec<u8> {
+        let mut timespec = [0u8; 16];
+        timespec[..8].copy_from_slice(&tv_sec.to_ne_bytes());
+        // tv_nsec = 0
+        let mut peer_attrs = Vec::new();
+        peer_attrs.extend(make_nla(WGPEER_A_PUBLIC_KEY, pubkey));
+        peer_attrs.extend(make_nla(WGPEER_A_LAST_HANDSHAKE_TIME, &timespec));
+        make_nested(0, &peer_attrs)
+    }
+
+    #[test]
+    fn tv_sec_zero_maps_to_none_handshake() {
+        let pubkey = [0x01u8; 32];
+        let peer_container = make_peer_with_hs(&pubkey, 0);
+        // parse_peer operates on the payload of the container NLA.
+        // The container NLA layout: nla_len(u16) + nla_ty(u16) + payload.
+        let nla_len = u16::from_ne_bytes([peer_container[0], peer_container[1]]) as usize;
+        let payload = &peer_container[4..nla_len];
+        let p = parse_peer(payload).expect("must parse peer");
+        assert!(
+            p.last_handshake_secs.is_none(),
+            "tv_sec=0 must produce None (never handshaked)"
+        );
+    }
+
+    #[test]
+    fn tv_sec_nonzero_maps_to_some_handshake() {
+        let pubkey = [0x02u8; 32];
+        let peer_container = make_peer_with_hs(&pubkey, 1_700_000_000);
+        let nla_len = u16::from_ne_bytes([peer_container[0], peer_container[1]]) as usize;
+        let payload = &peer_container[4..nla_len];
+        let p = parse_peer(payload).expect("must parse peer");
+        assert!(
+            p.last_handshake_secs.is_some(),
+            "tv_sec>0 must produce Some"
+        );
+        let tv = p.last_handshake_secs.expect("checked Some above");
+        assert!(
+            (tv - 1_700_000_000.0_f64).abs() < 1.0,
+            "stored tv_sec must be ≈ 1_700_000_000"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-006-C: peer cap is enforced in push_device_metrics
+    // -----------------------------------------------------------------------
+
+    fn make_peer_stub(id: u8) -> WireguardPeer {
+        WireguardPeer {
+            peer_id: format!("{id:016x}"),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            last_handshake_secs: None,
+            persistent_keepalive_secs: 0,
+            endpoint_present: false,
+        }
+    }
+
+    #[test]
+    fn peer_cap_limits_emitted_peers() {
+        let dev = WireguardDevice {
+            if_name: "wg0".to_owned(),
+            listen_port: 51820,
+            fwmark: 0,
+            peers: (0u8..10).map(make_peer_stub).collect(),
+        };
+
+        let mut out = Vec::new();
+        push_device_metrics(&mut out, &dev, 0, 3); // cap = 3
+
+        // Count how many distinct peer label values appear.
+        let peer_labels: std::collections::BTreeSet<String> = out
+            .iter()
+            .filter_map(|s| s.labels.get("peer").cloned())
+            .collect();
+        assert_eq!(
+            peer_labels.len(),
+            3,
+            "only 3 peers must be emitted when max_peers=3"
+        );
+    }
+
+    #[test]
+    fn peer_cap_zero_emits_no_peer_metrics() {
+        let dev = WireguardDevice {
+            if_name: "wg0".to_owned(),
+            listen_port: 51820,
+            fwmark: 0,
+            peers: (0u8..5).map(make_peer_stub).collect(),
+        };
+
+        let mut out = Vec::new();
+        push_device_metrics(&mut out, &dev, 0, 0); // cap = 0
+
+        let has_peer_label = out.iter().any(|s| s.labels.contains_key("peer"));
+        assert!(!has_peer_label, "cap=0 must emit no peer metrics");
+    }
+
+    #[test]
+    fn peer_count_gauge_reflects_uncapped_total() {
+        let dev = WireguardDevice {
+            if_name: "wg0".to_owned(),
+            listen_port: 51820,
+            fwmark: 0,
+            peers: (0u8..10).map(make_peer_stub).collect(),
+        };
+
+        let mut out = Vec::new();
+        push_device_metrics(&mut out, &dev, 0, 3);
+
+        let count_gauge = out
+            .iter()
+            .find(|s| s.name == "nft_wireguard_device_peer_count")
+            .expect("peer_count gauge must be emitted");
+        // Value must be 10 (total), not 3 (cap).
+        let MetricValue::F64(peer_count_val) = count_gauge.value else {
+            panic!("peer_count gauge must have F64 value");
+        };
+        assert!(
+            (peer_count_val - 10.0_f64).abs() < f64::EPSILON,
+            "peer_count must reflect the uncapped total (10)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MC-004: device_info must not carry listen_port or fwmark as labels
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn device_info_has_no_volatile_labels() {
+        let dev = WireguardDevice {
+            if_name: "wg0".to_owned(),
+            listen_port: 51820,
+            fwmark: 42,
+            peers: vec![],
+        };
+
+        let mut out = Vec::new();
+        push_device_metrics(&mut out, &dev, 0, 1_000);
+
+        let info = out
+            .iter()
+            .find(|s| s.name == "nft_wireguard_device_info")
+            .expect("device_info must be present");
+
+        assert!(
+            !info.labels.contains_key("listen_port"),
+            "device_info must not carry listen_port label"
+        );
+        assert!(
+            !info.labels.contains_key("fwmark"),
+            "device_info must not carry fwmark label"
+        );
+        assert_eq!(
+            info.labels.get("interface").map(String::as_str),
+            Some("wg0")
+        );
+
+        // Volatile values must appear as separate gauges.
+        let has_port_gauge = out
+            .iter()
+            .any(|s| s.name == "nft_wireguard_device_listen_port");
+        let has_fwmark_gauge = out.iter().any(|s| s.name == "nft_wireguard_device_fwmark");
+        assert!(has_port_gauge, "listen_port must have its own gauge");
+        assert!(has_fwmark_gauge, "fwmark must have its own gauge");
+    }
+
+    // -----------------------------------------------------------------------
+    // pubkey_hash: deterministic, 16 chars, all lowercase hex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pubkey_hash_is_deterministic_and_16_hex_chars() {
+        let key = [0xABu8; 32];
+        let h1 = pubkey_hash(&key);
+        let h2 = pubkey_hash(&key);
+        assert_eq!(h1, h2, "hash must be deterministic");
+        assert_eq!(h1.len(), 16, "hash must be 16 chars");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be lowercase hex"
+        );
+    }
+
+    #[test]
+    fn pubkey_hash_differs_for_different_keys() {
+        let key_a = [0x01u8; 32];
+        let key_b = [0x02u8; 32];
+        assert_ne!(pubkey_hash(&key_a), pubkey_hash(&key_b));
     }
 }
