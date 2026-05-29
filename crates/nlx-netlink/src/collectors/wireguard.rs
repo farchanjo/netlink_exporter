@@ -52,7 +52,7 @@ use tracing::debug;
 
 use crate::{
     transport::NetlinkSocket,
-    wire::{nested_attrs, parse_attrs, read_u16, read_u32, read_u64},
+    wire::{NLA_HDRLEN, align4, nested_attrs, parse_attrs, read_u16, read_u32, read_u64},
 };
 
 const NETLINK_GENERIC: i32 = 16;
@@ -77,6 +77,19 @@ const WGPEER_A_LAST_HANDSHAKE_TIME: u16 = 6; // timespec64: tv_sec@0 u64, tv_nse
 const WGPEER_A_RX_BYTES: u16 = 7;
 const WGPEER_A_TX_BYTES: u16 = 8;
 // WGPEER_A_ALLOWEDIPS = 9 — DISCARDED (per-peer routing prefixes, ADR-0005).
+
+// WG_CMD_GET_DEVICE has no "dump all devices" form: the kernel's
+// `lookup_interface()` returns -EBADR (errno 53) unless exactly one of
+// WGDEVICE_A_IFINDEX / WGDEVICE_A_IFNAME is supplied (drivers/net/wireguard/
+// netlink.c). We therefore enumerate wireguard interfaces over rtnetlink first,
+// then issue one filtered WG_CMD_GET_DEVICE dump per interface.
+const NETLINK_ROUTE: i32 = 0;
+const RTM_GETLINK: u16 = 18;
+const IFINFOMSG_LEN: usize = 16;
+const IFLA_IFNAME: u16 = 3;
+const IFLA_LINKINFO: u16 = 18;
+const IFLA_INFO_KIND: u16 = 1;
+const WG_LINK_KIND: &[u8] = b"wireguard";
 
 /// Adapter implementing [`NetlinkWireguardPort`] and [`Collector`] for `WireGuard`.
 ///
@@ -115,20 +128,9 @@ impl NetlinkWireguardPort for WireguardCollector {
             return Ok(vec![]);
         };
 
-        let frames = wg_dump(&mut sock, family_id)
+        collect_devices(&mut sock, family_id)
             .await
-            .map_err(|e| DomainError::Collector(e.to_string()))?;
-
-        let mut result = Vec::with_capacity(frames.len());
-        for frame in &frames {
-            if frame.len() < 4 {
-                continue;
-            }
-            if let Some(dev) = parse_device(&frame[4..]) {
-                result.push(dev);
-            }
-        }
-        Ok(result)
+            .map_err(|e| DomainError::Collector(e.to_string()))
     }
 }
 
@@ -156,7 +158,7 @@ impl Collector for WireguardCollector {
                 return Ok(vec![]);
             };
 
-            let frames = wg_dump(&mut sock, family_id)
+            let devices = collect_devices(&mut sock, family_id)
                 .await
                 .map_err(|e| CollectError::Io(e.to_string()))?;
 
@@ -167,15 +169,9 @@ impl Collector for WireguardCollector {
                 .unwrap_or(0);
 
             let mut out = Vec::new();
-            for frame in &frames {
-                if frame.len() < 4 {
-                    continue;
-                }
-                let Some(dev) = parse_device(&frame[4..]) else {
-                    continue;
-                };
+            for dev in &devices {
                 // TC-006: enforce the configured peer cap before metric emission.
-                push_device_metrics(&mut out, &dev, now_secs, self.max_peers);
+                push_device_metrics(&mut out, dev, now_secs, self.max_peers);
             }
             Ok(out)
         })
@@ -195,12 +191,106 @@ impl Collector for WireguardCollector {
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-async fn wg_dump(
+/// Push a flat nlattr (`nla_len`, type, payload, padding) into `buf`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nlattr length fits u16 by construction; NLA_HDRLEN + IFNAMSIZ never exceeds 65535"
+)]
+fn push_nla(buf: &mut Vec<u8>, ty: u16, payload: &[u8]) {
+    let nla_len = (NLA_HDRLEN + payload.len()) as u16;
+    buf.extend_from_slice(&nla_len.to_ne_bytes());
+    buf.extend_from_slice(&ty.to_ne_bytes());
+    buf.extend_from_slice(payload);
+    let pad = align4(NLA_HDRLEN + payload.len()) - (NLA_HDRLEN + payload.len());
+    buf.extend(std::iter::repeat_n(0u8, pad));
+}
+
+/// Enumerate interface names whose rtnetlink link-info kind is `"wireguard"`.
+///
+/// Uses an `RTM_GETLINK` dump on `NETLINK_ROUTE`; this is the only reliable way
+/// to discover wireguard interfaces, since `WG_CMD_GET_DEVICE` itself requires a
+/// specific interface and has no dump-all form.
+async fn list_wireguard_interfaces() -> Result<Vec<String>, crate::transport::NetlinkError> {
+    let mut sock = NetlinkSocket::open(NETLINK_ROUTE)?;
+    let ifinfo = [0u8; IFINFOMSG_LEN];
+    let mut restarts = 0u32;
+    let frames = loop {
+        match sock.dump(RTM_GETLINK, 0, &ifinfo).await {
+            Ok(f) => break f,
+            Err(crate::transport::NetlinkError::DumpIntr) => {
+                restarts += 1;
+                if restarts >= crate::transport::MAX_DUMP_RESTARTS {
+                    return Err(crate::transport::NetlinkError::DumpIntr);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    let mut names = Vec::new();
+    for frame in &frames {
+        if frame.len() < IFINFOMSG_LEN {
+            continue;
+        }
+        if let Some(name) = wireguard_ifname(&frame[IFINFOMSG_LEN..]) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Return the interface name if a link's rtattrs identify it as a wireguard
+/// device (`IFLA_LINKINFO` → `IFLA_INFO_KIND == "wireguard"`).
+fn wireguard_ifname(attrs: &[u8]) -> Option<String> {
+    let mut name: Option<String> = None;
+    let mut is_wg = false;
+    for attr in parse_attrs(attrs) {
+        match attr.ty {
+            IFLA_IFNAME => {
+                let end = attr
+                    .payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(attr.payload.len());
+                name = Some(String::from_utf8_lossy(&attr.payload[..end]).into_owned());
+            }
+            IFLA_LINKINFO => {
+                for inner in nested_attrs(attr.payload) {
+                    if inner.ty == IFLA_INFO_KIND {
+                        let end = inner
+                            .payload
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(inner.payload.len());
+                        if &inner.payload[..end] == WG_LINK_KIND {
+                            is_wg = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if is_wg { name } else { None }
+}
+
+/// Build a `WG_CMD_GET_DEVICE` request body filtered to one interface by name.
+fn build_wg_payload(ifname: &str) -> Vec<u8> {
+    let mut buf = vec![WG_CMD_GET_DEVICE, WG_GENL_VERSION, 0u8, 0u8];
+    let mut name = ifname.as_bytes().to_vec();
+    name.push(0); // NUL terminator (NLA_NUL_STRING)
+    push_nla(&mut buf, WGDEVICE_A_IFNAME, &name);
+    buf
+}
+
+/// Dump a single wireguard interface. A device with many peers is split by the
+/// kernel across several `NLM_F_MULTI` frames; `dump()` accumulates them all.
+async fn wg_dump_iface(
     sock: &mut NetlinkSocket,
     family_id: u16,
+    ifname: &str,
 ) -> Result<Vec<Vec<u8>>, crate::transport::NetlinkError> {
-    // Payload: genlmsghdr only (cmd=0, version=1, reserved=0).
-    let payload = vec![WG_CMD_GET_DEVICE, WG_GENL_VERSION, 0u8, 0u8];
+    let payload = build_wg_payload(ifname);
     let mut restarts = 0u32;
     loop {
         match sock.dump(family_id, 0, &payload).await {
@@ -214,6 +304,51 @@ async fn wg_dump(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Merge the (possibly multi-frame) `WG_CMD_GET_DEVICE` reply for one interface
+/// into a single [`WireguardDevice`]. Continuation frames repeat the interface
+/// header and carry additional peers, which are accumulated.
+fn merge_device_frames(frames: &[Vec<u8>]) -> Option<WireguardDevice> {
+    let mut dev: Option<WireguardDevice> = None;
+    for frame in frames {
+        if frame.len() < 4 {
+            continue;
+        }
+        let Some(parsed) = parse_device(&frame[4..]) else {
+            continue;
+        };
+        match dev.as_mut() {
+            None => dev = Some(parsed),
+            Some(d) => {
+                d.peers.extend(parsed.peers);
+                if d.listen_port == 0 {
+                    d.listen_port = parsed.listen_port;
+                }
+                if d.fwmark == 0 {
+                    d.fwmark = parsed.fwmark;
+                }
+            }
+        }
+    }
+    dev
+}
+
+/// Enumerate wireguard interfaces and dump each, returning one merged device per
+/// interface. Shared by the [`NetlinkWireguardPort`] and [`Collector`] paths.
+async fn collect_devices(
+    sock: &mut NetlinkSocket,
+    family_id: u16,
+) -> Result<Vec<WireguardDevice>, crate::transport::NetlinkError> {
+    let ifaces = list_wireguard_interfaces().await?;
+    let mut result = Vec::with_capacity(ifaces.len());
+    for ifname in &ifaces {
+        let frames = wg_dump_iface(sock, family_id, ifname).await?;
+        if let Some(dev) = merge_device_frames(&frames) {
+            result.push(dev);
+        }
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
