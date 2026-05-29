@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded
 date: 2026-05-28
 deciders: [eonf]
 consulted: []
@@ -7,6 +7,15 @@ informed: []
 ---
 
 # Add drop-monitor bounded context via direct generic-netlink NET_DM family with runtime gating
+
+> **Superseded by [ADR-0026](0026-drop-monitor-hybrid-multicast-accumulator.md).**
+> This ADR's per-reason `NET_DM_ATTR_REASON` summary-mode design does not match
+> kernel reality: SUMMARY mode delivers per-*location* counts (no reason string;
+> reasons exist only in PACKET mode), and `NET_DM_CMD_STATS_GET` returns the
+> monitor's overflow counter, not drop totals. ADR-0026 documents the
+> as-implemented hybrid model (multicast accumulator for real totals + an
+> honestly-named overflow-pull health metric), verified live on a kernel with
+> `CONFIG_NET_DROP_MONITOR=y`.
 
 ## Context and Problem Statement
 

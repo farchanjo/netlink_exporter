@@ -2083,14 +2083,61 @@ genetlink family caches.
 > The kernel family `.version = 2`; genlmsghdr must carry `version=2` or the
 > kernel will reject with `EINVAL`.
 
-**Collection model:** per-scrape pull via `NET_DM_CMD_STATS_GET` (unicast, no
-`NLM_F_DUMP`). No background task, no `Mutex`, no `Arc`. On each `collect()`:
+**Collection model (ADR-0026 hybrid):** real drop totals come from a background
+multicast accumulator on `NET_DM_GRP_ALERT`; `NET_DM_CMD_STATS_GET` is pulled
+per scrape only as a monitor-health (overflow) signal.
 
-1. Resolve `"NET_DM"` family ID (fast; kernel-cached).
-2. Send `NET_DM_CMD_CONFIG` (set SUMMARY mode) + `NET_DM_CMD_START` (idempotent;
-   `EBUSY`/`EALREADY` silently ignored — monitoring already active).
-3. Send `NET_DM_CMD_STATS_GET`; parse `NET_DM_CMD_STATS_NEW` reply.
-4. Emit two fixed-cardinality metrics.
+> **Why not STATS_GET for totals?** `NET_DM_ATTR_STATS_DROPPED` is incremented
+> only on the `unlock_free` path when a per-CPU drop queue is full
+> (`net/core/drop_monitor.c:533-536`) — it counts drops the monitor itself could
+> NOT report, and stays `0` under normal load. Real per-location drop counts are
+> delivered only on the `NET_DM_GRP_ALERT` multicast stream.
+
+Background listener (`setup_and_spawn_listener`, lock-free `AtomicU64`).
+Privileged setup runs before the capability drop (the `events` group is
+`GENL_MCAST_CAP_SYS_ADMIN` → needs `CAP_SYS_ADMIN`); the recv loop is
+unprivileged. **All steps use io_uring** (ADR-0024):
+
+1. Resolve `"NET_DM"` family ID and the `events` multicast group ID via
+   `CTRL_CMD_GETFAMILY` (`CTRL_ATTR_MCAST_GROUPS` → `CTRL_ATTR_MCAST_GRP_NAME` /
+   `CTRL_ATTR_MCAST_GRP_ID`) — `IORING_OP_SEND`/`RECV`.
+2. `NET_DM_CMD_CONFIG` (SUMMARY) + `NET_DM_CMD_START` (unicast, before joining;
+   `EBUSY`/`EAGAIN`/`EALREADY` tolerated — see [G-34]) — `IORING_OP_SEND`/`RECV`.
+3. Join `events` via `NETLINK_ADD_MEMBERSHIP` issued as
+   `IORING_OP_URING_CMD` / `SOCKET_URING_OP_SETSOCKOPT` (kernel ≥ 6.7; blocking
+   `setsockopt` fallback on older kernels).
+4. Loop `IORING_OP_RECV`; for each `NET_DM_CMD_ALERT` frame, sum drop counts
+   into `sw`/`hw` atomics.
+
+Per scrape, `collect()` reads the atomics (never fails) and additionally pulls
+`NET_DM_CMD_STATS_GET` (best-effort) for the overflow metric.
+
+### 16.5  NET_DM_CMD_ALERT SUMMARY wire format (real totals)
+
+```text
+nlmsghdr (16 B)
+  genlmsghdr (4 B): cmd=NET_DM_CMD_ALERT (1), ver=2
+    nlattr NLA_UNSPEC (type 0):
+      struct net_dm_alert_msg { __u32 entries; net_dm_drop_point points[entries]; }
+        net_dm_drop_point { __u8 pc[8]; __u32 count; }   // 12 B each
+        -> SW drops = sum(points[].count)
+    nlattr NET_DM_ATTR_HW_ENTRIES (17, nested)            // HW drops only
+      nlattr NET_DM_ATTR_HW_ENTRY (18, nested)
+        nlattr NET_DM_ATTR_HW_TRAP_COUNT (19, u32)
+        -> HW drops = sum(HW_TRAP_COUNT)
+```
+
+**Metrics produced (totals, from the multicast accumulator):**
+
+- `nft_drop_packets_total{origin="sw", reason="total"}`
+- `nft_drop_packets_total{origin="hw", reason="total"}`
+
+**Metric produced (health, from `NET_DM_CMD_STATS_GET`):**
+
+- `nft_drop_monitor_unreported_total{origin="sw"|"hw"}` — drops the monitor
+  could not enqueue for reporting (per-CPU queue overflow); not a drop total.
+
+### 16.6  Pull steps (legacy STATS_GET path, now health-only)
 
 ### 16.1  Command Table
 
