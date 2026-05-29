@@ -1292,46 +1292,93 @@ equality.
 `NETLINK_XFRM` does not use a subsystem header (no `nfgenmsg`). The body follows
 the `nlmsghdr` directly.
 
-| Symbolic name | Value | Purpose |
-|---|---|---|
-| `XFRM_MSG_GETSA` | `0x0007` | Full SAD dump; one `xfrm_usersa_info` per reply frame |
-| `XFRM_MSG_GETPOLICY` | `0x0009` | Full SPD dump; one `xfrm_userpolicy_info` per reply frame |
-| `XFRM_MSG_GETSADINFO` | `0x0011` | Single-frame reply with `xfrm_sadinfo` |
-| `XFRM_MSG_GETSPDINFO` | `0x0012` | Single-frame reply with `xfrm_spdinfo` |
+All XFRM message types derive from the C enum in `include/uapi/linux/xfrm.h`.
+`XFRM_MSG_BASE = 0x10`; each subsequent enum member increments by one.
+
+| Symbolic name | Hex | Decimal | Direction |
+|---|---|---|---|
+| `XFRM_MSG_NEWSA` | `0x10` | 16 | kernel to user (dump reply) |
+| `XFRM_MSG_GETSA` | `0x12` | 18 | user to kernel, NLM_F_DUMP |
+| `XFRM_MSG_NEWPOLICY` | `0x13` | 19 | kernel to user (dump reply) |
+| `XFRM_MSG_GETPOLICY` | `0x15` | 21 | user to kernel, NLM_F_DUMP |
+| `XFRM_MSG_NEWSADINFO` | `0x22` | 34 | kernel to user (unicast reply) |
+| `XFRM_MSG_GETSADINFO` | `0x23` | 35 | user to kernel (unicast) |
+| `XFRM_MSG_NEWSPDINFO` | `0x24` | 36 | kernel to user (unicast reply) |
+| `XFRM_MSG_GETSPDINFO` | `0x25` | 37 | user to kernel (unicast) |
+
+> **Previous values were wrong:** the original doc listed `GETSA=0x0007`,
+> `GETPOLICY=0x0009`, `GETSADINFO=0x0011`, `GETSPDINFO=0x0012`. Those values
+> were a fictional numbering scheme. Correct values verified against
+> `linux-6.17/include/uapi/linux/xfrm.h`.
 
 ### 12.2  Runtime Availability Probe
 
 Open `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 6)`. If this
 returns `EPROTONOSUPPORT`, `xfrm_user` is absent; set `available=false` and skip
-all subsequent I/O. Otherwise issue `XFRM_MSG_GETSADINFO` with a 500 ms timeout.
-`EPERM` or `ENOENT` replies also set `available=false`. Log the probe result at
-`INFO` level on startup; do not log on every scrape cycle when `available=false`.
+all subsequent I/O. Otherwise send `XFRM_MSG_GETSADINFO` (0x23) with a 4-byte body (`u32 flags =
+0xFFFFFFFF`). A non-error reply confirms `xfrm_user` + `xfrm_algo` are loaded.
+
+**Critical:** `xfrm_msg_min[XFRM_MSG_GETSADINFO] = sizeof(u32) = 4`. Sending an
+empty body causes `EINVAL`. Always send the 4-byte flags body.
+
+`EPERM` (errno 1) or `ENOENT` (errno 2) replies set `available=false`. Log the
+probe result at `INFO` level on startup; do not log on every scrape cycle when
+`available=false`.
 
 ### 12.3  XFRM_MSG_GETSA Dump
 
-**Request (16 bytes — nlmsghdr only, no body):**
+**Request (16-byte nlmsghdr + empty body):**
 
 ```
 nlmsghdr {
     nlmsg_len   = 16,
-    nlmsg_type  = 0x0007,       // XFRM_MSG_GETSA
+    nlmsg_type  = 0x0012,       // XFRM_MSG_GETSA (XFRM_MSG_BASE+2)
     nlmsg_flags = 0x0301,       // NLM_F_REQUEST | NLM_F_DUMP
     nlmsg_seq   = N,
     nlmsg_pid   = 0
 }
+// empty body: dump handler accepts nlmsg_parse_deprecated(nlh, 0, ...) with min=0
 ```
 
-**Reply:** One frame per SA. Body is `xfrm_usersa_info` (220 bytes, native-endian
-unless noted). `NLMSG_DONE` terminates the dump. Apply `NLM_F_DUMP_INTR` restart
-logic (section 3.3, cap at `netlink_dump_max_restarts`).
+**Reply:** One frame per SA. Type `XFRM_MSG_NEWSA` (0x10). Body is
+`xfrm_usersa_info` (220 bytes, native-endian). `NLMSG_DONE` terminates the dump.
+Apply `NLM_F_DUMP_INTR` restart logic (section 3.3, cap at
+`netlink_dump_max_restarts`).
 
-**xfrm_usersa_info fields used for metric labels:**
+**xfrm_usersa_info byte layout (220 bytes total):**
 
 ```
-// offsets within body (after nlmsghdr)
-u8  id.proto    @ 40   // IPPROTO_ESP=50, IPPROTO_AH=51, IPPROTO_COMP=108
-u8  mode        @ 184  // XFRM_MODE_TUNNEL=0, XFRM_MODE_TRANSPORT=1, XFRM_MODE_BEET=4
+Offset  Size  Field
+     0    56  struct xfrm_selector sel
+    56    24  struct xfrm_id id
+                  +0  xfrm_address_t daddr  (16 bytes)
+                  +16 __be32 spi            (4 bytes)
+                  +20 __u8   proto          (1 byte)  <-- IPsec proto here
+                  +21 pad                   (3 bytes)
+    80    16  xfrm_address_t saddr
+    96    64  struct xfrm_lifetime_cfg lft
+   160    32  struct xfrm_lifetime_cur curlft
+   192    12  struct xfrm_stats stats
+   204     4  __u32 seq
+   208     4  __u32 reqid
+   212     2  __u16 family
+   214     1  __u8 mode                         <-- XFRM_MODE_* here
+   215     3  pad (to 220)
 ```
+
+**Correct field offsets for metric labels (verified against kernel source):**
+
+```
+u8 id.proto @ 76   // sel(56) + id.daddr(16) + id.spi(4) = 76
+             // IPPROTO_ESP=50, IPPROTO_AH=51, IPPROTO_COMP=108
+u8 mode     @ 214  // sel(56)+id(24)+saddr(16)+lft(64)+curlft(32)+stats(12)+seq(4)+reqid(4)+family(2)
+             // XFRM_MODE_TRANSPORT=0, XFRM_MODE_TUNNEL=1, XFRM_MODE_BEET=4
+```
+
+> **Previous offsets were wrong:** the original doc listed `id.proto @ 40` and
+> `mode @ 184`. Correct offsets are 76 and 214.
+> **Mode values were reversed:** the original doc listed `0=tunnel, 1=transport`.
+> Correct: `XFRM_MODE_TRANSPORT=0`, `XFRM_MODE_TUNNEL=1` (from `xfrm.h:156-157`).
 
 **Metric accumulation:** For each reply frame, increment the counter for the
 `(proto_label(id.proto), mode_label(mode))` bucket in a `BTreeMap`. After
@@ -1349,8 +1396,8 @@ fn proto_label(proto: u8) -> &'static str {
 
 fn mode_label(mode: u8) -> &'static str {
     match mode {
-        0 => "tunnel",
-        1 => "transport",
+        0 => "transport",   // XFRM_MODE_TRANSPORT (not tunnel!)
+        1 => "tunnel",      // XFRM_MODE_TUNNEL
         4 => "beet",
         _ => "other",
     }
@@ -1359,19 +1406,20 @@ fn mode_label(mode: u8) -> &'static str {
 
 ### 12.4  XFRM_MSG_GETPOLICY Dump
 
-**Request (16 bytes):**
+**Request (16-byte nlmsghdr + empty body):**
 
 ```
 nlmsghdr {
     nlmsg_len   = 16,
-    nlmsg_type  = 0x0009,       // XFRM_MSG_GETPOLICY
+    nlmsg_type  = 0x0015,       // XFRM_MSG_GETPOLICY (XFRM_MSG_BASE+5)
     nlmsg_flags = 0x0301,       // NLM_F_REQUEST | NLM_F_DUMP
     nlmsg_seq   = N,
     nlmsg_pid   = 0
 }
 ```
 
-**Reply:** One frame per policy. Body is `xfrm_userpolicy_info` (164 bytes).
+**Reply:** One frame per policy. Type `XFRM_MSG_NEWPOLICY` (0x13). Body is
+`xfrm_userpolicy_info` (164 bytes).
 
 **xfrm_userpolicy_info fields used for metric labels:**
 
@@ -1394,100 +1442,108 @@ fn action_label(action: u8) -> &'static str {
 
 ### 12.5  XFRM_MSG_GETSADINFO
 
-**Request (16 bytes):**
+**Request: 16-byte nlmsghdr + 4-byte body `u32 flags`:**
 
 ```
-nlmsghdr { nlmsg_len=16, nlmsg_type=0x0011, nlmsg_flags=0x0001, ... }
+nlmsghdr { nlmsg_len=20, nlmsg_type=0x0023, nlmsg_flags=0x0001, ... }
+body: u32 flags = 0xFFFFFFFF  // required; empty body yields EINVAL
 ```
 
-**Reply:** Single frame. Body is `xfrm_sadinfo` (8 bytes, native-endian):
+**Reply type:** `XFRM_MSG_NEWSADINFO` (0x22).
+
+**Reply payload layout (after 16-byte nlmsghdr):**
 
 ```
-u32 sadhcnt  @ 0   // current SAD hash entry count → nft_xfrm_sad_hash_count
-u32 sadhmcnt @ 4   // SAD hash bucket count        → nft_xfrm_sad_hash_max
+[0..4]  u32 flags (echoed from request)
+[4..]   NLA sequence:
+  XFRMA_SAD_CNT   (type=2, u32): total SA count (informational, not exported)
+  XFRMA_SAD_HINFO (type=3, 8 bytes): struct xfrmu_sadhinfo
+      +0  u32 sadhcnt   current hash bucket count  --> nft_xfrm_sad_hash_count
+      +4  u32 sadhmcnt  max hash bucket capacity   --> nft_xfrm_sad_hash_max
 ```
+
+**Parsing:** skip the 4-byte echoed flags prefix, then iterate NLAs with
+`parse_attrs()`, match on `XFRMA_SAD_HINFO` (type=3).
+
+> **Previous layout was wrong:** the original doc described the reply body as a
+> raw 8-byte `xfrm_sadinfo` struct. The actual reply is NLA-encoded. Parsing
+> raw bytes at offset 0/4 reads the echoed flags and NLA header, not hash counts.
 
 ### 12.6  XFRM_MSG_GETSPDINFO
 
-**Request (16 bytes):**
+**Request: 16-byte nlmsghdr + 4-byte body `u32 flags`:**
 
 ```
-nlmsghdr { nlmsg_len=16, nlmsg_type=0x0012, nlmsg_flags=0x0001, ... }
+nlmsghdr { nlmsg_len=20, nlmsg_type=0x0025, nlmsg_flags=0x0001, ... }
+body: u32 flags = 0xFFFFFFFF  // required; empty body yields EINVAL
 ```
 
-**Reply:** Single frame. Body is `xfrm_spdinfo` (28 bytes, native-endian):
+**Reply type:** `XFRM_MSG_NEWSPDINFO` (0x24).
+
+**Reply payload layout (after 16-byte nlmsghdr):**
 
 ```
-u32 spdhcnt  @ 0   // current SPD hash entry count → nft_xfrm_spd_hash_count
-u32 spdhmcnt @ 4   // SPD hash bucket count        → nft_xfrm_spd_hash_max
-// remaining 20 bytes (spdbtree policy counts) not exported
+[0..4]  u32 flags (echoed from request)
+[4..]   NLA sequence:
+  XFRMA_SPD_INFO  (type=2, 24 bytes): struct xfrmu_spdinfo (not exported)
+  XFRMA_SPD_HINFO (type=3, 8 bytes): struct xfrmu_spdhinfo
+      +0  u32 spdhcnt   current hash bucket count  --> nft_xfrm_spd_hash_count
+      +4  u32 spdhmcnt  max hash bucket capacity   --> nft_xfrm_spd_hash_max
+  XFRMA_SPD_IPV4_HTHRESH (type=4, 2 bytes): optional
+  XFRMA_SPD_IPV6_HTHRESH (type=5, 2 bytes): optional
 ```
 
-### 12.7  /proc/net/xfrm_stat Error Counters
+> **ADR-0023 NATIVE-API ONLY:** `/proc/net/xfrm_stat` has been removed. MIB
+> error counters have no netlink path; procfs reads are forbidden per ADR-0023
+> §6. The `nft_xfrm_stat_total` metric family is dropped from this collector.
 
-`/proc/net/xfrm_stat` is a plain text file with one `key value` pair per line.
-The kernel already aggregates per-CPU counters before exposing them here; no
-further summation is needed.
-
-**Parsing pseudocode (inside `spawn_blocking`):**
-
-```rust
-let text = std::fs::read_to_string("/proc/net/xfrm_stat")?;
-for line in text.lines() {
-    let mut parts = line.split_whitespace();
-    let key = parts.next().unwrap_or("");
-    let val: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    if XFRM_STAT_KEYS.contains(key) {
-        stat_map.insert(key, val);
-    }
-    // unknown keys silently ignored — forward-compat with future kernel counters
-}
-```
-
-`XFRM_STAT_KEYS` is a `&[&str; 26]` constant containing the fixed kernel ABI key
-set.
-
-**Metric mapping:** Each key emits one `nft_xfrm_stat_total{counter=<key>}` series.
-
-### 12.8  Metric Field-to-Wire Table
+### 12.7  Metric Field-to-Wire Table
 
 | Metric | Source | Wire field | Notes |
 |---|---|---|---|
-| `nft_xfrm_sa_count{proto,mode}` | `XFRM_MSG_GETSA` dump | frame count by `(id.proto, mode)` | Counters, not gauge from a struct field |
-| `nft_xfrm_sp_count{dir,action}` | `XFRM_MSG_GETPOLICY` dump | frame count by `(dir, action)` | Counters, not gauge from a struct field |
-| `nft_xfrm_sad_hash_count` | `XFRM_MSG_GETSADINFO` | `xfrm_sadinfo.sadhcnt` u32 LE | |
-| `nft_xfrm_sad_hash_max` | `XFRM_MSG_GETSADINFO` | `xfrm_sadinfo.sadhmcnt` u32 LE | |
-| `nft_xfrm_spd_hash_count` | `XFRM_MSG_GETSPDINFO` | `xfrm_spdinfo.spdhcnt` u32 LE | |
-| `nft_xfrm_spd_hash_max` | `XFRM_MSG_GETSPDINFO` | `xfrm_spdinfo.spdhmcnt` u32 LE | |
-| `nft_xfrm_stat_total{counter}` | `/proc/net/xfrm_stat` | text key-value, pre-aggregated | 26 bounded counter names |
-| `nft_scrape_collector_available{collector="xfrm-ipsec"}` | startup probe | `XFRM_MSG_GETSADINFO` result | 1=available, 0=absent/EPERM |
+| `nft_xfrm_sa_count{proto,mode}` | `XFRM_MSG_GETSA` (0x12) dump | frame count by `(id.proto @ 76, mode @ 214)` | mode: 0=transport, 1=tunnel |
+| `nft_xfrm_sp_count{dir,action}` | `XFRM_MSG_GETPOLICY` (0x15) dump | frame count by `(dir @ 160, action @ 161)` | |
+| `nft_xfrm_sad_hash_count` | `XFRM_MSG_GETSADINFO` (0x23) | NLA XFRMA_SAD_HINFO sadhcnt u32 | skip 4-byte flags echo |
+| `nft_xfrm_sad_hash_max` | `XFRM_MSG_GETSADINFO` (0x23) | NLA XFRMA_SAD_HINFO sadhmcnt u32 | |
+| `nft_xfrm_spd_hash_count` | `XFRM_MSG_GETSPDINFO` (0x25) | NLA XFRMA_SPD_HINFO spdhcnt u32 | |
+| `nft_xfrm_spd_hash_max` | `XFRM_MSG_GETSPDINFO` (0x25) | NLA XFRMA_SPD_HINFO spdhmcnt u32 | |
+| `nft_scrape_collector_available{collector="xfrm-ipsec"}` | startup probe | `XFRM_MSG_GETSADINFO` with 4-byte flags body | 1=available, 0=absent/EPERM |
 
-### 12.9  Endianness
+### 12.8  Endianness
 
-All `xfrm_usersa_info`, `xfrm_userpolicy_info`, `xfrm_sadinfo`, and `xfrm_spdinfo`
-fields are **native-endian** (same as all other `NETLINK_XFRM` payloads; no
-`byteorder::NetworkEndian` reads required). The IP address fields within
-`xfrm_address_t` (used in `xfrm_selector` and `xfrm_id`) are network-byte-order
-but are not read by this collector (no per-SA address labels — ADR-0005 cardinality
-forbids them).
+All `xfrm_usersa_info`, `xfrm_userpolicy_info` fixed struct fields and all
+SADINFO/SPDINFO NLA payloads are **native-endian**. No `byteorder::NetworkEndian`
+reads required. IP address fields within `xfrm_address_t` are network-byte-order
+but not read (ADR-0005 cardinality forbids per-SA labels).
 
-### 12.10  Gotchas
+### 12.9  Gotchas
 
-- `XFRM_MSG_GETSA` and `XFRM_MSG_GETPOLICY` dumps can interleave with kernel SA
-  expiry events; `NLM_F_DUMP_INTR` (bit 4 of `nlmsg_flags`) signals concurrent
-  modification. Apply the standard restart logic capped at
-  `ExporterConfig.netlink_dump_max_restarts` (default 8).
-- The body length of `xfrm_usersa_info` is 220 bytes on all supported kernel
-  versions (>= 4.14). Unlike `nf_conntrack_stat` or `rtnl_link_stats64`, there
-  are no known kernel-version size variants. Validate with
-  `payload.len() >= 220` and return `CollectorError::ParseError` if violated.
-- `xfrm_userpolicy_info` is followed by optional `xfrma_*` nlattr chain (e.g.
-  `XFRMA_TMPL`). The adapter reads only the fixed struct body and ignores the
-  trailing nlattr chain — consistent with the count-only metric strategy.
-- `/proc/net/xfrm_stat` requires only read access (no `CAP_NET_ADMIN`). The
-  socket operations require `CAP_NET_ADMIN` (or `CAP_NET_RAW` on some kernels).
-  The runtime availability probe will distinguish permission failures from module
-  absence via the returned errno.
+**[G-xfrm-1] All four XFRM message type values were wrong in earlier doc versions.**
+`GETSA` was 0x0007 (correct: 0x0012), `GETPOLICY` was 0x0009 (correct: 0x0015),
+`GETSADINFO` was 0x0011 (correct: 0x0023), `GETSPDINFO` was 0x0012 (correct:
+0x0025). Enum starts at `XFRM_MSG_BASE=0x10`; each member increments by one.
+
+**[G-xfrm-2] GETSADINFO/GETSPDINFO empty body causes EINVAL.**
+`xfrm_msg_min[XFRM_MSG_GETSADINFO] = sizeof(u32) = 4`. Send `u32 flags =
+0xFFFFFFFF`. Empty body causes kernel rejection before reaching the handler.
+
+**[G-xfrm-3] SADINFO/SPDINFO reply is NLA-encoded, not a raw struct.**
+Payload starts with 4 bytes of echoed flags, then NLA chain. Match on
+`XFRMA_SAD_HINFO` (type=3) for `{sadhcnt: u32, sadhmcnt: u32}`.
+
+**[G-xfrm-4] SA struct offsets id.proto and mode were wrong in earlier versions.**
+`id.proto` is at offset 76 (`sel(56)+id.daddr(16)+id.spi(4)`), not 40.
+`mode` is at offset 214, not 184.
+
+**[G-xfrm-5] XFRM_MODE_TRANSPORT=0, XFRM_MODE_TUNNEL=1 (not reversed).**
+Correct from `xfrm.h:156-157`. Earlier code had 0=tunnel, 1=transport.
+
+- Dumps interleave with SA expiry; apply `NLM_F_DUMP_INTR` restart logic capped
+  at `ExporterConfig.netlink_dump_max_restarts` (default 8).
+- `xfrm_usersa_info` is 220 bytes on all supported kernel versions (>= 4.14).
+  Validate with `payload.len() >= 220`.
+- `xfrm_userpolicy_info` may be followed by an optional `xfrma_*` NLA chain
+  (e.g. `XFRMA_TMPL`); ignore the trailing chain.
 
 ---
 
@@ -2018,117 +2074,111 @@ before matching inner attribute types.
 
 ## 16  NETLINK_GENERIC (family=16) — NET_DM drop_monitor Subsystem
 
-**Genl family name resolution note:** The NET_DM family name `"NET_DM\0"` must
-be resolved at startup via `CTRL_CMD_GETFAMILY` and cached in its own
-`OnceLock<u16>`, independent of the ethtool, IPVS, wireguard, and devlink
-caches.
+**Genl family:** name `"NET_DM"`, **version 2** (`NET_DM_GENL_VERSION = 2`).
+The family name `"NET_DM\0"` must be resolved via `CTRL_CMD_GETFAMILY` and
+cached in its own `OnceLock<u16>`, independent of ethtool, IPVS, and other
+genetlink family caches.
 
-**Socket Model note (tokio + mio readiness):** The drop-monitor adapter
-subscribes to the `NET_DM_GRP_ALERT` multicast group using `bind()` with a
-computed `nl_groups` bitmask. Incoming alert frames are drained asynchronously
-on `collect()` calls using the same `AsyncFd<OwnedFd>` pattern from section 2.
-The tokio reactor provides edge-triggered readiness; `recvmsg` is called
-non-blocking until `EAGAIN`.
+> **Version correction:** the original doc and a previous stub used `version=1`.
+> The kernel family `.version = 2`; genlmsghdr must carry `version=2` or the
+> kernel will reject with `EINVAL`.
 
-### 16.1  Three-Phase Sequence
+**Collection model:** per-scrape pull via `NET_DM_CMD_STATS_GET` (unicast, no
+`NLM_F_DUMP`). No background task, no `Mutex`, no `Arc`. On each `collect()`:
 
-```
-+-------------------+          +------------------+
-| nft_exporter      |          | Linux Kernel      |
-+-------------------+          +------------------+
-        |                              |
-        | CTRL_CMD_GETFAMILY           |
-        |  family_name="NET_DM\0"      |
-        |----------------------------->|
-        |<-- CTRL_ATTR_FAMILY_ID u16 --|  (cache in OnceLock<u16>)
-        |    or ENOENT -> gate off     |
-        |                              |
-        | NET_DM_CMD_CONFIG            |
-        |  NET_DM_ATTR_ALERT_MODE=1    |  (summary mode)
-        |----------------------------->|
-        |<-- ACK ----------------------|
-        |                              |
-        | NET_DM_CMD_START             |
-        |----------------------------->|
-        |<-- ACK ----------------------|
-        |                              |
-        | bind(nl_groups = grp_mask)   |  (subscribe NET_DM_GRP_ALERT)
-        |                              |
-        |<-- NET_DM_CMD_ALERT ---------| (kernel sends asynchronously)
-        |    NET_DM_ATTR_STATS nest    |
-        |    NET_DM_ATTR_REASON str    |
-        |    NET_DM_ATTR_ORIGIN u16    |
-        |                              |
-        |   (accumulate per interval)  |
-        |   drain on collect()         |
-```
+1. Resolve `"NET_DM"` family ID (fast; kernel-cached).
+2. Send `NET_DM_CMD_CONFIG` (set SUMMARY mode) + `NET_DM_CMD_START` (idempotent;
+   `EBUSY`/`EALREADY` silently ignored — monitoring already active).
+3. Send `NET_DM_CMD_STATS_GET`; parse `NET_DM_CMD_STATS_NEW` reply.
+4. Emit two fixed-cardinality metrics.
 
-**ENOENT from CTRL_CMD_GETFAMILY** means the `drop_monitor` module is absent.
-Set `nft_scrape_collector_available{collector="drop-monitor"}=0` and return an
-empty snapshot. Do not increment `nft_scrape_collector_error_total`.
+### 16.1  Command Table
+
+| Cmd | Value | Privilege | Direction | Description |
+|-----|-------|-----------|-----------|-------------|
+| `NET_DM_CMD_UNSPEC` | 0 | — | — | Reserved |
+| `NET_DM_CMD_ALERT` | 1 | — | kernel to user | Summary-mode multicast alert |
+| `NET_DM_CMD_CONFIG` | 2 | `CAP_NET_ADMIN` | user to kernel | Configure alert mode |
+| `NET_DM_CMD_START` | 3 | `CAP_NET_ADMIN` | user to kernel | Start monitoring |
+| `NET_DM_CMD_STOP` | 4 | `CAP_NET_ADMIN` | user to kernel | Stop monitoring |
+| `NET_DM_CMD_PACKET_ALERT` | 5 | — | kernel to user | Packet-mode per-reason alert |
+| `NET_DM_CMD_CONFIG_GET` | 6 | — | user to kernel | Query config |
+| `NET_DM_CMD_CONFIG_NEW` | 7 | — | kernel to user | Config reply |
+| `NET_DM_CMD_STATS_GET` | 8 | none | user to kernel | Pull aggregate drop counts |
+| `NET_DM_CMD_STATS_NEW` | 9 | — | kernel to user | Stats reply |
 
 ### 16.2  genlmsghdr for NET_DM
 
-Follows `nlmsghdr` at byte offset 16. For all NET_DM commands send `version=1`;
-the kernel rejects `version=0` with `EINVAL`.
+Follows `nlmsghdr` at byte offset 16. Send `version=2` (`NET_DM_GENL_VERSION`).
 
-| Field | NET_DM_CMD_CONFIG | NET_DM_CMD_START | NET_DM_CMD_ALERT (recv) |
+| Field | NET_DM_CMD_CONFIG | NET_DM_CMD_START | NET_DM_CMD_STATS_GET |
 |---|---|---|---|
-| `cmd` | 2 | 3 | 1 |
-| `version` | 1 | 1 | 1 |
+| `cmd` | 2 | 3 | 8 |
+| `version` | 2 | 2 | 2 |
 | `reserved` | 0 | 0 | 0 |
 
 nlattr chain starts at byte offset 20.
 
-### 16.3  NET_DM Attribute Catalogue
+### 16.3  NET_DM Attribute Catalogue (enum net_dm_attr)
 
-| Attribute | Type constant | Payload | Use |
-|---|---|---|---|
-| `NET_DM_ATTR_ALERT_MODE` | 1 | `u8`: 0=per-packet, 1=summary | Sent in NET_DM_CMD_CONFIG |
-| `NET_DM_ATTR_STATS` | 12 | nested: per-reason aggregate counters | Received in NET_DM_CMD_ALERT |
-| `NET_DM_ATTR_ORIGIN` | 14 | `u16` native-endian: 0=sw, 1=hw | Received in NET_DM_CMD_ALERT |
-| `NET_DM_ATTR_HW_TRAP_NAME` | 16 | NUL-terminated string | hw drop trap name; strip trailing NUL |
-| `NET_DM_ATTR_REASON` | 22 | NUL-terminated string | sw drop reason (kernel >= 5.17) |
+| Type | Value | Wire type | Notes |
+|------|-------|-----------|-------|
+| `NET_DM_ATTR_ALERT_MODE` | 1 | u8 | 0=summary, 1=packet |
+| `NET_DM_ATTR_STATS` | 12 | nested | SW drop stats container |
+| `NET_DM_ATTR_HW_STATS` | 13 | nested | HW drop stats container |
+| `NET_DM_ATTR_ORIGIN` | 14 | u16 | 0=SW, 1=HW |
+| `NET_DM_ATTR_HW_TRAP_NAME` | 16 | string | HW trap name (NUL-terminated) |
+| `NET_DM_ATTR_REASON` | 23 | string | Drop-reason name (kernel >= 5.17, NUL-terminated) |
 
-Inside `NET_DM_ATTR_STATS` nested container:
+> **NET_DM_ATTR_REASON correction:** the original doc listed type=22. The
+> correct value is **23** (FLOW_ACTION_COOKIE=22, REASON=23 in the enum).
 
-| Inner attribute | Type | Payload | Use |
-|---|---|---|---|
-| `NET_DM_ATTR_STATS_DROPPED` | 1 | `u64` native-endian | packets dropped count |
+Inner attrs inside `NET_DM_ATTR_STATS` / `NET_DM_ATTR_HW_STATS` (own enum
+starting at 0):
 
-**Critical:** always strip `NLA_F_NESTED (bit 15)` before matching nla_type values.
+| Type | Value | Wire type | Notes |
+|------|-------|-----------|-------|
+| `NET_DM_ATTR_STATS_DROPPED` | 0 | u64 | Aggregate dropped packet count |
 
-### 16.4  Summary Mode Aggregation Logic
+> **NET_DM_ATTR_STATS_DROPPED correction:** the original doc listed type=1.
+> The correct value is **0** (first in its own inner enum starting at 0).
+> `NET_DM_ALERT_MODE_SUMMARY` is also **0** (not 1 as previously listed).
 
-```rust
-// On each received NET_DM_CMD_ALERT frame:
-let origin = parse_origin(attrs)?;     // NET_DM_ATTR_ORIGIN u16::from_ne_bytes
-let reason = match origin {
-    Sw => parse_reason(attrs)?,        // NET_DM_ATTR_REASON, strip NUL
-    Hw => parse_hw_trap_name(attrs)?,  // NET_DM_ATTR_HW_TRAP_NAME, strip NUL
-};
-let dropped = parse_stats_dropped(attrs)?; // NET_DM_ATTR_STATS -> DROPPED u64::from_ne_bytes
-*acc.entry(DropReasonKey { reason, origin }).or_insert(0) += dropped;
+**Critical:** always strip `NLA_F_NESTED (bit 15)` before matching nla_type.
+
+### 16.4  NET_DM_CMD_STATS_GET Pull Protocol
+
+`NET_DM_CMD_STATS_GET` is a unicast request (no `NLM_F_DUMP`). The reply
+(`NET_DM_CMD_STATS_NEW`) contains SW total and HW total drops:
+
+```
+nlmsghdr (16 B)
+  genlmsghdr (4 B): cmd=NET_DM_CMD_STATS_NEW (9), ver=2
+    nlattr: type=NET_DM_ATTR_STATS (12), NLA_F_NESTED
+      nlattr: type=NET_DM_ATTR_STATS_DROPPED (0), payload=u64 (8 B)
+    nlattr: type=NET_DM_ATTR_HW_STATS (13), NLA_F_NESTED
+      nlattr: type=NET_DM_ATTR_STATS_DROPPED (0), payload=u64 (8 B)
 ```
 
-**Kernel < 5.17:** `NET_DM_ATTR_REASON (type=22)` is absent. Log one
-`tracing::warn` per missing frame, emit no counter for that frame, and set
-`DropMonitorSnapshot.reason_attr_supported = false`.
+**Metrics produced:**
 
-### 16.5  Multicast Group Subscription
+- `nft_drop_packets_total{origin="sw", reason="total"}` — cumulative SW drops
+- `nft_drop_packets_total{origin="hw", reason="total"}` — cumulative HW drops
 
-After `NET_DM_CMD_START` ACK:
+### 16.5  Availability Probe
 
-1. Look up group ID in `CTRL_ATTR_MCAST_GROUPS` response from the earlier
-   `CTRL_CMD_GETFAMILY` call. Find the entry with name `"NET_DM_GRP_ALERT"`.
-2. Set `nl_groups = 1u32 << (group_id - 1)` in the `sockaddr_nl` passed to
-   `bind()`.
-3. Receive frames via non-blocking `recvmsg` in the existing `AsyncFd` wrapper.
+`probe_available()` resolves the `"NET_DM"` family via `CTRL_CMD_GETFAMILY`.
+`Ok(None)` = `drop_monitor` module not loaded; `available=0`. No error counter
+incremented on `ENOENT`.
 
-**No `NLM_F_DUMP` is issued.** The kernel pushes `NET_DM_CMD_ALERT` frames
-asynchronously; the adapter drains them on each `collect()` call.
+### 16.6  Multicast Group (Future Use)
 
-### 16.6  Endianness
+`NET_DM_GRP_ALERT` = 1 (group name `"events"`). Packet-mode alerts
+(`NET_DM_CMD_PACKET_ALERT`) on this group contain `NET_DM_ATTR_REASON` +
+`NET_DM_ATTR_ORIGIN` for per-reason breakdown. Not used by this collector (pull
+model preferred; multicast subscriber reserved for future integration).
+
+### 16.7  Endianness
 
 All NET_DM attribute payload values are native-endian.
 
@@ -2140,24 +2190,32 @@ All NET_DM attribute payload values are native-endian.
 | `NET_DM_ATTR_REASON` | UTF-8 string | strip trailing NUL |
 | `NET_DM_ATTR_HW_TRAP_NAME` | UTF-8 string | strip trailing NUL |
 
-### 16.7  Parsing Gotchas
+### 16.8  Parsing Gotchas
 
-**[G-29] NET_DM_ATTR_REASON absent on kernel < 5.17** (drop_monitor)
-The drop-reason enum was introduced in kernel 5.17. Do not treat the missing
-attribute as a parse error; set `reason_attr_supported = false` on the snapshot
-and emit no nft_drop_packets_total series.
+**[G-29] NET_DM_ATTR_REASON absent on kernel less than 5.17** (drop_monitor)
+The drop-reason enum was introduced in kernel 5.17. Missing attribute is not an
+error; return `None` from the alert parser.
 
 **[G-30] NLA_F_NESTED on NET_DM_ATTR_STATS inner attributes** (drop_monitor)
 Always strip before matching: `nla_type & 0x1FFF`.
 
 **[G-31] NET_DM multicast group ID is dynamic** (drop_monitor)
-The group ID for `NET_DM_GRP_ALERT` is not a fixed constant. It is returned in
-the `CTRL_ATTR_MCAST_GROUPS` nested attr of the `CTRL_CMD_GETFAMILY` reply.
+The group ID for `NET_DM_GRP_ALERT` is returned in `CTRL_ATTR_MCAST_GROUPS`
+of the `CTRL_CMD_GETFAMILY` reply, not a fixed constant.
 
 **[G-32] NET_DM_CMD_START side effect** (drop_monitor)
 Issuing `NET_DM_CMD_START` activates the kernel's drop accounting path. On hosts
 under severe packet-drop load this introduces measurable per-drop CPU overhead.
 The collector is opt-in by design (not in the default enabled list).
+
+**[G-33] NET_DM_GENL_VERSION must be 2, not 1** (drop_monitor)
+The kernel family `.version = 2`. Sending `version=1` in genlmsghdr causes
+`EINVAL`. Probes that used `version=1` reported `available=0` on all kernels.
+
+**[G-34] NET_DM_CMD_CONFIG returns EBUSY when monitoring is active** (drop_monitor)
+On the second and subsequent scrapes, `NET_DM_CMD_CONFIG` is rejected with
+`EBUSY` (errno=16) or `EALREADY` (errno=114) because monitoring is already
+running. Both are silently ignored; proceed directly to `STATS_GET`.
 
 ---
 
@@ -2186,22 +2244,45 @@ u32 filter_mask @ 8   (bitmask of IFLA_STATS_* groups to request/return)
 RTattrs start at `NLMSG_HDRLEN + NLMSG_ALIGN(16) = 32` bytes from the start
 of the netlink datagram.
 
-**filter_mask values:**
+**if_stats_msg (12 bytes, corrected):**
 
-| Bit | Constant | Value | Payload |
+```
+u8  family      @ 0   (AF_UNSPEC=0)
+u8  pad1        @ 1
+u16 pad2        @ 2
+u32 ifindex     @ 4   (0 in dump requests; ifindex in replies)
+u32 filter_mask @ 8   (bitmask of IFLA_STATS_FILTER_BIT(ATTR) = 1 << (ATTR - 1))
+```
+
+> **Size correction:** the original doc listed 16 bytes. The correct size is
+> **12 bytes** (`family(1)+pad1(1)+pad2(2)+ifindex(4)+filter_mask(4)`). A
+> previous build_if_stats_msg emitted 16 bytes with a trailing 4-byte pad; the
+> kernel only reads `sizeof(if_stats_msg) = 12` bytes so it was harmless but
+> incorrect.
+
+RTattrs start at `NLMSG_HDRLEN + NLMSG_ALIGN(12) = 16 + 12 = 28` bytes.
+
+**filter_mask values (IFLA_STATS_FILTER_BIT(ATTR) = 1 << (ATTR - 1)):**
+
+| Attr enum | Enum val | Filter bit | Payload |
 |---|---|---|---|
-| 0 | `IFLA_STATS_LINK_64` | 1 | `rtnl_link_stats64` (192 or 200 bytes) |
-| 1 | `IFLA_STATS_LINK_XSTATS` | 2 | Nested driver-specific xstats |
-| 2 | `IFLA_STATS_LINK_XSTATS_SLAVE` | 4 | Nested xstats for slave interfaces |
-| 3 | `IFLA_STATS_LINK_OFFLOAD_XSTATS` | 8 | Nested hw-offload stats (`rtnl_hw_stats64`) |
-| 4 | `IFLA_STATS_AF_SPEC` | 16 | Nested per-address-family stats (skip) |
+| `IFLA_STATS_LINK_64` | 1 | 1 (0x01) | `rtnl_link_stats64` (192 or 200 bytes) |
+| `IFLA_STATS_LINK_XSTATS` | 2 | 2 (0x02) | Nested driver-specific xstats |
+| `IFLA_STATS_LINK_XSTATS_SLAVE` | 3 | 4 (0x04) | Nested xstats for slave interfaces |
+| `IFLA_STATS_LINK_OFFLOAD_XSTATS` | 4 | 8 (0x08) | Nested hw-offload stats (`rtnl_hw_stats64`) |
 
-The `RtnetlinkExtendedAdapter` requests `filter_mask = 0x0B` (bits 0, 1, 3).
+The `RtExtendedCollector` requests `filter_mask = 0x0A` (bits XSTATS=2 +
+OFFLOAD_XSTATS=8). `IFLA_STATS_LINK_64` is not requested here (already covered
+by the main `RtCollector`).
 
-**Availability probe:** Before the first scrape, the adapter sends a
-`RTM_GETSTATS` with `ifindex=1` (loopback) and `filter_mask=1`. If the response
-is `NLMSG_ERROR` with `error=-EINVAL` or `error=-ENOTSUP`, the collector is
-marked unavailable.
+**Availability probe:** Uses `RTM_GETRULE` + `NLM_F_DUMP` with `AF_UNSPEC`
+(12-byte `fib_rule_hdr`, all-zero). `RTM_GETRULE` always succeeds on any
+rtnetlink-capable kernel (>= 2.2) and returns 0+ `RTM_NEWRULE` frames.
+
+> **Probe correction:** the original doc used `RTM_GETSTATS` with `ifindex=1`
+> as the probe. This returned `ENODEV` (errno=19) on interfaces without
+> hardware-offload stats, causing a false-negative `available=0` even on fully
+> capable kernels. RTM_GETRULE never returns ENODEV.
 
 ### 17.2  IFLA_STATS_LINK_XSTATS — Bridge xstats
 
@@ -2276,20 +2357,46 @@ The existing neighbor collector in `RtnetlinkAdapter` skips `ndm_family=7`
 
 ### 17.5  RTM_GETRULE — FIB policy-rule counting
 
-`RTM_GETRULE = 82`. Three dumps are issued per scrape:
+`RTM_GETRULE = 34` (verified: `RTM_NEWRULE=32`, `RTM_DELRULE=33`,
+`RTM_GETRULE=34` in `linux-6.17/include/uapi/linux/rtnetlink.h`).
+Three dumps are issued per scrape using `fib_rule_hdr` (12 bytes):
+
+```
+u8  family  @ 0  (AF_INET=2, AF_INET6=10, AF_MPLS=28)
+u8  dst_len @ 1  (0)
+u8  src_len @ 2  (0)
+u8  tos     @ 3  (0)
+u8  table   @ 4  (0)
+u8  res1    @ 5  (0)
+u8  res2    @ 6  (0)
+u8  action  @ 7  (0)
+u32 flags   @ 8  (0)
+```
 
 | Request | nlmsg_type | body.family | Label |
 |---|---|---|---|
-| AF_INET rules | RTM_GETRULE (82) | 2 | `family="inet"` |
-| AF_INET6 rules | RTM_GETRULE (82) | 10 | `family="inet6"` |
-| AF_MPLS rules | RTM_GETRULE (82) | 28 | `family="mpls"` |
+| AF_INET rules | RTM_GETRULE (34) | 2 | `family="inet"` |
+| AF_INET6 rules | RTM_GETRULE (34) | 10 | `family="inet6"` |
+| AF_MPLS rules | RTM_GETRULE (34) | 28 | `family="mpls"` |
+
+> **RTM_GETRULE constant correction:** the original doc listed 82. The value 82
+> is `RTM_GETNETCONF`, which caused every `collect_fib_rules()` call to send
+> the wrong message type, returning `EINVAL` or wrong reply structures.
 
 **[G-32] AF_MPLS RTM_GETRULE EINVAL on kernel < 4.3** (rtnetlink-extended)
 Treat this as `count=0` for `family="mpls"` and do not increment error counters.
 
 ### 17.6  RTM_GETNEXTHOP — nexthop-object counting
 
-`RTM_GETNEXTHOP = 118` (kernel >= 5.3). The body is `nhmsg` (8 bytes):
+`RTM_GETNEXTHOP = 106` (kernel >= 5.3). Verified:
+`RTM_NEWNEXTHOP=104`, `RTM_DELNEXTHOP=105`, `RTM_GETNEXTHOP=106`.
+
+> **RTM_GETNEXTHOP constant correction:** the original doc listed 118. The value
+> 118 is `RTM_GETNEXTHOPBUCKET` (`RTM_NEWNEXTHOPBUCKET=116`,
+> `RTM_DELNEXTHOPBUCKET=117`, `RTM_GETNEXTHOPBUCKET=118`). Using 118 caused
+> `EINVAL` on kernels without bucket support and wrong results otherwise.
+
+The body is `nhmsg` (8 bytes):
 
 ```
 u8  nh_family   @ 0  (AF_UNSPEC=0 for all-object dump)

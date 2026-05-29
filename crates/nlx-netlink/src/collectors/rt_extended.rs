@@ -4,15 +4,17 @@
 //! Messages used (ADR-0021, netlink-protocol.md §17):
 //!  - `RTM_GETSTATS` (94) → per-interface xstats (bridge mcast, hw offload).
 //!  - `RTM_GETNEIGH` (30) with `AF_BRIDGE (7)` → bridge FDB entry counts.
-//!  - `RTM_GETRULE` (82) with AF_INET/INET6/MPLS → FIB policy-rule counts.
-//!  - `RTM_GETNEXTHOP` (118) → nexthop object total count.
+//!  - `RTM_GETRULE` (34) with AF_INET/INET6/MPLS → FIB policy-rule counts.
+//!  - `RTM_GETNEXTHOP` (106) → nexthop object total count (kernel >= 5.3).
 //!
 //! ## Runtime gate
 //!
-//! `probe_available()` sends a probe `RTM_GETSTATS` with `ifindex=1`.
-//! `EINVAL` (errno 22) or `ENOTSUP` (errno 95) → returns `false`.  On kernels
-//! < 5.3, `RTM_GETNEXTHOP` returns `EINVAL`; the nexthop metric emits 0 rather
-//! than an error.
+//! `probe_available()` performs an `RTM_GETRULE` dump with `AF_UNSPEC` (always
+//! supported on any Linux kernel that has rtnetlink).  The previous RTM_GETSTATS
+//! probe could return `ENODEV` (errno 19) when ifindex=1 lacks offload stats,
+//! causing a false-negative `available=0` even on fully capable kernels.
+//! On kernels < 5.3, `RTM_GETNEXTHOP` returns `EINVAL`; the nexthop metric
+//! emits 0 rather than an error.
 //!
 //! ## Cardinality
 //!
@@ -37,14 +39,17 @@ use crate::{
 const NETLINK_ROUTE: i32 = 0;
 
 // RTM message types (native-endian u16 in nlmsghdr.nlmsg_type).
+// Values verified against linux/rtnetlink.h (kernel 6.17).
 // RTM_GETSTATS = 94, RTM_NEWSTATS = 93 (ADR-0021 §17.1).
 const RTM_GETSTATS: u16 = 94;
 // RTM_GETNEIGH = 30 (with ndmsg.ndm_family = AF_BRIDGE=7 for FDB).
 const RTM_GETNEIGH: u16 = 30;
-// RTM_GETRULE = 82 (FIB policy-routing rules).
-const RTM_GETRULE: u16 = 82;
-// RTM_GETNEXTHOP = 118 (kernel >= 5.3).
-const RTM_GETNEXTHOP: u16 = 118;
+// RTM_GETRULE = 34 (FIB policy-routing rules).
+// NOTE: 82 is RTM_GETNETCONF — a common off-by-one mistake.
+const RTM_GETRULE: u16 = 34;
+// RTM_GETNEXTHOP = 106 (kernel >= 5.3).
+// NOTE: 118 is RTM_GETNEXTHOPBUCKET — a common off-by-one mistake.
+const RTM_GETNEXTHOP: u16 = 106;
 
 // Address families.
 const AF_UNSPEC: u8 = 0;
@@ -53,10 +58,10 @@ const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 const AF_MPLS: u8 = 28;
 
-// if_stats_msg filter_mask bits (§17.1).
-const IFLA_STATS_LINK_64: u32 = 1;
-const IFLA_STATS_LINK_XSTATS: u32 = 2;
-const IFLA_STATS_LINK_OFFLOAD_XSTATS: u32 = 8;
+// if_stats_msg filter_mask bits — IFLA_STATS_FILTER_BIT(ATTR) = 1 << (ATTR - 1) (§17.1).
+// IFLA_STATS_LINK_64 (enum=1) filter bit = 1 — not requested; full stats live in RtCollector.
+const IFLA_STATS_LINK_XSTATS: u32 = 2; // IFLA_STATS_LINK_XSTATS (enum=2), filter bit = 1<<1
+const IFLA_STATS_LINK_OFFLOAD_XSTATS: u32 = 8; // IFLA_STATS_LINK_OFFLOAD_XSTATS (enum=4), filter bit = 1<<3
 
 // Attributes in RTM_NEWSTATS replies (IFLA_STATS_* enum, effective types).
 const IFLA_STATS_A_LINK_64: u16 = 1; // rtnl_link_stats64 blob
@@ -180,20 +185,28 @@ impl Collector for RtExtendedCollector {
 
     fn probe_available(&self) -> BoxFuture<'_, bool> {
         Box::pin(async move {
-            // Probe by sending RTM_GETSTATS with ifindex=1 (loopback), filter_mask=1.
+            // Probe via RTM_GETRULE dump (AF_UNSPEC, fib_rule_hdr all-zero).
+            //
+            // RTM_GETRULE is present on every Linux kernel that supports rtnetlink
+            // (kernel >= 2.2) and always succeeds — it returns 0+ RTM_NEWRULE
+            // frames followed by NLMSG_DONE.  This avoids the false-negative that
+            // plagued the previous RTM_GETSTATS probe: on interfaces without
+            // hardware-offload stats, the kernel returns ENODEV (errno=19) which
+            // was not handled and fell through to `Err(_) => false`.
+            //
+            // fib_rule_hdr (12 bytes, all-zero for AF_UNSPEC dump):
+            //   family(1)+dst_len(1)+src_len(1)+tos(1)+table(1)+res1(1)+res2(1)
+            //   +action(1)+flags(4)
             let Ok(mut sock) = NetlinkSocket::open(NETLINK_ROUTE) else {
                 return false;
             };
-            // if_stats_msg (16 bytes): family=0, pad=0, pad=0, ifindex=1, filter_mask=1.
-            let mut body = vec![AF_UNSPEC, 0u8, 0u8, 0u8]; // family + 3 pad bytes
-            body.extend_from_slice(&1u32.to_ne_bytes()); // ifindex = 1 (loopback)
-            body.extend_from_slice(&IFLA_STATS_LINK_64.to_ne_bytes()); // filter_mask
-            body.extend_from_slice(&0u32.to_ne_bytes()); // pad to 16 bytes
-
-            match sock.request_single(RTM_GETSTATS, 0, &body).await {
+            let body = [0u8; 12]; // fib_rule_hdr, all-zero = AF_UNSPEC dump
+            match sock.dump(RTM_GETRULE, 0, &body).await {
                 Ok(_) => true,
-                Err(crate::transport::NetlinkError::KernelError { errno: 22 }) => false, // EINVAL
-                Err(crate::transport::NetlinkError::KernelError { errno: 95 }) => false, // ENOTSUP
+                Err(crate::transport::NetlinkError::DumpIntr) => {
+                    // Kernel says data changed — rtnetlink IS available.
+                    true
+                }
                 Err(_) => false,
             }
         })
@@ -368,15 +381,17 @@ async fn collect_nexthop_count(sock: &mut NetlinkSocket) -> Result<u64, String> 
 // Wire builders
 // ---------------------------------------------------------------------------
 
-/// Build `if_stats_msg` (16 bytes, §17.1).
+/// Build `if_stats_msg` (12 bytes, §17.1).
+///
+/// Layout (verified against `struct if_stats_msg` in linux/if_link.h):
+///   family(u8) + pad1(u8) + pad2(u16) + ifindex(u32) + filter_mask(u32) = 12 bytes.
 fn build_if_stats_msg(ifindex: u32, filter_mask: u32) -> Vec<u8> {
-    let mut body = Vec::with_capacity(16);
-    body.push(AF_UNSPEC); // ifi_family
+    let mut body = Vec::with_capacity(12);
+    body.push(AF_UNSPEC); // family
     body.push(0u8); // pad1
     body.extend_from_slice(&0u16.to_ne_bytes()); // pad2
-    body.extend_from_slice(&ifindex.to_ne_bytes());
-    body.extend_from_slice(&filter_mask.to_ne_bytes());
-    body.extend_from_slice(&0u32.to_ne_bytes()); // pad to 16
+    body.extend_from_slice(&ifindex.to_ne_bytes()); // ifindex
+    body.extend_from_slice(&filter_mask.to_ne_bytes()); // filter_mask
     body
 }
 
