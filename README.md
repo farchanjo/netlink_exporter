@@ -45,8 +45,8 @@ graph TD
     PROM["Prometheus Server\nGET /metrics every 15 s"]
 
     subgraph exporter["nft_exporter binary"]
-        HTTP["HTTP exposition layer\naxum 0.8 · port 9456\n/metrics /healthz /ready"]
-        ORCH["CollectionOrchestration\nScrapeLifecycle · JoinSet fan-out\nper-collector timeout · stale-snapshot fallback"]
+        HTTP["HTTP exposition layer\nmonoio-http 0.3 · port 9456\n/metrics /healthz /ready"]
+        ORCH["CollectionOrchestration\nScrapeLifecycle · spawn_blocking fan-out\nper-collector timeout · stale-snapshot fallback"]
 
         subgraph collectors["Collector adapters — one socket per netlink family"]
             RT["rtnetlink adapter\nNETLINK_ROUTE (0)\nlink · address · route · neighbor"]
@@ -56,7 +56,7 @@ graph TD
             NFT["nfnetlink adapter\nNETLINK_NETFILTER (12)\nnftables rules · counters · sets"]
             SD["sock-diag adapter\nNETLINK_SOCK_DIAG (4)"]
             GENL["genetlink adapters\nNETLINK_GENERIC (16)\nethtool · IPVS · WireGuard\ndevlink · drop-monitor"]
-            XFRM["xfrm adapter\nNETLINK_XFRM (6)\n+ /proc/net/xfrm_stat"]
+            XFRM["xfrm adapter\nNETLINK_XFRM (6)\nSA/SP/SADINFO/SPDINFO only"]
         end
     end
 
@@ -92,9 +92,10 @@ graph TD
 ### Hexagonal ports-and-adapters
 
 Domain-core crates declare only `async trait` ports and immutable ReadModels.
-`tokio` and `mio` are confined to driven adapter crates and the binary
-composition root. No domain-core crate imports any infrastructure crate;
-enforced by `cargo deny` workspace rules (ADR-0002, ADR-0014).
+`monoio` is confined to driven adapter crates and the binary composition root
+(ADR-0023). `tokio`, `mio`, and `axum` are absent from the dependency graph.
+No domain-core crate imports any infrastructure crate; enforced by `cargo deny`
+workspace rules (ADR-0002, ADR-0023).
 
 ```mermaid
 graph LR
@@ -131,14 +132,14 @@ graph LR
         CFG["ConfigPort"]
     end
 
-    subgraph adapters["Adapter crates (tokio + mio here only)"]
-        AXM["AxumHttpAdapter"]
+    subgraph adapters["Adapter crates (monoio here only)"]
+        AXM["MonoioHttpAdapter\n(monoio-http 0.3 — hand-rolled HTTP/1)"]
         RTA["RtnetlinkAdapter\n(rustix · zerocopy)"]
         CTA["ConntrackAdapter\n(rustix · byteorder)"]
         NFTA["NftablesAdapter\n(rustix · linux-raw-sys)"]
         SDA["SockDiagAdapter"]
         ETHA["EthtoolAdapter\n(genetlink OnceLock)"]
-        PRA["PrometheusRegistryAdapter\n(prometheus-client 0.24)"]
+        PRA["MetricsEncoder\n(nlx-metrics hand-rolled OpenMetrics)"]
     end
 
     P1 --> AXM
@@ -170,16 +171,16 @@ graph LR
 ```mermaid
 sequenceDiagram
     participant P as Prometheus
-    participant AXM as AxumHttpAdapter
+    participant AXM as MonoioHttpAdapter
     participant SL as ScrapeLifecycle
-    participant JS as tokio JoinSet
+    participant JS as spawn_blocking fan-out
     participant CT as ctnetlink adapter
     participant NFT as nfnetlink adapter
     participant K as Linux Kernel
 
     P->>AXM: GET /metrics
     AXM->>SL: trigger_scrape()
-    SL->>JS: spawn collectors (concurrent fan-out)
+    SL->>JS: spawn_blocking per collector (concurrent fan-out)
 
     JS->>CT: probe_availability() + collect()
     CT->>K: IPCTNL_MSG_CT_GET_STATS_CPU (per-CPU)
@@ -196,7 +197,7 @@ sequenceDiagram
     JS-->>SL: all ReadModels joined
     SL->>SL: post_process → MetricSnapshot
     SL-->>AXM: MetricSnapshot
-    AXM-->>P: OpenMetrics text<br/>application/openmetrics-text version=1.0.0
+    AXM-->>P: OpenMetrics text<br/>application/openmetrics-text; version=1.0.0<br/>(encoded by nlx-metrics)
 ```
 
 ---
@@ -223,7 +224,7 @@ sequenceDiagram
 | `wireguard` | `NETLINK_GENERIC` (16) — wireguard family | `nft_wireguard_peer_receive_bytes_total{interface,peer}`, `nft_wireguard_peer_last_handshake_seconds`, `nft_wireguard_peer_endpoint_present` | yes (`wireguard` module) |
 | `devlink` | `NETLINK_GENERIC` (16) — devlink family | `nft_devlink_health_reporter_error_total{bus_name,dev_name,reporter}`, `nft_devlink_health_reporter_state` | yes (`CONFIG_NET_DEVLINK`) |
 | `drop-monitor` | `NETLINK_GENERIC` (16) — NET_DM family | `nft_drop_packets_total{reason,origin}` (sw + hw) | yes (opt-in, `drop_monitor` module) |
-| `xfrm-ipsec` | `NETLINK_XFRM` (6) + `/proc/net/xfrm_stat` | `nft_xfrm_sa_count{proto,mode}`, `nft_xfrm_sp_count{dir,action}`, `nft_xfrm_stat_total{counter}` (26 fixed kernel ABI counters) | yes (`xfrm_user` module) |
+| `xfrm-ipsec` | `NETLINK_XFRM` (6) | `nft_xfrm_sa_count{proto,mode}`, `nft_xfrm_sp_count{dir,action}`, `nft_xfrm_sad_hash_count`, `nft_xfrm_spd_hash_count` | yes (`xfrm_user` module) |
 
 Runtime-gated collectors emit `nft_scrape_collector_available{collector}=0` when
 their kernel subsystem is absent and return `HTTP 200` without error, so `nft_up`
@@ -314,7 +315,7 @@ nft_exporter \
 | Endpoint | Description |
 |---|---|
 | `GET /metrics` | OpenMetrics text (`application/openmetrics-text; version=1.0.0`) |
-| `GET /healthz` | Kubernetes liveness probe — 200 when the tokio event loop is alive |
+| `GET /healthz` | Kubernetes liveness probe — 200 when the monoio event loop is alive |
 | `GET /ready` | Kubernetes readiness probe — 200 after the first successful scrape |
 
 ---
@@ -403,13 +404,20 @@ seccompProfile:
 ```
 
 `CAP_NET_RAW` is **not** required (`SOCK_RAW` over `AF_NETLINK` does not need
-it). `CAP_SYS_ADMIN` is **not** required (per-netns fd inheritance via a
-dedicated `netns-opener` thread avoids `setns(CLONE_NEWNET)`). See ADR-0009.
+it). `CAP_SYS_ADMIN` is **not** required for normal operation; however, when
+the `drop-monitor` collector is **enabled**, `CAP_SYS_ADMIN` is transiently
+required during startup to join the `NET_DM_GRP_ALERT` multicast group
+(see ADR-0026, ADR-0009). See ADR-0009 for the capability-drop model.
 
-The custom seccomp profile (`deploy/seccomp/nft-exporter.json`) allows only
-`socket(AF_NETLINK)`, `bind`, `recvmsg`, `sendmsg`, `epoll_wait`, and `futex`;
-it denies `execve`, `ptrace`, `mount`, `bpf`, `clone(CLONE_NEWUSER)`, and
-`perf_event_open`.
+The custom seccomp profile (`deploy/seccomp/nft-exporter.json`) is a
+RuntimeDefault baseline extended to allow `io_uring_setup` (425),
+`io_uring_enter` (426), and `io_uring_register` (427) (required by monoio;
+blocked by default under `RuntimeDefault`).  It denies `execve`, `execveat`,
+`ptrace`, `bpf`, `clone(CLONE_NEWUSER)`, and `perf_event_open`.  `epoll_wait`
+is **not** in the allowlist — the runtime is monoio io_uring, not epoll
+(ADR-0023).  The profile must be deployed to
+`/var/lib/kubelet/seccomp/nft-exporter.json` on every node before the
+DaemonSet is applied.
 
 ---
 
@@ -427,7 +435,7 @@ All configuration is available as both environment variables and CLI flags.
 | `NFT_EXPORTER_LOG_LEVEL` | `--log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `NFT_EXPORTER_LOG_FORMAT` | `--log-format` | `json` | `json` or `text` |
 | `NFT_EXPORTER_NETLINK_RECV_BUF_BYTES` | `--netlink-recv-buf-bytes` | `4194304` | Netlink socket receive buffer (4 MiB minimum) |
-| `TOKIO_WORKER_THREADS` | _(none)_ | logical CPU count | tokio multi-thread worker count |
+| `MONOIO_DRIVER` | _(none)_ | `iouring` | Set to `legacy` to force the epoll fallback without recompiling (ADR-0023) |
 
 ### Collector enable flags
 
@@ -462,10 +470,10 @@ All architectural decisions are recorded as MADR 4.0 files in
 | [ADR-0005](docs/arch/adr/0005-metric-cardinality-strategy.md) | Aggregate-only model; 50,000 series ceiling; no per-flow labels |
 | [ADR-0008](docs/arch/adr/0008-packaging-and-deployment.md) | Static musl binary in `distroless/static-debian12:nonroot` |
 | [ADR-0009](docs/arch/adr/0009-privilege-and-security-model.md) | `CAP_NET_ADMIN` only; capabilities dropped after socket open |
-| [ADR-0010](docs/arch/adr/0010-http-exposition-stack.md) | axum 0.8 on port 9456; `GET /metrics /healthz /ready` |
+| [ADR-0010](docs/arch/adr/0010-http-exposition-stack.md) | monoio-http 0.3 (hand-rolled HTTP/1) on port 9456; `GET /metrics /healthz /ready` |
 | [ADR-0011](docs/arch/adr/0011-adopt-direct-netlink-wire-protocol.md) | Direct AF_NETLINK wire protocol (rustix + linux-raw-sys + zerocopy) |
 | [ADR-0013](docs/arch/adr/0013-interface-and-collector-filtering.md) | Include/exclude regex interface filter; per-collector enable flags |
-| [ADR-0014](docs/arch/adr/0014-tokio-mio-runtime.md) | tokio + mio confined to driven adapters; port traits runtime-agnostic |
+| [ADR-0023](docs/arch/adr/0023-io-uring-runtime.md) | monoio 0.2 + monoio-http 0.3; single thread; io_uring SEND/RECV; tokio/mio/axum removed |
 | [ADR-0015](docs/arch/adr/0015-collector-runtime-gating.md) | Per-scrape availability probe; `nft_scrape_collector_available` gauge |
 
 Domain model, bounded-context map, and ubiquitous language:

@@ -8,6 +8,15 @@ informed: []
 
 # Require CAP_NET_ADMIN only; drop all other capabilities immediately after netlink socket open; reject CAP_NET_RAW and CAP_SYS_ADMIN by design
 
+> **drop_monitor exception (ADR-0026):** When the `drop-monitor` collector is
+> enabled, `CAP_SYS_ADMIN` is transiently required during the privileged setup
+> phase to join the `NET_DM_GRP_ALERT` multicast group (`events`), which is
+> declared `GENL_MCAST_CAP_SYS_ADMIN` in `net/core/drop_monitor.c:187`.  The
+> join executes before the capability drop; the background recv thread spawned
+> afterwards inherits no capabilities.  When `drop-monitor` is **disabled**
+> (the default), `CAP_SYS_ADMIN` is never requested and the invariant below
+> holds without exception.  See ADR-0026 for full capability ordering detail.
+
 ## Context and Problem Statement
 
 The nft_exporter reads kernel state via six netlink API families. Two of those families (NETLINK_NETFILTER ctnetlink and `SOCK_DIAG_BY_FAMILY` with full stats) require elevated privileges. The wrong capability set choice could expose a significant privilege-escalation surface on every node in the cluster.
@@ -44,14 +53,28 @@ After this point the process has no capabilities in any set. The ambient set is 
 
 **systemd unit hardening**: `AmbientCapabilities=CAP_NET_ADMIN`, `CapabilityBoundingSet=CAP_NET_ADMIN`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `PrivateTmp=true`, `PrivateDevices=true`, `ProtectKernelTunables=true`, `ProtectControlGroups=true`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`, `MemoryDenyWriteExecute=true`, `LockPersonality=true`, `SystemCallFilter=@system-service @network-io`.
 
-**Custom seccomp profile** (`deploy/seccomp/nft-exporter.json`): allows `socket(AF_NETLINK)`, `bind`, `recvmsg`, `sendmsg`, `epoll_wait`, `futex`; denies `execve`, `ptrace`, `mount`, `bpf`, `clone(CLONE_NEWUSER)`, `perf_event_open`.
+**Custom seccomp profile** (`deploy/seccomp/nft-exporter.json`): allows
+`socket(AF_NETLINK)`, `bind`, `recvmsg`, `sendmsg`,
+`io_uring_setup` (syscall 425), `io_uring_enter` (syscall 426),
+`io_uring_register` (syscall 427), `futex`, `mmap`, `mprotect`, `read`,
+`write`, `close`; denies `execve`, `execveat`, `ptrace`, `mount`, `bpf`,
+`clone(CLONE_NEWUSER)`, `perf_event_open`.  `epoll_wait` is **not** in the
+allowlist — the runtime is monoio io_uring, not epoll (ADR-0023).  The
+Kubernetes `RuntimeDefault` seccomp profile denies `io_uring_setup` by
+default; deploying the Localhost profile at
+`/var/lib/kubelet/seccomp/nft-exporter.json` is therefore mandatory (see
+`deploy/seccomp/nft-exporter.json` and ADR-0023 §seccomp).
 
 **Consequences:**
 
 - Positive: The capability bounding set contains exactly one capability; even if an attacker achieves arbitrary code execution inside the process, they cannot escalate beyond `CAP_NET_ADMIN`.
 - Positive: Post-drop, the process has zero capabilities; network interface configuration, routing table modification, and firewall rule changes are all blocked from within the exporter process after socket initialization.
 - Positive: The seccomp custom profile blocks the most common kernel exploit primitives (`execve`, `bpf`, `perf_event_open`, `clone(CLONE_NEWUSER)`) while permitting only the netlink I/O and tokio async primitives the exporter actually uses.
-- Negative: The capability drop is irreversible; if a future feature requires an additional netlink family that needs a different capability, the socket for that family must be opened before the drop in `ExporterApp::start()`.
+- Negative: The capability drop is irreversible and **fatal on failure** — if
+  `caps::clear` returns an error the process aborts rather than continuing with
+  elevated privileges.  If a future feature requires an additional capability,
+  the corresponding socket must be opened before the drop in
+  `ExporterApp::start()`.
 - Negative: The custom seccomp profile must be maintained as the tokio and axum syscall surface evolves. CI runs `strace -f -e trace=all` in a test container and diffs against the allowed syscall set on each dependency update.
 
 **Rejected options:**

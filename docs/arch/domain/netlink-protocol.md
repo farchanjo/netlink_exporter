@@ -74,16 +74,22 @@ open --> bind --> setsockopt* --> [dump loop]* --> close
                     NETLINK_GET_STRICT_CHK=1 (NETLINK_ROUTE only)
 ```
 
-1. **open** — `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, protocol)`
-   via `rustix::net::socket_with`.
+1. **open** — `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, protocol)`
+   via `rustix::net::socket_with`.  `SOCK_NONBLOCK` is **intentionally
+   omitted**: monoio's `PollFd` drives readiness via `IORING_OP_POLL_ADD` on
+   the io_uring SQ; the fd does not need to be set non-blocking at the OS
+   level because io_uring handles async completion without O_NONBLOCK.
 2. **bind** — `sockaddr_nl { nl_family: AF_NETLINK, nl_pid: 0, nl_groups: 0 }`.
    Setting `nl_pid=0` causes the kernel to assign the port number; the exporter
    never hard-codes a pid.
 3. **setsockopt**:
    - `SO_RCVBUF` to 4 194 304 bytes (4 MiB minimum). The shared socket module
      doubles this on the first ENOBUFS occurrence.
-   - `NETLINK_GET_STRICT_CHK` (value 11) to `1u32` on NETLINK_ROUTE sockets.
-     Silently ignore `ENOPROTOOPT` on kernel < 4.20.
+   - `NETLINK_GET_STRICT_CHK` (value **12**) to `1u32` on NETLINK_ROUTE
+     sockets.  Silently ignore `ENOPROTOOPT` on kernel < 4.20.
+     (The constant is defined at `include/uapi/linux/netlink.h` —
+     `#define NETLINK_GET_STRICT_CHK 12`.  Earlier versions of this doc
+     incorrectly listed value 11, which is `NETLINK_BROADCAST_ERROR`.)
 4. **dump loop** — repeated for each subsystem dump; see section 3.3.
 5. **close** — `rustix::io::close` after all collectors finish. Capabilities
    are dropped before the first dump (ADR-0009).
@@ -91,47 +97,41 @@ open --> bind --> setsockopt* --> [dump loop]* --> close
 ### io_uring SQ/CQ submit and complete model (ADR-0023)
 
 The transport uses monoio 0.2 with io_uring as the kernel I/O interface
-(ADR-0023). The `AF_NETLINK` fd is registered with the io_uring instance at
-open time via `IORING_REGISTER_FILES` (fixed-file index). Two receive buffers of
-4 MiB each are registered at open time via `IORING_REGISTER_BUFFERS` (fixed
-lifetime, `Pin<Box<[u8]>>`). The `monoio::io::PollFd` wrapper (from the
-`poll-io` feature) provides `readable().await` driven by `IORING_OP_POLL_ADD`
-on the SQ rather than epoll.
+(ADR-0023). The `monoio::io::PollFd` wrapper (from the `poll-io` feature)
+provides `readable().await` driven by `IORING_OP_POLL_ADD` on the SQ rather
+than epoll. Send/receive use plain **`IORING_OP_SEND`** and **`IORING_OP_RECV`**
+respectively — not `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG`, and
+**no registered buffers** (`IORING_REGISTER_BUFFERS` / `IORING_REGISTER_FILES`
+are not used). Each ring is created with depth **32 SQEs** and executes inside
+`monoio::spawn_blocking`.
 
-Each dump request submits one `IORING_OP_SENDMSG` SQE followed by a receive
-loop of `IORING_OP_RECVMSG` SQEs with `IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT`.
-The kernel writes received bytes directly into the registered buffer and posts a
-CQE with the byte count in `cqe.res`. No intermediate epoll wakeup and no
-separate data syscall are interleaved.
-
-Minimum kernel for `IOSQE_BUFFER_SELECT`: **5.7**. On kernel 5.1–5.6 the driver
-falls back to `IORING_OP_POLL_ADD` + standard `sendmsg`/`recvmsg` syscalls. On
-kernel < 5.1 the monoio `legacy` feature activates the epoll path transparently.
+Minimum kernel: **5.1** (required for `io_uring_setup`). On kernel < 5.1 the
+monoio `legacy` feature activates the epoll path transparently.
 
 ```rust
 // Pseudocode — actual impl in nft_exporter_netlink_socket (ADR-0023)
-let fd = socket_with(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, protocol)?;
+let fd = socket_with(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, protocol)?;
 bind(&fd, &sockaddr_nl { nl_family: AF_NETLINK, nl_pid: 0, nl_groups: 0 })?;
 set_socket_recv_buffer_size(&fd, 4_194_304)?;
-// Register fd and pre-pinned recv_buf with the io_uring instance.
 // PollFd drives fd readiness via IORING_OP_POLL_ADD on the SQ.
 let poll_fd = monoio::io::PollFd::new(fd);
 
-// Send: IORING_OP_SENDMSG SQE with IOSQE_FIXED_FILE
+// Send: IORING_OP_SEND SQE (plain, not sendmsg)
 let _guard = poll_fd.writable().await?;
-ring.submit_sendmsg_sqe(&request_bytes)?;
+ring.submit_send_sqe(&request_bytes)?;
 ring.reap_cqe_and_check()?;
 
-// Receive loop: IORING_OP_RECVMSG SQE with IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT
+// Receive loop: IORING_OP_RECV SQE (no registered buffers)
+let mut recv_buf = vec![0u8; 4_194_304];
 loop {
     let _guard = poll_fd.readable().await?;
-    ring.submit_recvmsg_sqe(fixed_buf_index)?;
-    let n = ring.reap_cqe_byte_count()?;  // cqe.res = bytes written to registered buf
-    match process_nlmsgs(&registered_buf[..n]) {
+    ring.submit_recv_sqe(&mut recv_buf)?;
+    let n = ring.reap_cqe_byte_count()?;  // cqe.res = bytes received
+    match process_nlmsgs(&recv_buf[..n]) {
         ParseResult::Done(frames)   => return Ok(frames),
         ParseResult::Continue       => continue,
         ParseResult::DumpIntr       => return Err(NetlinkError::DumpIntr),
-        ParseResult::Enobufs        => { grow_rcvbuf_and_reregister(); continue; }
+        ParseResult::Enobufs        => { grow_rcvbuf(&fd); continue; }
     }
 }
 ```
@@ -140,30 +140,30 @@ loop {
 
 ```mermaid
 sequenceDiagram
-    participant U as NetlinkSocket<br/>(blocking thread)
+    participant U as NetlinkSocket<br/>(spawn_blocking thread)
     participant SQ as io_uring SQ
     participant K as Linux Kernel
     participant CQ as io_uring CQ
 
-    Note over U,CQ: Socket open, fd registered via IORING_REGISTER_FILES<br/>recv buf registered via IORING_REGISTER_BUFFERS
+    Note over U,CQ: Socket open (SOCK_RAW | SOCK_CLOEXEC, no SOCK_NONBLOCK)<br/>No registered files or registered buffers
 
-    U->>SQ: push IORING_OP_SENDMSG SQE (fixed-file, request bytes)
+    U->>SQ: push IORING_OP_SEND SQE (request bytes)
     SQ->>K: io_uring_enter, IORING_ENTER_GETEVENTS
-    K->>CQ: post sendmsg CQE (res = bytes sent)
+    K->>CQ: post send CQE (res = bytes sent)
     CQ->>U: reap CQE, check res >= 0
 
     loop until NLMSG_DONE or error
-        U->>SQ: push IORING_OP_RECVMSG SQE (IOSQE_FIXED_FILE, IOSQE_BUFFER_SELECT, buf_id=0)
+        U->>SQ: push IORING_OP_RECV SQE (recv_buf, len=4MiB)
         SQ->>K: io_uring_enter, IORING_ENTER_GETEVENTS
-        K-->>CQ: post recvmsg CQE (res = byte count, flags carry IORING_CQE_F_BUFFER)
-        CQ->>U: reap CQE, read res bytes from registered buffer
-        U->>U: parse_nlmsgs(registered_buf[0..res])
+        K-->>CQ: post recv CQE (res = byte count)
+        CQ->>U: reap CQE, read res bytes from recv_buf
+        U->>U: parse_nlmsgs(recv_buf[0..res])
         alt NLMSG_DONE
             U->>U: return Ok(accumulated frames)
         else NLM_F_DUMP_INTR on any frame
             U->>U: return Err(DumpIntr)
         else ENOBUFS (cqe.res == -105)
-            U->>U: grow_rcvbuf, IORING_REGISTER_BUFFERS_UPDATE
+            U->>U: grow_rcvbuf via setsockopt SO_RCVBUF
         end
     end
 ```
@@ -300,8 +300,9 @@ sequenceDiagram
 
 ### 3.4  ENOBUFS Circuit-Breaker
 
-When `recvmsg` returns `ENOBUFS`, the kernel dropped messages from the socket
-receive buffer. The dump is incomplete.
+When `recvmsg` (or `IORING_OP_RECV` CQE `res == -105`) indicates ENOBUFS,
+the kernel dropped messages from the socket receive buffer.  The dump is
+incomplete.
 
 **Procedure:**
 
@@ -311,12 +312,23 @@ receive buffer. The dump is incomplete.
 4. If ENOBUFS occurs again: return `CollectorError::Enobufs`. Do not retry
    further. Serve stale snapshot.
 
+> **Implementation status:** `nft_netlink_errors_total` is referenced in this
+> document and in ADR-0011 as a planned counter, but is **not yet emitted** by
+> the current collector code.  The ENOBUFS circuit-breaker logic exists, but
+> the metric increment is a no-op stub.  Do not write alerting rules against
+> this metric until it is implemented.  Track via the ENOBUFS counter task.
+
 ### 3.5  NETLINK_GET_STRICT_CHK
 
-`setsockopt(SOL_NETLINK=270, NETLINK_GET_STRICT_CHK=11, &1u32, 4)`
+`setsockopt(SOL_NETLINK=270, NETLINK_GET_STRICT_CHK=12, &1u32, 4)`
 
 Available on kernel >= 4.20. When set, the kernel validates dump requests and
 respects filter attributes. Silently ignore `ENOPROTOOPT` on older kernels.
+
+> **Correction:** earlier versions of this doc listed `NETLINK_GET_STRICT_CHK`
+> as value 11.  The correct constant is **12**.  Value 11 is
+> `NETLINK_BROADCAST_ERROR` (`include/uapi/linux/netlink.h`).  Using 11 set a
+> different sockopt silently and strict-check was not actually enabled.
 
 **Warning:** Setting `RTEXT_FILTER_SKIP_STATS` in `IFLA_EXT_MASK` alongside
 strict checking suppresses `IFLA_STATS64` from `RTM_NEWLINK` responses. Never
@@ -729,9 +741,19 @@ when issuing a full dump. Sending `NLM_F_REQUEST (0x0001)` alone produces
 `EINVAL (errno=22)` from the kernel because the subsystem validates that dump
 requests carry both `NLM_F_ROOT` and `NLM_F_MATCH` bits.
 
-**nlattr payload endianness for nftables:** unlike ctnetlink (section 5.2–5.6),
-all nftables-specific nlattr payloads are **native-endian** (little-endian on
-x86-64/aarch64). No big-endian reads are required for nftables attributes.
+**nlattr payload endianness for nftables:** most nftables-specific nlattr
+payloads are **native-endian** (little-endian on x86-64/aarch64), but four
+integer attributes are encoded **big-endian** (`nla_put_be32` in the kernel):
+
+| Attribute | nla_type | Rust read |
+|---|---|---|
+| `NFTA_OBJ_TYPE` | type=5 in `nft_obj_attrs` | `u32::from_be_bytes` |
+| `NFTA_HOOK_HOOKNUM` | type=1 in `nft_hook_attrs` | `u32::from_be_bytes` |
+| `NFTA_HOOK_PRIORITY` | type=2 in `nft_hook_attrs` | `u32::from_be_bytes` (i32 reinterpret for negative priorities) |
+| `NFTA_CHAIN_POLICY` | type=10 in `nft_chain_attrs` | `u32::from_be_bytes` |
+
+All other nftables integer attributes use native-endian (including
+`NFTA_COUNTER_BYTES`/`NFTA_COUNTER_PACKETS` which use `nla_put_be64`).
 
 **Object (counter) parsing path:** `NFTA_OBJ_DATA (type=4)` is a nested nlattr
 container whose inner attributes follow the `nft_counter_attributes` enum:
@@ -748,8 +770,12 @@ counter values are serialised via `nla_put_be64`).
 ```
 u8  sdiag_family    @ 0   (AF_INET=2 or AF_INET6=10)
 u8  sdiag_protocol  @ 1   (IPPROTO_TCP=6, IPPROTO_UDP=17, IPPROTO_UDPLITE=136)
-u8  idiag_ext       @ 2   (bitmask: INET_DIAG_INFO=0x02, INET_DIAG_SKMEMINFO=0x20
-                           → combined 0x22)
+u8  idiag_ext       @ 2   (bitmask: INET_DIAG_INFO=2 → bit 1 = 0x02,
+                            INET_DIAG_SKMEMINFO=7 → bit 6 = 0x40
+                            → combined 0x42)
+                           Note: the ext bitmask uses (1 << (attr_id - 1));
+                           INET_DIAG_INFO=2 → 1<<1=0x02;
+                           INET_DIAG_SKMEMINFO=7 → 1<<6=0x40.
 u8  pad             @ 3   (always 0)
 u32 idiag_states    @ 4   (0xFFFFFFFF = all states)
 struct inet_diag_sockid id @ 8..56
@@ -782,7 +808,12 @@ create a spurious TCP close label for UDP traffic.
 `inet_diag_msg` struct immediately after accumulating `idiag_rqueue` and
 `idiag_wqueue`.
 
-### 6.3  INET_DIAG_SKMEMINFO (nla_type=6)
+### 6.3  INET_DIAG_SKMEMINFO (nla_type=7)
+
+> **Correction:** earlier versions of this doc listed `nla_type=6`.  The
+> correct value is **7** (`INET_DIAG_SKMEMINFO` in the
+> `inet_diag_attr_type` enum: `INET_DIAG_TOS=5`, `INET_DIAG_TCLASS=6`,
+> `INET_DIAG_SKMEMINFO=7`, `INET_DIAG_SHUTDOWN=8`).
 
 9 × `u32` little-endian, total 36 bytes.
 
@@ -802,19 +833,41 @@ create a spurious TCP close label for UDP traffic.
 let skmem_drop = u32::from_le_bytes(skmeminfo_payload[32..36].try_into()?);
 ```
 
-### 6.4  INET_DIAG_INFO (nla_type=2)
+### 6.4  INET_DIAG_INFO (nla_type=2, confirmed correct)
 
-For TCP sockets, the payload is a `struct tcp_info` blob. The cumulative
-retransmit count is at **byte offset 12**:
+For TCP sockets, the payload is a `struct tcp_info` blob.  Two retransmit
+fields exist; only `tcpi_total_retrans` is suitable for a monotonically
+increasing Prometheus counter:
+
+| Field | Type | Byte offset | Notes |
+|---|---|---|---|
+| `tcpi_retransmits` | `u8` | **2** | In-flight unacknowledged retransmit segments — NOT cumulative; resets to 0 when all are acked. Do NOT use for `nft_socket_retransmits_total`. |
+| `tcpi_total_retrans` | `u32` | **100** | Cumulative total retransmitted segments since socket creation — monotonically increasing. Use this for `nft_socket_retransmits_total`. |
+
+Kernel source: `include/uapi/linux/tcp.h` — `struct tcp_info`.
+`tcpi_retransmits` is at byte 2 (verified: `u8` at field offset 2).
+`tcpi_total_retrans` is at byte 100 (verified: after 8 bytes of u8 fields +
+padding, then 23 × u32 = 92 bytes, total 100).
 
 ```rust
-// tcp_info.tcpi_retransmits is at offset 12 within INET_DIAG_INFO payload
-let retransmits = u32::from_le_bytes(info_payload[12..16].try_into()?);
+// CORRECT: use tcpi_total_retrans at byte offset 100
+let total_retrans = u32::from_le_bytes(info_payload[100..104].try_into()?);
+// emit nft_socket_retransmits_total{protocol="tcp"} += total_retrans
+
+// WRONG: do NOT use tcpi_retransmits at offset 2 — it is NOT cumulative
+// let retransmits = info_payload[2] as u32;  // in-flight only, resets on ACK
 ```
 
 **Critical distinction:** `idiag_retrans` at byte 3 of `inet_diag_msg` is the
-in-flight retransmit timer count (resets on zero), not the cumulative total.
-Use only `tcpi_retransmits` (INET_DIAG_INFO offset 12) for `nft_socket_retransmits_total`.
+in-flight retransmit timer count (not a field in `tcp_info`; it resets on
+zero and is not useful for alerting). Use only `tcpi_total_retrans`
+(`INET_DIAG_INFO` byte offset 100) for `nft_socket_retransmits_total`.
+
+> **Previous doc error corrected:** earlier versions of this document cited
+> `tcpi_retransmits at offset 12`.  Offset 12 is `tcpi_ato` (a u32 timing
+> field), not a retransmit count.  `tcpi_retransmits` is the u8 at offset 2;
+> it is in-flight only.  `tcpi_total_retrans` at offset 100 is the cumulative
+> counter required for a Prometheus counter metric.
 
 ### 6.5  Six Dump Requests per Scrape
 
@@ -1209,10 +1262,13 @@ close label for UDP.
 `skmem_drop` is at array index 8, byte offset 32. Off-by-one reads `sk_backlog`
 (index 7) instead.
 
-**[G-14] tcpi_retransmits vs idiag_retrans** (sock_diag)
-Use `tcpi_retransmits` at byte offset 12 within `INET_DIAG_INFO` for the
-cumulative retransmit total. `idiag_retrans` at byte 3 of `inet_diag_msg` is
-the in-flight timer count; it resets on zero and is not useful for alerting.
+**[G-14] tcpi_total_retrans vs idiag_retrans / tcpi_retransmits** (sock_diag)
+Use `tcpi_total_retrans` at byte offset **100** within `INET_DIAG_INFO` for
+the cumulative retransmit total (`nft_socket_retransmits_total`).
+`tcpi_retransmits` (u8 at `tcp_info` offset 2) is the in-flight unacked
+retransmit count — not cumulative, resets on ACK.  `idiag_retrans` at byte 3
+of `inet_diag_msg` is also non-cumulative.  Previous doc versions cited
+"offset 12" which is `tcpi_ato` (a timing field), not a retransmit count.
 
 **[G-15] TCA_STATS2 NLA_F_NESTED on inner attrs** (TC)
 Some kernels set bit 15 on `TCA_STATS_BASIC (1)` and `TCA_STATS_QUEUE (3)`
@@ -1313,9 +1369,9 @@ All XFRM message types derive from the C enum in `include/uapi/linux/xfrm.h`.
 
 ### 12.2  Runtime Availability Probe
 
-Open `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 6)`. If this
-returns `EPROTONOSUPPORT`, `xfrm_user` is absent; set `available=false` and skip
-all subsequent I/O. Otherwise send `XFRM_MSG_GETSADINFO` (0x23) with a 4-byte body (`u32 flags =
+Open `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 6)` (no `SOCK_NONBLOCK` —
+see section 2 socket lifecycle note). If this returns `EPROTONOSUPPORT`,
+`xfrm_user` is absent; set `available=false` and skip all subsequent I/O. Otherwise send `XFRM_MSG_GETSADINFO` (0x23) with a 4-byte body (`u32 flags =
 0xFFFFFFFF`). A non-error reply confirms `xfrm_user` + `xfrm_algo` are loaded.
 
 **Critical:** `xfrm_msg_min[XFRM_MSG_GETSADINFO] = sizeof(u32) = 4`. Sending an
@@ -1456,14 +1512,19 @@ body: u32 flags = 0xFFFFFFFF  // required; empty body yields EINVAL
 ```
 [0..4]  u32 flags (echoed from request)
 [4..]   NLA sequence:
-  XFRMA_SAD_CNT   (type=2, u32): total SA count (informational, not exported)
-  XFRMA_SAD_HINFO (type=3, 8 bytes): struct xfrmu_sadhinfo
+  XFRMA_SAD_CNT   (type=1, u32): total SA count (informational, not exported)
+  XFRMA_SAD_HINFO (type=2, 8 bytes): struct xfrmu_sadhinfo
       +0  u32 sadhcnt   current hash bucket count  --> nft_xfrm_sad_hash_count
       +4  u32 sadhmcnt  max hash bucket capacity   --> nft_xfrm_sad_hash_max
 ```
 
+> **Correction:** earlier versions of this doc listed `XFRMA_SAD_CNT` as
+> type 2 and `XFRMA_SAD_HINFO` as type 3.  The correct enum values are
+> `XFRMA_SAD_UNSPEC=0`, `XFRMA_SAD_CNT=1`, `XFRMA_SAD_HINFO=2`
+> (`include/uapi/linux/xfrm.h`).
+
 **Parsing:** skip the 4-byte echoed flags prefix, then iterate NLAs with
-`parse_attrs()`, match on `XFRMA_SAD_HINFO` (type=3).
+`parse_attrs()`, match on `XFRMA_SAD_HINFO` (type=**2**).
 
 > **Previous layout was wrong:** the original doc described the reply body as a
 > raw 8-byte `xfrm_sadinfo` struct. The actual reply is NLA-encoded. Parsing
@@ -1485,13 +1546,18 @@ body: u32 flags = 0xFFFFFFFF  // required; empty body yields EINVAL
 ```
 [0..4]  u32 flags (echoed from request)
 [4..]   NLA sequence:
-  XFRMA_SPD_INFO  (type=2, 24 bytes): struct xfrmu_spdinfo (not exported)
-  XFRMA_SPD_HINFO (type=3, 8 bytes): struct xfrmu_spdhinfo
+  XFRMA_SPD_INFO  (type=1, 24 bytes): struct xfrmu_spdinfo (not exported)
+  XFRMA_SPD_HINFO (type=2, 8 bytes): struct xfrmu_spdhinfo
       +0  u32 spdhcnt   current hash bucket count  --> nft_xfrm_spd_hash_count
       +4  u32 spdhmcnt  max hash bucket capacity   --> nft_xfrm_spd_hash_max
-  XFRMA_SPD_IPV4_HTHRESH (type=4, 2 bytes): optional
-  XFRMA_SPD_IPV6_HTHRESH (type=5, 2 bytes): optional
+  XFRMA_SPD_IPV4_HTHRESH (type=3, 2 bytes): optional
+  XFRMA_SPD_IPV6_HTHRESH (type=4, 2 bytes): optional
 ```
+
+> **Correction:** earlier versions listed `XFRMA_SPD_INFO` as type 2 and
+> `XFRMA_SPD_HINFO` as type 3.  The correct enum values are
+> `XFRMA_SPD_UNSPEC=0`, `XFRMA_SPD_INFO=1`, `XFRMA_SPD_HINFO=2`
+> (`include/uapi/linux/xfrm.h`).
 
 > **ADR-0023 NATIVE-API ONLY:** `/proc/net/xfrm_stat` has been removed. MIB
 > error counters have no netlink path; procfs reads are forbidden per ADR-0023
@@ -1503,8 +1569,8 @@ body: u32 flags = 0xFFFFFFFF  // required; empty body yields EINVAL
 |---|---|---|---|
 | `nft_xfrm_sa_count{proto,mode}` | `XFRM_MSG_GETSA` (0x12) dump | frame count by `(id.proto @ 76, mode @ 214)` | mode: 0=transport, 1=tunnel |
 | `nft_xfrm_sp_count{dir,action}` | `XFRM_MSG_GETPOLICY` (0x15) dump | frame count by `(dir @ 160, action @ 161)` | |
-| `nft_xfrm_sad_hash_count` | `XFRM_MSG_GETSADINFO` (0x23) | NLA XFRMA_SAD_HINFO sadhcnt u32 | skip 4-byte flags echo |
-| `nft_xfrm_sad_hash_max` | `XFRM_MSG_GETSADINFO` (0x23) | NLA XFRMA_SAD_HINFO sadhmcnt u32 | |
+| `nft_xfrm_sad_hash_count` | `XFRM_MSG_GETSADINFO` (0x23) | NLA XFRMA_SAD_HINFO (type=2) sadhcnt u32 | skip 4-byte flags echo |
+| `nft_xfrm_sad_hash_max` | `XFRM_MSG_GETSADINFO` (0x23) | NLA XFRMA_SAD_HINFO (type=2) sadhmcnt u32 | |
 | `nft_xfrm_spd_hash_count` | `XFRM_MSG_GETSPDINFO` (0x25) | NLA XFRMA_SPD_HINFO spdhcnt u32 | |
 | `nft_xfrm_spd_hash_max` | `XFRM_MSG_GETSPDINFO` (0x25) | NLA XFRMA_SPD_HINFO spdhmcnt u32 | |
 | `nft_scrape_collector_available{collector="xfrm-ipsec"}` | startup probe | `XFRM_MSG_GETSADINFO` with 4-byte flags body | 1=available, 0=absent/EPERM |
@@ -1529,7 +1595,9 @@ but not read (ADR-0005 cardinality forbids per-SA labels).
 
 **[G-xfrm-3] SADINFO/SPDINFO reply is NLA-encoded, not a raw struct.**
 Payload starts with 4 bytes of echoed flags, then NLA chain. Match on
-`XFRMA_SAD_HINFO` (type=3) for `{sadhcnt: u32, sadhmcnt: u32}`.
+`XFRMA_SAD_HINFO` (type=**2**) for `{sadhcnt: u32, sadhmcnt: u32}`.
+(Earlier doc listed type=3 which is incorrect; `XFRMA_SAD_CNT=1`,
+`XFRMA_SAD_HINFO=2`.)
 
 **[G-xfrm-4] SA struct offsets id.proto and mode were wrong in earlier versions.**
 `id.proto` is at offset 76 (`sel(56)+id.daddr(16)+id.spi(4)`), not 40.
@@ -1803,12 +1871,12 @@ bytes as stats64 nested attrs.
 must be resolved at startup via `CTRL_CMD_GETFAMILY` and cached in a
 `OnceLock<Option<u16>>` separate from the ethtool and IPVS family caches.
 
-**Socket Model note (tokio + mio readiness):** The WireGuard adapter reuses the
-shared `AsyncFd<OwnedFd>` wrapper described in section 2. For WG_CMD_GET_DEVICE
-dumps, the tokio readiness model via `AsyncFd::readable()` is used for all
-non-blocking `recvmsg` calls. No separate mio `Poll` instance is created; the
-tokio runtime's internal epoll reactor provides the readiness notification
-channel.
+**Socket Model note (monoio + io_uring):** The WireGuard adapter reuses the
+shared `monoio::io::PollFd<OwnedFd>` wrapper described in section 2.  For
+`WG_CMD_GET_DEVICE` dumps, the monoio readiness model via
+`PollFd::readable().await` drives `IORING_OP_POLL_ADD` on the SQ; data is
+transferred with `IORING_OP_RECV` (not recvmsg).  No epoll instance is used;
+the monoio io_uring backend provides the readiness path (ADR-0023).
 
 ### 14.1  Three-Phase Sequence
 
@@ -1999,8 +2067,8 @@ Do not issue Phase 2 or Phase 3 requests.
 Follows `nlmsghdr` at byte offset 16. Same 4-byte layout as ethtool (section 8.2):
 
 ```
-u8  cmd      @ 0   (DEVLINK_CMD_GET=1, DEVLINK_CMD_PORT_GET=7,
-                     DEVLINK_CMD_HEALTH_REPORTER_GET=66)
+u8  cmd      @ 0   (DEVLINK_CMD_GET=1, DEVLINK_CMD_PORT_GET=5,
+                     DEVLINK_CMD_HEALTH_REPORTER_GET=54)
 u8  version  @ 1   (always 1 for devlink messages)
 u16 reserved @ 2   (always 0)
 ```
@@ -2032,7 +2100,7 @@ kernels before 5.18. Issue one unicast or filtered dump per device:
 
 ```
 nlmsghdr { nlmsg_type=family_id, nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP }
-genlmsghdr { cmd=66, version=1, reserved=0 }
+genlmsghdr { cmd=54, version=1, reserved=0 }   -- DEVLINK_CMD_HEALTH_REPORTER_GET=54
 nlattr { DEVLINK_ATTR_BUS_NAME="pci\0" }
 nlattr { DEVLINK_ATTR_DEV_NAME="0000:03:00.0\0" }
 ```

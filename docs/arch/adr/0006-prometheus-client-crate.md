@@ -1,12 +1,22 @@
 ---
-status: accepted
+status: superseded
 date: 2026-05-28
 deciders: [eonf]
 consulted: []
 informed: []
+superseded-by: nlx-metrics (hand-rolled OpenMetrics encoder)
 ---
 
 # Use prometheus-client 0.24 (OpenMetrics-native) and reject prometheus 0.14 (legacy text format)
+
+> **Superseded.** The `prometheus-client 0.24` dependency has been replaced by
+> `nlx-metrics`, a hand-rolled OpenMetrics encoder crate internal to this
+> workspace. `nlx-metrics` serialises `MetricSnapshot` directly to
+> `application/openmetrics-text; version=1.0.0` without the `Family<L, M>`
+> registry overhead or any third-party registry allocation. The API contract
+> (`MetricRegistryPort`) and metric naming conventions remain unchanged. All
+> statements about wire format and label semantics below remain historically
+> accurate.
 
 ## Context and Problem Statement
 

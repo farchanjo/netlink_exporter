@@ -75,7 +75,8 @@ falling back to a blocking `libc::setsockopt` only when the op returns
 **Capability ordering.** The `events` group is declared
 `GENL_MCAST_CAP_SYS_ADMIN` (`net/core/drop_monitor.c:187`), so the join needs
 `CAP_SYS_ADMIN` (and CONFIG/START need `CAP_NET_ADMIN`). The privileged setup
-therefore runs **before** the process drops capabilities (ADR-0009); the
+therefore runs **before** the process drops capabilities (ADR-0009 — see also
+the CAP_SYS_ADMIN note added to ADR-0009 for the drop_monitor case); the
 recv-only thread spawned afterwards needs no capabilities. The listener is
 started only when the NET_DM family was available at probe time.
 
@@ -95,8 +96,10 @@ nft_drop_packets_total{origin="hw",reason="total"}
 ```
 
 The netlink RECV uses io_uring (ADR-0024). The listener thread uses only
-`AtomicU64` — no `Mutex`/`RwLock` (ADR-0023). It is spawned after the capability
-drop so it inherits exactly `CAP_NET_ADMIN` (required by `CONFIG`/`START`), and
+`AtomicU64` — no `Mutex`/`RwLock` (ADR-0023). It is spawned **before** the
+capability drop (the `events` multicast group is declared
+`GENL_MCAST_CAP_SYS_ADMIN` in `net/core/drop_monitor.c:187`, so joining it
+requires `CAP_SYS_ADMIN`; see ADR-0009 for the overall capability model), and
 only when the NET_DM family was available at probe time.
 
 **SUMMARY not PACKET mode, and no per-reason labels.** SUMMARY-mode alerts carry

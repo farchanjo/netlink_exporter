@@ -98,13 +98,14 @@ The `NetlinkSocket` transport in `nlx-netlink` replaces the `AsyncFd` epoll
 readiness pattern with `monoio::io::PollFd` (from the `poll-io` feature). The
 `PollFd` readiness path drives `AF_NETLINK` fd wakeup via `IORING_OP_POLL_ADD`
 on the io_uring SQ, replacing epoll `EPOLLIN`. The send/receive data path uses
-`IORING_OP_SENDMSG` and `IORING_OP_RECVMSG` with registered buffers
-(`IORING_REGISTER_BUFFERS`) pinned for the ring's lifetime.
+plain **`IORING_OP_SEND`** and **`IORING_OP_RECV`** — not `IORING_OP_SENDMSG`
+/ `IORING_OP_RECVMSG`, and **no registered buffers** (`IORING_REGISTER_BUFFERS`
+is not used). Each io_uring ring is created with a **depth of 32 SQEs** per
+`spawn_blocking` call.
 
-The blocking-thread bridge model described in the io_uring netlink transport
-analysis applies: each `NetlinkSocket::dump` call executes the SQ/CQ loop from
-inside a dedicated blocking thread (`monoio::spawn_blocking` equivalent) to
-avoid blocking the monoio executor. The `NetlinkSocket` public API is unchanged:
+The blocking-thread bridge model applies: each `NetlinkSocket::dump` call
+executes the SQ/CQ loop from inside `monoio::spawn_blocking` to avoid blocking
+the monoio executor. The `NetlinkSocket` public API is unchanged:
 
 ```
 pub fn open(nl_family: i32) -> Result<Self>
@@ -113,12 +114,9 @@ pub async fn request_single(...) -> Result<Option<Vec<u8>>>
 pub async fn resolve_genl_family(&mut self, name: &str) -> Result<Option<u16>>
 ```
 
-Minimum kernel version for the io_uring path: **5.7** (required for
-`IOSQE_BUFFER_SELECT`). On kernel < 5.7, `NetlinkSocket::open` detects the
-version via `rustix::system::uname()` and falls back to the `PollFd` readiness
-path without registered buffers (pure `IORING_OP_POLL_ADD` + standard
-`sendmsg`/`recvmsg` syscalls). On kernel < 5.1 the monoio `legacy` feature
-activates the epoll path transparently.
+Minimum kernel version for the io_uring path: **5.1** (required for
+`io_uring_setup`). On kernel < 5.1 the monoio `legacy` feature activates the
+epoll path transparently.
 
 ### HTTP adapter replacement
 
@@ -134,27 +132,29 @@ path-dispatch match inside a `service-async` handler. No axum `Router`,
 `ScrapeTriggerPort`, `HealthPort`, `ReadinessPort`, and `MetricRegistryPort`
 trait signatures are unchanged.
 
-### Thread-per-core composition root
+### Composition root — single monoio thread
 
-The binary replaces `#[tokio::main]` with a `std::thread::spawn` × N pattern
-where each thread runs a monoio runtime instance:
+The binary replaces `#[tokio::main]` with a **single monoio runtime** on the
+main thread. There is no `std::thread::spawn × N` multi-thread pattern:
 
 ```
-Thread 0 (main)  — monoio::RuntimeBuilder HTTP accept + metrics encode
-Thread 1         — monoio::RuntimeBuilder nlx-netlink dump (NETLINK_ROUTE)
-Thread 2         — monoio::RuntimeBuilder nlx-netlink dump (NETLINK_NETFILTER)
-Thread 3         — monoio::RuntimeBuilder nlx-netlink dump (NETLINK_GENERIC et al.)
+Thread 0 (main)  — monoio::RuntimeBuilder  HTTP accept (monoio-http 0.3)
+                                           + per-scrape dump fan-out via
+                                             monoio::spawn_blocking per collector
 ```
 
-Shared state between threads is **lock-free** (RCU). Each subsystem thread owns
-one `arc_swap::ArcSwap<MetricSnapshot>`: a scrape pass builds a fresh immutable
-`MetricSnapshot` and publishes it with an atomic `store()`; the HTTP thread reads
-every subsystem's snapshot with a wait-free `load()`. No `Mutex`, `RwLock`, or
-`tokio::sync` primitive is used anywhere — a reader (`/metrics`) never blocks a
-writer (scrape) and vice versa. Per-collector self-telemetry counters
-(`nft_scrape_collector_error_total`, `success`) use `AtomicU64` with `Relaxed`
-ordering. `monoio::task::JoinHandle` replaces `tokio::task::JoinSet` for
-intra-thread task fan-out.
+Each scrape triggers one `monoio::spawn_blocking` task per enabled collector;
+the blocking tasks run the io_uring `IORING_OP_SEND`/`IORING_OP_RECV` loop
+and return a `MetricSnapshot` to the monoio thread via a channel.
+
+Shared state between the HTTP handler and scrape tasks is **lock-free** (RCU).
+`arc_swap::ArcSwap<MetricSnapshot>` is updated by an atomic `store()` after
+each successful scrape pass; the HTTP handler reads with a wait-free `load()`.
+No `Mutex`, `RwLock`, or `tokio::sync` primitive is used anywhere — a reader
+(`/metrics`) never blocks a writer (scrape) and vice versa. Per-collector
+self-telemetry counters (`nft_scrape_collector_error_total`, `success`) use
+`AtomicU64` with `Relaxed` ordering. `monoio::task::JoinHandle` replaces
+`tokio::task::JoinSet` for intra-scrape task collection.
 
 ### Seccomp and sysctl operational requirements
 
@@ -166,21 +166,22 @@ will receive `EPERM` on `io_uring_setup` at startup and crash immediately.
 
 **Required actions for container deployments:**
 
-1. **Seccomp profile:** Deploy a Localhost custom profile to
-   `/var/lib/kubelet/seccomp/nft-exporter-io-uring.json` on every node before
-   the DaemonSet is applied. The profile must add `SCMP_ACT_ALLOW` for
-   `io_uring_setup`, `io_uring_enter`, and `io_uring_register` while retaining
-   `SCMP_ACT_ERRNO` for `execve`, `execveat`, `ptrace`, `bpf`, `perf_event_open`,
-   and `clone(CLONE_NEWUSER)`. The DaemonSet `securityContext.seccompProfile`
-   must change from `type: RuntimeDefault` to
-   `type: Localhost, localhostProfile: nft-exporter-io-uring.json`.
+1. **Seccomp profile:** Deploy the Localhost custom profile
+   `deploy/seccomp/nft-exporter.json` to
+   `/var/lib/kubelet/seccomp/nft-exporter.json` on every node before the
+   DaemonSet is applied. The profile adds `SCMP_ACT_ALLOW` for
+   `io_uring_setup` (425), `io_uring_enter` (426), and `io_uring_register`
+   (427) on top of a RuntimeDefault baseline, while retaining `SCMP_ACT_ERRNO`
+   for `execve`, `execveat`, `ptrace`, `bpf`, `perf_event_open`, and
+   `clone(CLONE_NEWUSER)`. The DaemonSet `securityContext.seccompProfile` is
+   set to `type: Localhost, localhostProfile: nft-exporter.json`.
 
 2. **sysctl:** `kernel.io_uring_disabled` must be `0` on all target nodes.
-   Value `1` blocks unprivileged processes (the exporter drops `CAP_NET_ADMIN`
-   after socket init and has no `CAP_SYS_ADMIN`). Value `2` blocks all
-   callers. CIS Level 2 hardening profiles for RHEL 9 and Ubuntu 24.04 may set
-   this to `1` by default. Verify with `sysctl kernel.io_uring_disabled` before
-   deploying.
+   Value `1` blocks unprivileged processes (the exporter drops all capabilities
+   after socket init, including `CAP_NET_ADMIN`, so post-drop it runs fully
+   unprivileged). Value `2` blocks all callers. CIS Level 2 hardening profiles
+   for RHEL 9 and Ubuntu 24.04 may set this to `1` by default. Verify with
+   `sysctl kernel.io_uring_disabled` before deploying.
 
 3. **Kernel floor:** Minimum kernel `5.15 LTS` for DaemonSet deployments.
    The `deploy/k8s/daemonset.yaml` nodeAffinity must gate on kernel >= 5.15 and
@@ -243,15 +244,15 @@ moves from `tokio::task::JoinSet` to `monoio::task::JoinHandle` collection.
 
 **Positive:**
 
-- `AF_NETLINK` send/receive uses `IORING_OP_SENDMSG`/`IORING_OP_RECVMSG` with
-  registered buffers, eliminating per-dump buffer allocation and epoll wakeup
-  overhead.
+- `AF_NETLINK` send/receive uses `IORING_OP_SEND`/`IORING_OP_RECV` via
+  io_uring, eliminating the `epoll_wait` + blocking `recvmsg` two-syscall
+  pattern while remaining simpler than the registered-buffer variant.
 - Full tokio removal eliminates the work-stealing scheduler overhead for a
-  workload that is serial-per-subsystem.
+  workload that is serial-per-subsystem within each scrape epoch.
 - The `legacy` feature provides a transparent epoll fallback for environments
   where `io_uring_setup` is blocked without any code change.
-- Thread-per-core model simplifies reasoning about task locality and buffer
-  ownership.
+- Single monoio thread simplifies reasoning about task locality and ownership;
+  no cross-thread `Mutex`/`RwLock` contention possible.
 
 **Negative:**
 

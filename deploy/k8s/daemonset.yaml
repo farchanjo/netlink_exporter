@@ -1,6 +1,6 @@
 # deploy/k8s/daemonset.yaml
 #
-# DaemonSet for nft_exporter on Kubernetes (ADR-0008, ADR-0009).
+# DaemonSet for nft_exporter on Kubernetes (ADR-0008, ADR-0009, ADR-0023).
 #
 # Security model (ADR-0009):
 #   capabilities.drop: [ALL]         — drop the full Linux capability set first
@@ -8,7 +8,22 @@
 #   allowPrivilegeEscalation: false  — no setuid/setgid escalation
 #   runAsNonRoot: true               — uid 65532 (distroless nonroot)
 #   readOnlyRootFilesystem: true     — immutable container root
-#   seccompProfile.type: RuntimeDefault — default container runtime seccomp
+#   seccompProfile.type: Localhost   — custom profile at deploy/seccomp/nft-exporter.json
+#
+# drop_monitor CAP_SYS_ADMIN note (ADR-0026):
+#   When the drop-monitor collector is enabled, CAP_SYS_ADMIN is transiently
+#   required during startup to join the NET_DM_GRP_ALERT multicast group
+#   (GENL_MCAST_CAP_SYS_ADMIN, net/core/drop_monitor.c:187).  The group join
+#   runs before the capability drop; the background recv thread needs none.
+#   If drop-monitor is used in production, add SYS_ADMIN to capabilities.add
+#   only for that deployment variant and document the exception per ADR-0009.
+#
+# io_uring seccomp requirement (ADR-0023):
+#   The RuntimeDefault seccomp profile denies io_uring_setup (425),
+#   io_uring_enter (426), and io_uring_register (427) by default.  The
+#   Localhost profile at deploy/seccomp/nft-exporter.json must be placed at
+#   /var/lib/kubelet/seccomp/nft-exporter.json on every node before applying
+#   this DaemonSet.  Missing the profile causes EPERM at startup (CrashLoopBackOff).
 #
 # hostNetwork: true is required so netlink sockets bind to the node's network
 # namespace rather than the pod network namespace.  The exporter cannot observe
@@ -63,10 +78,13 @@ spec:
         runAsGroup: 65532     # distroless nonroot gid
         fsGroup: 65532
         seccompProfile:
-          # Use the custom profile (deploy/seccomp/nft-exporter.json) when
-          # placed at /var/lib/kubelet/seccomp/nft-exporter.json on each node.
-          # Fall back to RuntimeDefault if the file is absent.
-          type: RuntimeDefault
+          # Custom Localhost profile adds SCMP_ACT_ALLOW for io_uring_setup
+          # (425), io_uring_enter (426), and io_uring_register (427) which are
+          # denied by RuntimeDefault.  Deploy the profile from
+          # deploy/seccomp/nft-exporter.json to
+          # /var/lib/kubelet/seccomp/nft-exporter.json on every node first.
+          type: Localhost
+          localhostProfile: nft-exporter.json
 
       containers:
         - name: nft-exporter
