@@ -4,13 +4,13 @@
 //! Messages used (ADR-0021, netlink-protocol.md §17):
 //!  - `RTM_GETSTATS` (94) → per-interface xstats (bridge mcast, hw offload).
 //!  - `RTM_GETNEIGH` (30) with `AF_BRIDGE (7)` → bridge FDB entry counts.
-//!  - `RTM_GETRULE` (34) with AF_INET/INET6/MPLS → FIB policy-rule counts.
+//!  - `RTM_GETRULE` (34) with `AF_INET/INET6/MPLS` → FIB policy-rule counts.
 //!  - `RTM_GETNEXTHOP` (106) → nexthop object total count (kernel >= 5.3).
 //!
 //! ## Runtime gate
 //!
 //! `probe_available()` performs an `RTM_GETRULE` dump with `AF_UNSPEC` (always
-//! supported on any Linux kernel that has rtnetlink).  The previous RTM_GETSTATS
+//! supported on any Linux kernel that has rtnetlink).  The previous `RTM_GETSTATS`
 //! probe could return `ENODEV` (errno 19) when ifindex=1 lacks offload stats,
 //! causing a false-negative `available=0` even on fully capable kernels.
 //! On kernels < 5.3, `RTM_GETNEXTHOP` returns `EINVAL`; the nexthop metric
@@ -64,17 +64,15 @@ const IFLA_STATS_LINK_XSTATS: u32 = 2; // IFLA_STATS_LINK_XSTATS (enum=2), filte
 const IFLA_STATS_LINK_OFFLOAD_XSTATS: u32 = 8; // IFLA_STATS_LINK_OFFLOAD_XSTATS (enum=4), filter bit = 1<<3
 
 // Attributes in RTM_NEWSTATS replies (IFLA_STATS_* enum, effective types).
-const IFLA_STATS_A_LINK_64: u16 = 1; // rtnl_link_stats64 blob
+// IFLA_STATS_A_LINK_64 (1) — rtnl_link_stats64 blob; collected by RtCollector, not duplicated here.
 const IFLA_STATS_A_LINK_XSTATS: u16 = 2; // nested bridge/bond xstats
 const IFLA_STATS_A_OFFLOAD_XSTATS: u16 = 4; // nested hw offload stats
 
 // BRIDGE_XSTATS types inside IFLA_STATS_LINK_XSTATS.
-const BRIDGE_XSTATS_VLAN: u16 = 1; // skip
 const BRIDGE_XSTATS_MCAST: u16 = 2; // br_mcast_stats
 
 // ifla_offload_xstats_type inside IFLA_STATS_LINK_OFFLOAD_XSTATS.
 const IFLA_OFFLOAD_XSTATS_CPU_HIT: u16 = 1; // rtnl_hw_stats64
-const IFLA_OFFLOAD_XSTATS_HW_S_INFO: u16 = 2; // skip
 const IFLA_OFFLOAD_XSTATS_L3_STATS: u16 = 3; // rtnl_hw_stats64
 
 // rtnl_hw_stats64 byte offsets (64 bytes, all u64 LE).
@@ -120,10 +118,14 @@ impl NetlinkRtExtendedPort for RtExtendedCollector {
 }
 
 impl Collector for RtExtendedCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "rtnetlink_extended"
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+    )]
     fn collect(&self) -> BoxFuture<'_, Result<Vec<MetricSample>, CollectError>> {
         Box::pin(async move {
             let mut sock =
@@ -202,11 +204,8 @@ impl Collector for RtExtendedCollector {
             };
             let body = [0u8; 12]; // fib_rule_hdr, all-zero = AF_UNSPEC dump
             match sock.dump(RTM_GETRULE, 0, &body).await {
-                Ok(_) => true,
-                Err(crate::transport::NetlinkError::DumpIntr) => {
-                    // Kernel says data changed — rtnetlink IS available.
-                    true
-                }
+                // Ok, or kernel says data changed (NLM_F_DUMP_INTR) — rtnetlink IS available.
+                Ok(_) | Err(crate::transport::NetlinkError::DumpIntr) => true,
                 Err(_) => false,
             }
         })
@@ -258,10 +257,8 @@ async fn collect_link_xstats(sock: &mut NetlinkSocket) -> Result<Vec<MetricSampl
                 IFLA_STATS_A_OFFLOAD_XSTATS => {
                     parse_offload_xstats(attr.payload, &if_label, &mut out);
                 }
-                IFLA_STATS_A_LINK_64 => {
-                    // Full rtnl_link_stats64 already collected by RtCollector.
-                    // Not duplicated here.
-                }
+                // IFLA_STATS_A_LINK_64: full rtnl_link_stats64 already collected
+                // by RtCollector — not duplicated here.
                 _ => {}
             }
         }
@@ -270,6 +267,10 @@ async fn collect_link_xstats(sock: &mut NetlinkSocket) -> Result<Vec<MetricSampl
 }
 
 /// Dump `RTM_GETNEIGH` with `AF_BRIDGE` and count FDB entries per interface.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+)]
 async fn collect_bridge_fdb(sock: &mut NetlinkSocket) -> Result<Vec<MetricSample>, String> {
     // ndmsg (12 bytes): family=AF_BRIDGE, rest zero.
     let mut body = [0u8; 12];
@@ -319,7 +320,11 @@ async fn collect_bridge_fdb(sock: &mut NetlinkSocket) -> Result<Vec<MetricSample
     Ok(out)
 }
 
-/// Dump `RTM_GETRULE` for AF_INET, AF_INET6, AF_MPLS and count rules per family.
+/// Dump `RTM_GETRULE` for `AF_INET`, `AF_INET6`, `AF_MPLS` and count rules per family.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+)]
 async fn collect_fib_rules(sock: &mut NetlinkSocket) -> Result<Vec<MetricSample>, String> {
     let families: &[(&str, u8)] = &[("inet", AF_INET), ("inet6", AF_INET6), ("mpls", AF_MPLS)];
     let mut out = Vec::new();
@@ -383,8 +388,8 @@ async fn collect_nexthop_count(sock: &mut NetlinkSocket) -> Result<u64, String> 
 
 /// Build `if_stats_msg` (12 bytes, §17.1).
 ///
-/// Layout (verified against `struct if_stats_msg` in linux/if_link.h):
-///   family(u8) + pad1(u8) + pad2(u16) + ifindex(u32) + filter_mask(u32) = 12 bytes.
+/// Layout (verified against `struct if_stats_msg` in `linux/if_link.h)`:
+///   family(u8) + pad1(u8) + pad2(u16) + ifindex(u32) + `filter_mask(u32)` = 12 bytes.
 fn build_if_stats_msg(ifindex: u32, filter_mask: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(12);
     body.push(AF_UNSPEC); // family
@@ -400,6 +405,10 @@ fn build_if_stats_msg(ifindex: u32, filter_mask: u32) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Parse `IFLA_STATS_LINK_XSTATS` payload (bridge mcast stats, §17.2).
+#[allow(
+    clippy::single_match,
+    reason = "only one xstat type is handled today; kept as match for future stat types"
+)]
 fn parse_bridge_xstats(payload: &[u8], if_label: &str, out: &mut Vec<MetricSample>) {
     for attr in nested_attrs(payload) {
         match attr.ty {
@@ -425,9 +434,7 @@ fn parse_bridge_xstats(payload: &[u8], if_label: &str, out: &mut Vec<MetricSampl
                     tx,
                 ));
             }
-            BRIDGE_XSTATS_VLAN => {
-                // br_vlan_stats — not exported.
-            }
+            // BRIDGE_XSTATS_VLAN (br_vlan_stats) — not exported; falls through to _.
             _ => {}
         }
     }
@@ -467,10 +474,32 @@ fn parse_offload_xstats(payload: &[u8], if_label: &str, out: &mut Vec<MetricSamp
                     tx,
                 ));
             }
-            IFLA_OFFLOAD_XSTATS_HW_S_INFO => {
-                // Availability info — skip.
-            }
+            // IFLA_OFFLOAD_XSTATS_HW_S_INFO (availability info) — not exported; falls through to _.
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "test assertions on fixed byte layouts")]
+
+    use super::*;
+
+    /// Verify that `build_if_stats_msg` produces a 12-byte body with the
+    /// expected layout (`family=AF_UNSPEC` at byte 0, `filter_mask` at bytes 8-11).
+    #[test]
+    fn build_if_stats_msg_layout() {
+        let buf = build_if_stats_msg(42, 0b1010);
+        assert_eq!(buf.len(), 12);
+        assert_eq!(buf[0], AF_UNSPEC);
+        let ifindex = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+        assert_eq!(ifindex, 42);
+        let mask = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        assert_eq!(mask, 0b1010);
     }
 }

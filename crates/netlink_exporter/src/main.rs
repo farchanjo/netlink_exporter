@@ -1,4 +1,4 @@
-//! # netlink_exporter — Composition Root
+//! # `netlink_exporter` — Composition Root
 //!
 //! **Hexagonal role: COMPOSITION ROOT (binary entry point / Facade).**
 //!
@@ -169,7 +169,12 @@ async fn run(config: ExporterConfig) -> Result<()> {
     let _ = shutdown_flag; // suppress unused warning; flag used for future extension
 
     if let Err(e) = http_adapter
-        .serve(scrape_port, health_port, readiness_port, Arc::clone(&metrics_adapter))
+        .serve(
+            scrape_port,
+            health_port,
+            readiness_port,
+            Arc::clone(&metrics_adapter),
+        )
         .await
     {
         error!(error = %e, "HTTP adapter exited with error");
@@ -206,7 +211,10 @@ fn drop_caps_to_net_admin() -> Result<()> {
             .context("caps::set(Inheritable) failed")?;
         caps::set(None, CapSet::Permitted, &target).context("caps::set(Permitted) failed")?;
 
-        info!(caps = "CAP_NET_ADMIN", "Linux capabilities dropped successfully");
+        info!(
+            caps = "CAP_NET_ADMIN",
+            "Linux capabilities dropped successfully"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]

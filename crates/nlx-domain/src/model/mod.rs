@@ -1,4 +1,4 @@
-//! ReadModel value objects for each netlink subsystem.
+//! `ReadModel` value objects for each netlink subsystem.
 
 pub mod address;
 pub mod conntrack;

@@ -1,4 +1,4 @@
-//! WireGuard genetlink collector.
+//! `WireGuard` genetlink collector.
 //!
 //! Netlink family: `NETLINK_GENERIC` (16), family name `"wireguard"`.
 //! Messages used: `WG_CMD_GET_DEVICE` (cmd=0).
@@ -63,7 +63,7 @@ const WGPEER_A_RX_BYTES: u16 = 7;
 const WGPEER_A_TX_BYTES: u16 = 8;
 // WGPEER_A_ALLOWEDIPS = 9 — DISCARDED (per-peer routing prefixes, ADR-0005).
 
-/// Adapter implementing [`NetlinkWireguardPort`] and [`Collector`] for WireGuard.
+/// Adapter implementing [`NetlinkWireguardPort`] and [`Collector`] for `WireGuard`.
 pub struct WireguardCollector;
 
 impl NetlinkWireguardPort for WireguardCollector {
@@ -98,10 +98,14 @@ impl NetlinkWireguardPort for WireguardCollector {
 }
 
 impl Collector for WireguardCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "wireguard"
     }
 
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "unix seconds fit i64 for centuries"
+    )]
     fn collect(&self) -> BoxFuture<'_, Result<Vec<MetricSample>, CollectError>> {
         Box::pin(async move {
             let mut sock = NetlinkSocket::open(NETLINK_GENERIC)
@@ -180,7 +184,7 @@ async fn wg_dump(
 // Parsers
 // ---------------------------------------------------------------------------
 
-/// Parse one WireGuard device frame (attrs after genlmsghdr).
+/// Parse one `WireGuard` device frame (attrs after genlmsghdr).
 fn parse_device(attrs_buf: &[u8]) -> Option<WireguardDevice> {
     let mut if_name = String::new();
     let mut listen_port: u16 = 0;
@@ -230,7 +234,11 @@ fn parse_device(attrs_buf: &[u8]) -> Option<WireguardDevice> {
     })
 }
 
-/// Parse one WireGuard peer (inner WGPEER_A_* attrs).
+/// Parse one `WireGuard` peer (inner `WGPEER_A`_* attrs).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "handshake tv_sec stored as f64 for age math; precision adequate for seconds"
+)]
 fn parse_peer(attrs_buf: &[u8]) -> Option<WireguardPeer> {
     let mut peer_id = String::new();
     let mut rx_bytes: u64 = 0;
@@ -317,6 +325,11 @@ fn pubkey_hash(key: &[u8]) -> String {
 // Metric emission
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "handshake age math; f64/i64 seconds within representable range"
+)]
 fn push_device_metrics(out: &mut Vec<MetricSample>, dev: &WireguardDevice, now_secs: i64) {
     // Device info gauge.
     let mut dev_labels = BTreeMap::new();

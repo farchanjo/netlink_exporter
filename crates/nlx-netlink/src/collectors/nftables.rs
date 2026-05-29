@@ -76,7 +76,7 @@ use nlx_ports::{
 };
 
 use crate::{
-    transport::{MAX_DUMP_RESTARTS, NLMSG_HDRLEN, NetlinkError, NetlinkSocket},
+    transport::{MAX_DUMP_RESTARTS, NetlinkError, NetlinkSocket},
     wire::{nested_attrs, parse_attrs, read_u32, read_u64_be},
 };
 
@@ -87,11 +87,10 @@ use crate::{
 /// `NETLINK_NETFILTER` protocol number.
 const NETLINK_NETFILTER: i32 = 12;
 
-/// nfgenmsg: 4 bytes (nfgen_family u8 + version u8 + res_id __be16).
+/// nfgenmsg: 4 bytes (`nfgen_family` u8 + version u8 + `res_id` __be16).
 const NFGENMSG_LEN: usize = 4;
 
-/// Offset of the first nlattr after nlmsghdr (16) + nfgenmsg (4).
-const ATTRS_OFFSET: usize = NLMSG_HDRLEN + NFGENMSG_LEN;
+// ATTRS_OFFSET (NLMSG_HDRLEN + NFGENMSG_LEN = 20) removed: unused in this module.
 
 // NFNL_SUBSYS_NFTABLES = 10; nlmsg_type = (10 << 8) | msg_type
 //
@@ -203,7 +202,7 @@ fn cstr_to_string(payload: &[u8]) -> String {
 // Dump helpers with DumpIntr restart
 // ---------------------------------------------------------------------------
 
-/// Issue a NETLINK_NETFILTER dump with `NLM_F_DUMP` and retry on
+/// Issue a `NETLINK_NETFILTER` dump with `NLM_F_DUMP` and retry on
 /// `NLM_F_DUMP_INTR` (capped at `MAX_DUMP_RESTARTS`).
 ///
 /// # Errors
@@ -264,6 +263,10 @@ fn parse_table_frame(frame: &[u8]) -> Option<NftTable> {
 // ---------------------------------------------------------------------------
 
 /// Parse one `NFT_MSG_GETCHAIN` reply frame into an `NftChain`.
+#[allow(
+    clippy::assigning_clones,
+    reason = "clarity: assigning &'static str via to_owned is idiomatic here"
+)]
 fn parse_chain_frame(frame: &[u8]) -> Option<NftChain> {
     if frame.len() < NFGENMSG_LEN {
         return None;
@@ -391,6 +394,10 @@ fn parse_obj_frame(frame: &[u8]) -> Option<NftCounter> {
 // collect() metric builder
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+)]
 fn build_metrics(
     tables: &[NftTable],
     chains: &[NftChain],
@@ -519,7 +526,7 @@ impl NetlinkNftablesPort for NftablesCollector {
 }
 
 impl Collector for NftablesCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "nftables"
     }
 
@@ -551,7 +558,7 @@ impl Collector for NftablesCollector {
                 .await
                 .map_err(map_nl_err)?;
 
-            #[expect(
+            #[allow(
                 clippy::cast_possible_truncation,
                 reason = "rule count fits u64 on any realistic system"
             )]
@@ -609,10 +616,19 @@ fn map_nl_err(e: NetlinkError) -> CollectError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "test assertions; panics are acceptable in test code"
+)]
 mod tests {
     use super::*;
     use crate::wire::{NLA_HDRLEN, align4};
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "nlattr length fits u16 by construction in test fixtures"
+    )]
     fn make_nla(ty: u16, payload: &[u8]) -> Vec<u8> {
         let nla_len = NLA_HDRLEN + payload.len();
         let padded = align4(nla_len);

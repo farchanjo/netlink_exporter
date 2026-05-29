@@ -1,8 +1,8 @@
-//! WireGuard genetlink read model.
+//! `WireGuard` genetlink read model.
 
 use serde::{Deserialize, Serialize};
 
-/// WireGuard device and its peers (`WG_CMD_GET_DEVICE`).
+/// `WireGuard` device and its peers (`WG_CMD_GET_DEVICE`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WireguardDevice {
     /// Interface name.
@@ -15,7 +15,7 @@ pub struct WireguardDevice {
     pub peers: Vec<WireguardPeer>,
 }
 
-/// One WireGuard peer.
+/// One `WireGuard` peer.
 ///
 /// The public key is hashed to an 8-byte hex string for the `peer` label
 /// (ADR-0018 anti-cardinality rule).  The raw key is not stored.

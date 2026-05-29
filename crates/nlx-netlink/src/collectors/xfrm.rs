@@ -1,4 +1,4 @@
-//! XFRM IPsec collector.
+//! XFRM `IPsec` collector.
 //!
 //! Netlink family: `NETLINK_XFRM` (6).
 //! Messages used:
@@ -23,8 +23,8 @@
 //! **SADINFO/SPDINFO response format:**
 //! The reply message body is: `u32 flags` (echoed) + zero or more NLAs.
 //! - SADINFO NLAs: `XFRMA_SAD_CNT` (type 2, u32) and `XFRMA_SAD_HINFO`
-//!   (type 3, struct xfrmu_sadhinfo = {sadhcnt: u32, sadhmcnt: u32}).
-//! - SPDINFO NLAs: `XFRMA_SPD_INFO` (type 2, struct xfrmu_spdinfo, ignored),
+//!   (type 3, struct `xfrmu_sadhinfo` = {sadhcnt: u32, sadhmcnt: u32}).
+//! - SPDINFO NLAs: `XFRMA_SPD_INFO` (type 2, struct `xfrmu_spdinfo`, ignored),
 //!   `XFRMA_SPD_HINFO` (type 3, {spdhcnt: u32, spdhmcnt: u32}).
 //!
 //! **SA/Policy dump frame layout:**
@@ -33,13 +33,15 @@
 //!   - `id.proto` at byte offset 76 (sel=56 + id.daddr=16 + id.spi=4)
 //!   - `mode` at byte offset 214 (sel=56 + id=24 + saddr=16 + lft=64 +
 //!     curlft=32 + stats=12 + seq=4 + reqid=4 + family=2)
+//!
 //! `XFRM_MSG_GETPOLICY` dump responses contain `XFRM_MSG_NEWPOLICY` frames
 //! with `struct xfrm_userpolicy_info` (164 bytes):
+//!
 //!   - `dir` at byte offset 160 (sel=56 + lft=64 + curlft=32 + priority=4 + index=4)
 //!   - `action` at byte offset 161
 //!
 //! **ADR-0023 NATIVE-API ONLY:** `/proc/net/xfrm_stat` has been **removed**.
-//! The MIB error counters it exposes (XfrmInError, XfrmOutError, …) have no
+//! The MIB error counters it exposes (`XfrmInError`, `XfrmOutError`, …) have no
 //! netlink path — they are only available via procfs.  Per ADR-0023 §6
 //! ("NATIVE API ONLY"), procfs reads are forbidden in exporter code.
 //! The `nft_xfrm_stat_total` metric family is dropped from this collector.
@@ -128,7 +130,7 @@ const XFRM_SA_INFO_MIN: usize = 220;
 /// Byte offset of `id.proto` within `xfrm_usersa_info`.
 ///
 /// Layout: `sel(56) + id.daddr(16) + id.spi(4) = 76`.
-/// The IPsec protocol (50=ESP, 51=AH, 108=COMP) lives at `xfrm_usersa_info.id.proto`.
+/// The `IPsec` protocol (50=ESP, 51=AH, 108=COMP) lives at `xfrm_usersa_info.id.proto`.
 const SA_PROTO_OFFSET: usize = 76;
 
 /// Byte offset of `mode` within `xfrm_usersa_info`.
@@ -212,7 +214,7 @@ fn action_label(action: u8) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Adapter implementing [`NetlinkXfrmPort`] and [`Collector`] for XFRM
-/// IPsec Security Associations and Policies.
+/// `IPsec` Security Associations and Policies.
 pub struct XfrmCollector;
 
 impl NetlinkXfrmPort for XfrmCollector {
@@ -242,7 +244,7 @@ impl NetlinkXfrmPort for XfrmCollector {
 }
 
 impl Collector for XfrmCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "xfrm-ipsec"
     }
 
@@ -304,6 +306,14 @@ async fn probe_xfrm_available() -> bool {
 // Core collection logic
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "cohesive parser/builder; splitting would obscure the wire layout"
+)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+)]
 async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
     let mut sock =
         NetlinkSocket::open(NETLINK_XFRM).map_err(|e| CollectError::Io(e.to_string()))?;
@@ -388,28 +398,25 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
     // Request body: u32 flags (required by xfrm_msg_min).
     // Reply body: [u32 flags (echoed)][NLA: XFRMA_SAD_CNT u32][NLA: XFRMA_SAD_HINFO {sadhcnt,sadhmcnt}]
     let flags_body = XFRM_INFO_FLAGS.to_ne_bytes();
-    match sock.request_single(XFRM_MSG_GETSADINFO, 0, &flags_body).await {
+    match sock
+        .request_single(XFRM_MSG_GETSADINFO, 0, &flags_body)
+        .await
+    {
         Ok(Some(payload)) => {
             // Skip the 4-byte echoed flags prefix; NLAs start at byte 4.
             if let Some(nla_buf) = payload.get(4..) {
-                let (mut sadhcnt, mut sadhmcnt) = (0u32, 0u32);
+                let (mut sadhcnt, mut sad_hash_max) = (0u32, 0u32);
                 for attr in parse_attrs(nla_buf) {
                     // XFRMA_SAD_CNT (2): u32 total SA count — informational,
                     // not exposed as a metric (we count from the dump directly).
-                    if attr.ty == XFRMA_SAD_HINFO
-                        && attr.payload.len() >= XFRM_HASHINFO_MIN
-                    {
+                    if attr.ty == XFRMA_SAD_HINFO && attr.payload.len() >= XFRM_HASHINFO_MIN {
                         // struct xfrmu_sadhinfo: sadhcnt(u32) + sadhmcnt(u32)
-                        if let (Some(hcnt_bytes), Some(hmcnt_bytes)) = (
-                            attr.payload.get(0..4),
-                            attr.payload.get(4..8),
-                        ) {
-                            sadhcnt = u32::from_ne_bytes(
-                                hcnt_bytes.try_into().unwrap_or([0u8; 4]),
-                            );
-                            sadhmcnt = u32::from_ne_bytes(
-                                hmcnt_bytes.try_into().unwrap_or([0u8; 4]),
-                            );
+                        if let (Some(hcnt_bytes), Some(hmcnt_bytes)) =
+                            (attr.payload.get(0..4), attr.payload.get(4..8))
+                        {
+                            sadhcnt = u32::from_ne_bytes(hcnt_bytes.try_into().unwrap_or([0u8; 4]));
+                            sad_hash_max =
+                                u32::from_ne_bytes(hmcnt_bytes.try_into().unwrap_or([0u8; 4]));
                         }
                     }
                 }
@@ -423,7 +430,7 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
                     "nft_xfrm_sad_hash_max",
                     "SAD hash bucket capacity",
                     BTreeMap::new(),
-                    f64::from(sadhmcnt),
+                    f64::from(sad_hash_max),
                 ));
             }
         }
@@ -439,25 +446,24 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
     //
     // Request body: u32 flags (required by xfrm_msg_min).
     // Reply body: [u32 flags (echoed)][NLA: XFRMA_SPD_INFO struct][NLA: XFRMA_SPD_HINFO {spdhcnt,spdhmcnt}]
-    match sock.request_single(XFRM_MSG_GETSPDINFO, 0, &flags_body).await {
+    match sock
+        .request_single(XFRM_MSG_GETSPDINFO, 0, &flags_body)
+        .await
+    {
         Ok(Some(payload)) => {
             // Skip the 4-byte echoed flags prefix; NLAs start at byte 4.
             if let Some(nla_buf) = payload.get(4..) {
-                let (mut spdhcnt, mut spdhmcnt) = (0u32, 0u32);
+                let (mut spdhcnt, mut spd_hash_max) = (0u32, 0u32);
                 for attr in parse_attrs(nla_buf) {
                     // XFRMA_SPD_INFO (2): xfrmu_spdinfo — not exposed as metrics.
                     if attr.ty == XFRMA_SPD_HINFO && attr.payload.len() >= XFRM_HASHINFO_MIN {
                         // struct xfrmu_spdhinfo: spdhcnt(u32) + spdhmcnt(u32)
-                        if let (Some(hcnt_bytes), Some(hmcnt_bytes)) = (
-                            attr.payload.get(0..4),
-                            attr.payload.get(4..8),
-                        ) {
-                            spdhcnt = u32::from_ne_bytes(
-                                hcnt_bytes.try_into().unwrap_or([0u8; 4]),
-                            );
-                            spdhmcnt = u32::from_ne_bytes(
-                                hmcnt_bytes.try_into().unwrap_or([0u8; 4]),
-                            );
+                        if let (Some(hcnt_bytes), Some(hmcnt_bytes)) =
+                            (attr.payload.get(0..4), attr.payload.get(4..8))
+                        {
+                            spdhcnt = u32::from_ne_bytes(hcnt_bytes.try_into().unwrap_or([0u8; 4]));
+                            spd_hash_max =
+                                u32::from_ne_bytes(hmcnt_bytes.try_into().unwrap_or([0u8; 4]));
                         }
                     }
                 }
@@ -471,7 +477,7 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
                     "nft_xfrm_spd_hash_max",
                     "SPD hash bucket capacity",
                     BTreeMap::new(),
-                    f64::from(spdhmcnt),
+                    f64::from(spd_hash_max),
                 ));
             }
         }
@@ -507,7 +513,6 @@ async fn dump_with_restarts(
             Ok(frames) => return Ok(frames),
             Err(NetlinkError::DumpIntr) => {
                 debug!(attempt, msg_type, "XFRM dump interrupted; retrying");
-                continue;
             }
             Err(NetlinkError::RecvBufOverflow) => return Err(CollectError::RecvBufOverflow),
             Err(e) => return Err(CollectError::Io(e.to_string())),

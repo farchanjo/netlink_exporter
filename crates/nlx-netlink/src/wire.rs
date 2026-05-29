@@ -229,6 +229,10 @@ mod tests {
     use super::*;
 
     /// Helpers to construct a minimal nlattr TLV in a `Vec<u8>`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "nlattr length fits u16 by construction in test helpers"
+    )]
     fn make_nla(ty: u16, payload: &[u8]) -> Vec<u8> {
         let nla_len = NLA_HDRLEN + payload.len();
         let padded = align4(nla_len);

@@ -1,4 +1,4 @@
-//! # nlx-metrics — OpenMetrics Text Exposition Adapter
+//! # nlx-metrics — `OpenMetrics` Text Exposition Adapter
 //!
 //! **Hexagonal role: DRIVEN ADAPTER (metrics registry).**
 //!
@@ -8,7 +8,7 @@
 //! The adapter accepts [`nlx_domain::metric::MetricSample`] values produced
 //! by collectors and maps them into the `prometheus-client` registry.  The
 //! `/metrics` HTTP endpoint calls [`MetricRegistryPort::encode_text`] to obtain
-//! the UTF-8 OpenMetrics text exposition.
+//! the UTF-8 `OpenMetrics` text exposition.
 //!
 //! ## Hexagonal note
 //!

@@ -1,4 +1,4 @@
-//! XFRM IPsec read models.
+//! XFRM `IPsec` read models.
 
 use serde::{Deserialize, Serialize};
 

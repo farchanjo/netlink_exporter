@@ -178,6 +178,10 @@ fn parse_expect_frame(frame: &[u8]) -> Option<ConntrackExpectEntry> {
 /// # Errors
 ///
 /// Returns [`NetlinkError`] on socket I/O failures unrelated to availability.
+#[allow(
+    clippy::items_after_statements,
+    reason = "cardinality cap declared next to its use"
+)]
 async fn dump_expectations_raw(
     sock: &mut NetlinkSocket,
 ) -> Result<Option<Vec<ConntrackExpectEntry>>, NetlinkError> {
@@ -203,9 +207,9 @@ async fn dump_expectations_raw(
     debug!(frames = frames.len(), "IPCTNL_MSG_EXP_GET frames");
 
     // Cardinality guard: cap at 256 distinct (l4proto, helper) keys (§18.2).
+    const CARDINALITY_CAP: usize = 256;
     let mut entries: Vec<ConntrackExpectEntry> = Vec::new();
     let mut key_count: usize = 0;
-    const CARDINALITY_CAP: usize = 256;
 
     for frame in &frames {
         if key_count >= CARDINALITY_CAP {
@@ -245,18 +249,19 @@ impl NetlinkConntrackExpectPort for ConntrackExpectCollector {
 }
 
 impl Collector for ConntrackExpectCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "conntrack_expect"
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "expectation count -> f64 gauge value"
+    )]
     fn collect(&self) -> BoxFuture<'_, Result<Vec<MetricSample>, CollectError>> {
         Box::pin(async move {
-            let mut sock = match NetlinkSocket::open(NETLINK_NETFILTER) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Socket open failure → treat as unavailable, return empty.
-                    return Ok(vec![]);
-                }
+            let Ok(mut sock) = NetlinkSocket::open(NETLINK_NETFILTER) else {
+                // Socket open failure → treat as unavailable, return empty.
+                return Ok(vec![]);
             };
 
             let entries = match dump_expectations_raw(&mut sock).await {
@@ -288,11 +293,9 @@ impl Collector for ConntrackExpectCollector {
         Box::pin(async move {
             // Probe: open socket and attempt a dump.
             // ENOENT/EPERM → false (graceful); other errors → false; success → true.
-            let sock = match NetlinkSocket::open(NETLINK_NETFILTER) {
-                Ok(s) => s,
-                Err(_) => return false,
+            let Ok(mut sock) = NetlinkSocket::open(NETLINK_NETFILTER) else {
+                return false;
             };
-            let mut sock = sock;
             let payload = nfgenmsg_unspec();
             match sock.dump(IPCTNL_MSG_EXP_GET, 0, &payload).await {
                 Ok(_) => true,
@@ -309,6 +312,12 @@ impl Collector for ConntrackExpectCollector {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        reason = "test helpers and assertions on fixed inputs"
+    )]
+
     use super::*;
     use crate::wire::{NLA_HDRLEN, align4};
 
@@ -323,7 +332,7 @@ mod tests {
         out
     }
 
-    /// Build a minimal CTA_EXPECT_TUPLE nested attr with CTA_PROTO_NUM.
+    /// Build a minimal `CTA_EXPECT_TUPLE` nested attr with `CTA_PROTO_NUM`.
     fn make_tuple_attr(proto: u8) -> Vec<u8> {
         // innermost: CTA_PROTO_NUM
         let proto_num_nla = make_nla(CTA_PROTO_NUM, &[proto]);
@@ -394,8 +403,7 @@ mod tests {
     fn ipctnl_msg_exp_get_constant_matches_kernel_enum() {
         // NFNL_SUBSYS_CTNETLINK_EXP = 2; IPCTNL_MSG_EXP_GET = 1 → 0x0201.
         assert_eq!(
-            IPCTNL_MSG_EXP_GET,
-            0x0201,
+            IPCTNL_MSG_EXP_GET, 0x0201,
             "IPCTNL_MSG_EXP_GET must be 0x0201 — sending 0x0200 (EXP_NEW) causes EINVAL"
         );
     }

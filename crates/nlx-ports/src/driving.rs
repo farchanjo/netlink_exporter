@@ -27,9 +27,7 @@ pub trait ScrapeTriggerPort: Send + Sync {
     /// Returns [`CollectError`] if the scrape fails catastrophically (e.g. all
     /// critical collectors errored).  Partial failures are represented in
     /// self-telemetry metrics and do not propagate as `Err`.
-    fn scrape(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<MetricSample>, CollectError>>;
+    fn scrape(&self) -> impl std::future::Future<Output = Result<Vec<MetricSample>, CollectError>>;
 }
 
 /// Liveness probe port.

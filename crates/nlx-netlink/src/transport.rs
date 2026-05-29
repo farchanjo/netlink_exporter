@@ -3,16 +3,16 @@
 //! ## Design (ADR-0011 + ADR-0023 + ADR-0024)
 //!
 //! 1. Open a raw `AF_NETLINK` socket via `rustix::net::socket_with`
-//!    with `SOCK_RAW | SOCK_CLOEXEC` (blocking mode; io_uring drives the I/O).
+//!    with `SOCK_RAW | SOCK_CLOEXEC` (blocking mode; `io_uring` drives the I/O).
 //! 2. Bind with `nl_pid = 0` so the kernel assigns the port ID.
 //! 3. Tune `SO_RCVBUF` to a minimum of 4 MiB.
 //! 4. Optionally enable `NETLINK_GET_STRICT_CHK` (`ENOPROTOOPT` silently
 //!    ignored on kernel < 4.20).
 //! 5. Each `dump`/`request_single` call is executed inside `monoio::spawn_blocking`
-//!    so the io_uring ring (which owns the submission/completion queues) never
+//!    so the `io_uring` ring (which owns the submission/completion queues) never
 //!    blocks the monoio executor thread.
 //!
-//! ## io_uring data path (ADR-0024)
+//! ## `io_uring` data path (ADR-0024)
 //!
 //! Netlink I/O uses **`IORING_OP_SEND`** and **`IORING_OP_RECV`** submitted
 //! through a per-call `io_uring::IoUring` ring (queue depth 32).
@@ -82,7 +82,10 @@ const NLMSG_OVERRUN: u16 = 4;
 
 // nlmsg_flags bits
 const NLM_F_REQUEST: u16 = 0x0001;
-#[allow(dead_code, reason = "NLM_F_MULTI consumed by parse_datagram indirectly via nlmsg_flags")]
+#[allow(
+    dead_code,
+    reason = "NLM_F_MULTI consumed by parse_datagram indirectly via nlmsg_flags"
+)]
 const NLM_F_MULTI: u16 = 0x0002;
 const NLM_F_DUMP_INTR: u16 = 0x0010;
 const NLM_F_DUMP: u16 = 0x0300;
@@ -101,7 +104,7 @@ const CTRL_ATTR_FAMILY_ID: u16 = 1;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NetlinkError {
-    /// Socket creation, bind, or io_uring setup failed.
+    /// Socket creation, bind, or `io_uring` setup failed.
     #[error("netlink socket open failed: {0}")]
     Open(String),
 
@@ -135,7 +138,7 @@ pub enum NetlinkError {
     #[error("netlink frame parse error: {0}")]
     Parse(String),
 
-    /// spawn_blocking join error (thread pool panic).
+    /// `spawn_blocking` join error (thread pool panic).
     #[error("blocking thread join error: {0}")]
     Join(String),
 }
@@ -148,7 +151,7 @@ pub type Result<T> = std::result::Result<T, NetlinkError>;
 // ---------------------------------------------------------------------------
 
 /// `AF_NETLINK` socket whose data path uses `IORING_OP_SEND` / `IORING_OP_RECV`
-/// via the `io-uring` crate.  The io_uring ring is created on the blocking
+/// via the `io-uring` crate.  The `io_uring` ring is created on the blocking
 /// thread inside `monoio::spawn_blocking` so the monoio executor is never
 /// blocked (ADR-0023 + ADR-0024).
 ///
@@ -160,7 +163,7 @@ pub struct NetlinkSocket {
     fd: OwnedFd,
     /// Current `SO_RCVBUF` size tracked for the ENOBUFS circuit-breaker.
     rcvbuf_size: usize,
-    /// Netlink protocol constant (e.g. 0 = NETLINK_ROUTE, 16 = NETLINK_GENERIC).
+    /// Netlink protocol constant (e.g. 0 = `NETLINK_ROUTE`, 16 = `NETLINK_GENERIC`).
     nl_family: i32,
 }
 
@@ -209,6 +212,10 @@ impl NetlinkSocket {
     // -----------------------------------------------------------------------
 
     #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "nl_family is a non-negative protocol constant; casting to u32 is safe here"
+    )]
     pub(crate) fn open_raw_fd(nl_family: i32) -> Result<OwnedFd> {
         use rustix::net::sockopt::set_socket_recv_buffer_size;
         use rustix::net::{
@@ -237,6 +244,11 @@ impl NetlinkSocket {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(
+        unsafe_code,
+        clippy::cast_possible_truncation,
+        reason = "FFI/io_uring requires unsafe; safety documented in the SAFETY comment; size_of::<c_int>() fits socklen_t by construction"
+    )]
     fn try_set_strict_chk(fd: &OwnedFd) {
         // SOL_NETLINK = 270, NETLINK_GET_STRICT_CHK = 12 (linux-raw-sys).
         // SAFETY: `fd` is a valid owned fd; the constants are well-known kernel
@@ -259,7 +271,10 @@ impl NetlinkSocket {
     }
 
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unnecessary_wraps, reason = "stub must match Linux return type")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "stub must match Linux return type"
+    )]
     pub(crate) fn open_raw_fd(_nl_family: i32) -> Result<OwnedFd> {
         Err(NetlinkError::Open(
             "AF_NETLINK is only available on Linux".into(),
@@ -270,6 +285,10 @@ impl NetlinkSocket {
     // Frame building
     // -----------------------------------------------------------------------
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "nlmsg total_len is bounded by NLMSG_HDRLEN + payload; fits u32 by construction"
+    )]
     fn build_request(msg_type: u16, flags: u16, payload: &[u8]) -> Vec<u8> {
         let total_len = NLMSG_HDRLEN + payload.len();
         let mut buf = Vec::with_capacity(align4(total_len));
@@ -369,7 +388,7 @@ impl NetlinkSocket {
     /// Send a netlink dump request and accumulate all response frames.
     ///
     /// Netlink I/O uses `IORING_OP_SEND` + `IORING_OP_RECV` via the `io-uring`
-    /// crate (io_uring is the engine for netlink), offloaded onto a
+    /// crate (`io_uring` is the engine for netlink), offloaded onto a
     /// `monoio::spawn_blocking` thread so the monoio executor is never blocked
     /// (ADR-0023 + ADR-0024).
     ///
@@ -393,10 +412,8 @@ impl NetlinkSocket {
         // access between the dup'd fd on the blocking thread and self.fd here.
         let dup_fd = Self::dup_fd(raw)?;
 
-        let result = monoio::spawn_blocking(move || {
-            blocking_dump(dup_fd, rcvbuf, nl_family, request)
-        })
-        .await;
+        let result =
+            monoio::spawn_blocking(move || blocking_dump(dup_fd, rcvbuf, nl_family, request)).await;
 
         match result {
             Ok(Ok((frames, new_rcvbuf))) => {
@@ -410,7 +427,7 @@ impl NetlinkSocket {
 
     /// Send a unicast (non-dump) netlink request and return the single reply payload.
     ///
-    /// Uses `IORING_OP_SEND` + `IORING_OP_RECV` via io_uring on the blocking
+    /// Uses `IORING_OP_SEND` + `IORING_OP_RECV` via `io_uring` on the blocking
     /// thread (ADR-0024).
     ///
     /// # Errors
@@ -429,10 +446,8 @@ impl NetlinkSocket {
         // SAFETY: same dup contract as `dump`.
         let dup_fd = Self::dup_fd(raw)?;
 
-        let result = monoio::spawn_blocking(move || {
-            blocking_request_single(dup_fd, rcvbuf, request)
-        })
-        .await;
+        let result =
+            monoio::spawn_blocking(move || blocking_request_single(dup_fd, rcvbuf, request)).await;
 
         match result {
             Ok(Ok(opt)) => Ok(opt),
@@ -451,6 +466,10 @@ impl NetlinkSocket {
     ///
     /// Returns [`NetlinkError`] on socket I/O, parse failure, or non-ENOENT
     /// kernel error.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "nla_total is NLA_HDRLEN + name len + 1; fits u16 for any valid genetlink family name"
+    )]
     pub async fn resolve_genl_family(&mut self, name: &str) -> Result<Option<u16>> {
         let mut genl_payload = vec![CTRL_CMD_GETFAMILY, 2u8, 0u8, 0u8];
 
@@ -506,6 +525,10 @@ impl NetlinkSocket {
     /// # Errors
     ///
     /// Returns `NetlinkError::Open` if `dup(2)` fails.
+    #[allow(
+        unsafe_code,
+        reason = "FFI/io_uring requires unsafe; safety documented in the SAFETY comment"
+    )]
     fn dup_fd(raw: std::os::fd::RawFd) -> Result<OwnedFd> {
         // SAFETY: raw is a valid open fd owned by the calling NetlinkSocket;
         // dup(2) returns a new independent fd with the same underlying file
@@ -542,6 +565,12 @@ impl NetlinkSocket {
 /// is called; the CQE is consumed immediately after — so the contract is
 /// satisfied by construction.  Only one SQE is in flight at a time.
 #[cfg(target_os = "linux")]
+#[allow(
+    unsafe_code,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "FFI/io_uring requires unsafe; safety documented in the SAFETY comment; send_buf.len() fits u32 for any valid netlink message; cqe.result() >= 0 is checked before cast"
+)]
 pub(crate) fn uring_send(
     ring: &mut io_uring::IoUring,
     raw_fd: std::os::unix::io::RawFd,
@@ -569,7 +598,7 @@ pub(crate) fn uring_send(
     ring.submit_and_wait(1)
         .map_err(|e| NetlinkError::Send(format!("submit_and_wait: {e}")))?;
 
-    for cqe in ring.completion() {
+    if let Some(cqe) = ring.completion().next() {
         let res = cqe.result();
         if res < 0 {
             return Err(NetlinkError::Send(
@@ -600,6 +629,12 @@ pub(crate) fn uring_send(
 /// the contract is satisfied by construction.  Single-in-flight: no other SQE
 /// references this buffer.
 #[cfg(target_os = "linux")]
+#[allow(
+    unsafe_code,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "FFI/io_uring requires unsafe; safety documented in the SAFETY comment; recv_buf.len() fits u32 (RECV_BUF_LEN = 32 KiB); cqe.result() >= 0 is checked before cast"
+)]
 pub(crate) fn uring_recv(
     ring: &mut io_uring::IoUring,
     raw_fd: std::os::unix::io::RawFd,
@@ -629,7 +664,7 @@ pub(crate) fn uring_recv(
     ring.submit_and_wait(1)
         .map_err(|e| NetlinkError::Recv(format!("submit_and_wait: {e}")))?;
 
-    for cqe in ring.completion() {
+    if let Some(cqe) = ring.completion().next() {
         let res = cqe.result();
         if res < 0 {
             if -res == libc::ENOBUFS {
@@ -649,9 +684,9 @@ pub(crate) fn uring_recv(
 // Blocking helpers — run on the monoio spawn_blocking thread pool
 // ---------------------------------------------------------------------------
 
-/// Execute a full NLM_F_DUMP on the blocking thread using io_uring.
+/// Execute a full `NLM_F_DUMP` on the blocking thread using `io_uring`.
 ///
-/// The io_uring ring (depth 32) is created once per call.  Only one SQE is in
+/// The `io_uring` ring (depth 32) is created once per call.  Only one SQE is in
 /// flight at any time: SEND completes before the RECV loop begins, and each
 /// RECV is fully completed before the next is submitted.  Single-in-flight
 /// discipline means no buffer aliasing is possible and every SAFETY contract on
@@ -659,6 +694,10 @@ pub(crate) fn uring_recv(
 ///
 /// Returns `(frames, new_rcvbuf_size)` on success.
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "fd and request are consumed by value on the blocking thread; ownership transfer is intentional"
+)]
 fn blocking_dump(
     fd: OwnedFd,
     mut rcvbuf_size: usize,
@@ -705,7 +744,7 @@ fn blocking_dump(
 
             match NetlinkSocket::parse_datagram(&recv_buf, n, &mut out) {
                 Ok(true) => return Ok((out, rcvbuf_size)),
-                Ok(false) => continue 'recv,
+                Ok(false) => {}
                 Err(NetlinkError::DumpIntr) => return Err(NetlinkError::DumpIntr),
                 Err(e) => return Err(e),
             }
@@ -725,12 +764,16 @@ fn blocking_dump(
     ))
 }
 
-/// Execute a single unicast request on the blocking thread using io_uring.
+/// Execute a single unicast request on the blocking thread using `io_uring`.
 ///
 /// Submits one `IORING_OP_SEND` then one `IORING_OP_RECV`, each with
 /// `submit_and_wait(1)`.  Single-in-flight; buffer-lifetime SAFETY contract
 /// trivially satisfied (see module-level doc).
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "fd and request are consumed by value on the blocking thread; ownership transfer is intentional"
+)]
 fn blocking_request_single(
     fd: OwnedFd,
     rcvbuf_size: usize,

@@ -5,7 +5,7 @@
 //! This crate wires an Axum HTTP server to the driving port traits:
 //!
 //! - `GET /metrics` → [`nlx_ports::driving::ScrapeTriggerPort::scrape`] →
-//!   UTF-8 OpenMetrics text body.
+//!   UTF-8 `OpenMetrics` text body.
 //! - `GET /healthz`  → [`nlx_ports::driving::HealthPort::is_healthy`] → 200/503.
 //! - `GET /ready`    → [`nlx_ports::driving::ReadinessPort::is_ready`] → 200/503.
 //!

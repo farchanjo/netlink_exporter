@@ -36,7 +36,7 @@ use nlx_ports::{
 };
 
 use crate::{
-    transport::{MAX_DUMP_RESTARTS, NLMSG_HDRLEN, NetlinkError, NetlinkSocket},
+    transport::{MAX_DUMP_RESTARTS, NetlinkError, NetlinkSocket},
     wire::{nested_attrs, parse_attrs, read_u8, read_u32_be, read_u64_be},
 };
 
@@ -50,9 +50,6 @@ const NETLINK_NETFILTER: i32 = 12;
 /// `nfgenmsg` is 4 bytes appended immediately after `nlmsghdr` in every
 /// `NETLINK_NETFILTER` message.
 const NFGENMSG_LEN: usize = 4;
-
-/// Offset of nlattr chain after nlmsghdr (16) + nfgenmsg (4).
-const ATTRS_OFFSET: usize = NLMSG_HDRLEN + NFGENMSG_LEN;
 
 // `nlmsg_type` values: (NFNL_SUBSYS_CTNETLINK=1) << 8 | msg_type
 /// Per-CPU stats — raw `nf_conntrack_stat` body, no nlattr wrapping.
@@ -108,7 +105,7 @@ struct CpuStatSum {
 /// accumulate into `sum`.
 ///
 /// Values are nlattr-encoded big-endian u32 (`nla_put_be32`). Optional tail
-/// fields (clash_resolve, chain_toolong) are simply absent on older kernels.
+/// fields (`clash_resolve`, `chain_toolong`) are simply absent on older kernels.
 fn accumulate_cpu_stat(payload: &[u8], sum: &mut CpuStatSum) {
     for attr in parse_attrs(payload) {
         let v = u64::from(read_u32_be(attr.payload).unwrap_or(0));
@@ -188,9 +185,8 @@ async fn fetch_global_entries(sock: &mut NetlinkSocket) -> Result<u64, NetlinkEr
         .request_single(IPCTNL_MSG_CT_GET_STATS, 0, &nfgenmsg)
         .await?;
 
-    let frame = match frame_opt {
-        Some(f) => f,
-        None => return Ok(0),
+    let Some(frame) = frame_opt else {
+        return Ok(0);
     };
 
     // frame = nfgenmsg (4 bytes) + nlattr chain
@@ -272,6 +268,10 @@ const CTA_COUNTERS_BYTES: u16 = 2;
 ///
 /// `frame` starts at the first byte of nfgenmsg (i.e. after nlmsghdr).
 /// Returns `None` when key attributes are absent (degenerate frame).
+#[allow(
+    clippy::assigning_clones,
+    reason = "clarity: state is a String, clone_from offers no benefit here"
+)]
 fn parse_flow_frame(frame: &[u8]) -> Option<ConntrackFlow> {
     if frame.len() < NFGENMSG_LEN {
         return None;
@@ -376,57 +376,18 @@ fn parse_flow_frame(frame: &[u8]) -> Option<ConntrackFlow> {
 // Full CT dump (stats-only mode)
 // ---------------------------------------------------------------------------
 
-/// Maximum conntrack entries to process during a CT_GET dump.  Exceeding this
+/// Maximum conntrack entries to process during a `CT_GET` dump.  Exceeding this
 /// cap triggers a cardinality-overflow error (§5.5).
 const CT_DUMP_MAX_ENTRIES: usize = 200_000;
-
-/// Dump all conntrack flows (CT_GET).
-///
-/// Returns `(Vec<ConntrackFlow>, entry_count)`.  If `entry_count >
-/// CT_DUMP_MAX_ENTRIES` the caller should surface a cardinality error.
-///
-/// # Errors
-///
-/// Returns [`NetlinkError`] on socket I/O or dump interrupt.
-async fn dump_flows_raw(sock: &mut NetlinkSocket) -> Result<Vec<ConntrackFlow>, NetlinkError> {
-    let nfgenmsg = nfgenmsg_unspec();
-
-    let mut restarts: u32 = 0;
-    let frames = loop {
-        match sock.dump(IPCTNL_MSG_CT_GET_STATS_CPU, 0, &nfgenmsg).await {
-            Ok(f) => break f,
-            Err(NetlinkError::DumpIntr) if restarts < MAX_DUMP_RESTARTS => {
-                restarts = restarts.saturating_add(1);
-                warn!(restart = restarts, "CT dump interrupted; retrying");
-            }
-            Err(e) => return Err(e),
-        }
-    };
-
-    let mut flows: Vec<ConntrackFlow> = Vec::new();
-    let mut count: usize = 0;
-
-    for frame in &frames {
-        if count >= CT_DUMP_MAX_ENTRIES {
-            warn!(
-                count,
-                "conntrack dump exceeded CT_DUMP_MAX_ENTRIES; truncating"
-            );
-            break;
-        }
-        if let Some(flow) = parse_flow_frame(frame) {
-            flows.push(flow);
-            count = count.saturating_add(1);
-        }
-    }
-
-    Ok(flows)
-}
 
 // ---------------------------------------------------------------------------
 // collect() helper — converts stats into MetricSamples
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+)]
 fn stat_to_samples(stat: &ConntrackStat, entries: u64) -> Vec<MetricSample> {
     let empty: BTreeMap<String, String> = BTreeMap::new();
     let mut out = Vec::with_capacity(10);
@@ -509,7 +470,7 @@ impl NetlinkConntrackPort for ConntrackCollector {
         let mut restarts: u32 = 0;
         let frames = loop {
             let nfgenmsg = nfgenmsg_unspec();
-            match sock.dump((1u16 << 8) | 0, 0, &nfgenmsg).await {
+            match sock.dump(1u16 << 8, 0, &nfgenmsg).await {
                 Ok(f) => break f,
                 Err(NetlinkError::DumpIntr) if restarts < MAX_DUMP_RESTARTS => {
                     restarts = restarts.saturating_add(1);
@@ -541,7 +502,7 @@ impl NetlinkConntrackPort for ConntrackCollector {
 }
 
 impl Collector for ConntrackCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "conntrack"
     }
 
@@ -618,7 +579,7 @@ mod tests {
     }
 
     /// Append one big-endian u32 nlattr (type, value) — 4-byte header (native
-    /// nla_len/nla_type) + 4-byte big-endian payload (matches ctnetlink).
+    /// `nla_len/nla_type`) + 4-byte big-endian payload (matches ctnetlink).
     fn push_be32_nla(buf: &mut Vec<u8>, ty: u16, val: u32) {
         let len: u16 = 8;
         buf.extend_from_slice(&len.to_ne_bytes());
@@ -638,7 +599,10 @@ mod tests {
 
         assert_eq!(sum.found, 7);
         assert_eq!(sum.drop, 3);
-        assert!(sum.clash_resolve.is_none(), "clash_resolve should be absent");
+        assert!(
+            sum.clash_resolve.is_none(),
+            "clash_resolve should be absent"
+        );
         assert!(sum.chaintoolong.is_none(), "chaintoolong should be absent");
     }
 

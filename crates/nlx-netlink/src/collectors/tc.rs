@@ -2,20 +2,20 @@
 //!
 //! Netlink family: `NETLINK_ROUTE` (0).
 //! Messages used: `RTM_GETQDISC` (type 38), `RTM_GETTCLASS`, `RTM_GETTFILTER`.
-//! ADR refs: ADR-0011 (TCA_STATS2 NLA_F_NESTED bit-15 masking), ADR-0014.
+//! ADR refs: ADR-0011 (`TCA_STATS2` `NLA_F_NESTED` bit-15 masking), ADR-0014.
 //!
 //! ## Wire layout (netlink-protocol.md §7)
 //!
 //! `tcmsg` 20 B: family(1) pad1(1) pad2(2) ifindex(4) handle(4) parent(4)
 //! info(4).
 //!
-//! TCA_KIND (type=1): NUL-terminated qdisc name string.
-//! TCA_STATS2 (type=7): nested nlattr container with:
-//!   - TCA_STATS_BASIC (1): `gnet_stats_basic` 12 B — u64 bytes + u32 packets
-//!   - TCA_STATS_QUEUE (3): `gnet_stats_queue` 20 B — 5× u32 (qlen, backlog,
+//! `TCA_KIND` (type=1): NUL-terminated qdisc name string.
+//! `TCA_STATS2` (type=7): nested nlattr container with:
+//!   - `TCA_STATS_BASIC` (1): `gnet_stats_basic` 12 B — u64 bytes + u32 packets
+//!   - `TCA_STATS_QUEUE` (3): `gnet_stats_queue` 20 B — 5× u32 (qlen, backlog,
 //!     drops, requeues, overlimits)
 //!
-//! Interface name is resolved from `tcm_ifindex` via a prior RTM_GETLINK dump.
+//! Interface name is resolved from `tcm_ifindex` via a prior `RTM_GETLINK` dump.
 
 use std::collections::BTreeMap;
 
@@ -57,14 +57,14 @@ const IFLA_IFNAME: u16 = 3;
 // Payload builders
 // ---------------------------------------------------------------------------
 
-/// `ifinfomsg` payload (16 bytes, ifi_family=AF_UNSPEC) for the RTM_GETLINK
+/// `ifinfomsg` payload (16 bytes, `ifi_family=AF_UNSPEC`) for the `RTM_GETLINK`
 /// dump used to build the ifindex→name map. A short rtgenmsg is rejected under
-/// NETLINK_GET_STRICT_CHK (empty dump → every device resolves to "unknown").
+/// `NETLINK_GET_STRICT_CHK` (empty dump → every device resolves to "unknown").
 fn ifinfomsg_payload() -> [u8; 16] {
     [0u8; 16]
 }
 
-/// `tcmsg` payload for RTM_GETQDISC dump: 20 bytes all-zero except family=0.
+/// `tcmsg` payload for `RTM_GETQDISC` dump: 20 bytes all-zero except family=0.
 fn tcmsg_payload() -> [u8; 20] {
     [0u8; 20]
 }
@@ -108,7 +108,12 @@ fn nl_err_to_collect(e: NetlinkError) -> CollectError {
 // ifindex → name map (built from RTM_GETLINK dump)
 // ---------------------------------------------------------------------------
 
-/// Build a map from `ifindex` (i32) to interface name using RTM_GETLINK.
+/// Build a map from `ifindex` (i32) to interface name using `RTM_GETLINK`.
+///
+/// # Errors
+///
+/// Returns [`NetlinkError`] if the `RTM_GETLINK` dump fails or is interrupted
+/// beyond the restart limit.
 async fn build_ifindex_map(
     sock: &mut NetlinkSocket,
 ) -> Result<BTreeMap<i32, String>, NetlinkError> {
@@ -146,19 +151,19 @@ fn decode_ifname(payload: &[u8]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 struct QdiscStats {
-    /// Total bytes through qdisc (from gnet_stats_basic).
+    /// Total bytes through qdisc (from `gnet_stats_basic`).
     bytes: u64,
-    /// Total packets through qdisc (from gnet_stats_basic).
+    /// Total packets through qdisc (from `gnet_stats_basic`).
     packets: u64,
-    /// Drops (from gnet_stats_queue).
+    /// Drops (from `gnet_stats_queue`).
     drops: u32,
-    /// Overlimits (from gnet_stats_queue).
+    /// Overlimits (from `gnet_stats_queue`).
     overlimits: u32,
-    /// Backlog bytes (from gnet_stats_queue).
+    /// Backlog bytes (from `gnet_stats_queue`).
     backlog: u32,
 }
 
-/// Parse `TCA_STATS2` payload (nested attrs: TCA_STATS_BASIC + TCA_STATS_QUEUE).
+/// Parse `TCA_STATS2` payload (nested attrs: `TCA_STATS_BASIC` + `TCA_STATS_QUEUE`).
 fn parse_tca_stats2(payload: &[u8]) -> Option<QdiscStats> {
     let mut bytes = 0u64;
     let mut packets = 0u64;
@@ -330,7 +335,7 @@ impl NetlinkTcPort for TcCollector {
 }
 
 impl Collector for TcCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "traffic_control"
     }
 
@@ -359,8 +364,7 @@ impl Collector for TcCollector {
                 };
                 let iface_name = ifindex_map
                     .get(&entry.ifindex)
-                    .map(String::as_str)
-                    .unwrap_or("unknown");
+                    .map_or("unknown", String::as_str);
                 emit_qdisc_metrics(&entry, iface_name, &mut samples);
             }
 

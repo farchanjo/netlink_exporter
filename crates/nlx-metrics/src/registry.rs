@@ -120,9 +120,9 @@ fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
 
     for (name, group) in &groups {
         let help_escaped = escape_help(group.help);
-        write!(out, "# HELP {name} {help_escaped}\n")
+        writeln!(out, "# HELP {name} {help_escaped}")
             .map_err(|e| RegistryError::Encode(e.to_string()))?;
-        write!(out, "# TYPE {name} {}\n", kind_str(group.kind))
+        writeln!(out, "# TYPE {name} {}", kind_str(group.kind))
             .map_err(|e| RegistryError::Encode(e.to_string()))?;
 
         for (labels, value) in &group.observations {
@@ -192,7 +192,7 @@ fn write_sample_line(
     if !labels.is_empty() {
         out.push('{');
         let mut first = true;
-        for (k, v) in labels.iter() {
+        for (k, v) in labels {
             if !first {
                 out.push(',');
             }
@@ -230,6 +230,10 @@ fn write_f64(out: &mut String, v: f64) -> Result<(), std::fmt::Error> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test code; panics on unexpected failure are intentional"
+)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

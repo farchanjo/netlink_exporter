@@ -11,7 +11,7 @@
 //! - Build the enabled collector set from config.
 //! - Run sequential fan-out scrapes.
 //! - Inject self-telemetry metrics on every scrape cycle.
-//! - Accumulate per-collector error counters across scrapes (AtomicU64).
+//! - Accumulate per-collector error counters across scrapes (`AtomicU64`).
 
 use std::{
     collections::BTreeMap,
@@ -25,12 +25,19 @@ use std::{
 use nlx_config::ExporterConfig;
 use nlx_domain::metric::MetricSample;
 use nlx_netlink::collectors::{
-    conntrack::ConntrackCollector, conntrack_expect::ConntrackExpectCollector,
+    conntrack::ConntrackCollector,
+    conntrack_expect::ConntrackExpectCollector,
     devlink::DevlinkCollector,
     drop_monitor::{DropCounters, DropMonitorCollector},
-    ethtool::EthtoolCollector, ipvs::IpvsCollector, nftables::NftablesCollector, rt::RtCollector,
-    rt_extended::RtExtendedCollector, sockdiag::SockDiagCollector, tc::TcCollector,
-    wireguard::WireguardCollector, xfrm::XfrmCollector,
+    ethtool::EthtoolCollector,
+    ipvs::IpvsCollector,
+    nftables::NftablesCollector,
+    rt::RtCollector,
+    rt_extended::RtExtendedCollector,
+    sockdiag::SockDiagCollector,
+    tc::TcCollector,
+    wireguard::WireguardCollector,
+    xfrm::XfrmCollector,
 };
 use nlx_ports::{
     collector::Collector,
@@ -38,7 +45,7 @@ use nlx_ports::{
     driving::ScrapeTriggerPort,
     error::CollectError,
 };
-use tracing::{error, warn};
+use tracing::error;
 
 // ---------------------------------------------------------------------------
 // Collector registry
@@ -129,8 +136,6 @@ pub struct ScrapeService<M: MetricRegistryPort> {
     pub collectors: Arc<Vec<Box<dyn Collector>>>,
     /// Metrics registry driven port.
     pub metrics: Arc<M>,
-    /// Scrape timeout in milliseconds (from config, kept for telemetry).
-    pub scrape_timeout_ms: u64,
     /// Startup availability map: collector name → available.
     pub availability: Arc<BTreeMap<String, bool>>,
     /// Per-collector cumulative error counters — lock-free `AtomicU64`.
@@ -151,10 +156,10 @@ impl<M: MetricRegistryPort> ScrapeService<M> {
         for c in collectors.iter() {
             stats_map.insert(c.name().to_owned(), CollectorStats::new());
         }
+        let _ = scrape_timeout_ms; // retained in signature for caller compatibility; not used internally
         Self {
             collectors,
             metrics,
-            scrape_timeout_ms,
             availability,
             stats: Arc::new(stats_map),
         }
@@ -162,6 +167,14 @@ impl<M: MetricRegistryPort> ScrapeService<M> {
 }
 
 impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cohesive scrape fan-out + self-telemetry block; splitting would obscure the sequential wire layout"
+    )]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "local helper struct kept next to its use inside the async fn body"
+    )]
     async fn scrape(&self) -> Result<Vec<MetricSample>, CollectError> {
         let mut all: Vec<MetricSample> = Vec::new();
 
@@ -287,7 +300,7 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
                 let error_count = self
                     .stats
                     .get(&cr.name)
-                    .map_or(0, |s| s.load_error());
+                    .map_or(0, CollectorStats::load_error);
                 all.push(MetricSample::counter(
                     "nft_scrape_collector_error_total",
                     "Total number of scrape errors for this collector since process start.",

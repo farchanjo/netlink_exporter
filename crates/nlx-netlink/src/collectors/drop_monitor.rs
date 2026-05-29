@@ -8,7 +8,7 @@
 //! `probe_available()` calls `resolve_genl_family("NET_DM")`. `Ok(None)` means
 //! the `drop_monitor` module is not loaded; `collect()` returns `Ok(vec![])`.
 //!
-//! ## Protocol (derived from linux/net/core/drop_monitor.c + uapi/linux/net_dropmon.h)
+//! ## Protocol (derived from `linux/net/core/drop_monitor.c` + `uapi/linux/net_dropmon.h`)
 //!
 //! Commands (genl family version = 2):
 //!
@@ -25,8 +25,8 @@
 //! - `NET_DM_ATTR_STATS`    (type=12, nested) → `NET_DM_ATTR_STATS_DROPPED` (type=0, u64) SW total
 //! - `NET_DM_ATTR_HW_STATS` (type=13, nested) → `NET_DM_ATTR_STATS_DROPPED` (type=0, u64) HW total
 //!
-//! **No per-reason breakdown from STATS_GET.** Per-reason data lives only in
-//! the `NET_DM_GRP_ALERT` multicast stream (PACKET-mode alerts). STATS_GET
+//! **No per-reason breakdown from `STATS_GET`.** Per-reason data lives only in
+//! the `NET_DM_GRP_ALERT` multicast stream (PACKET-mode alerts). `STATS_GET`
 //! is used here for a simple, lock-free, per-scrape pull that requires no
 //! background task.
 //!
@@ -105,7 +105,7 @@ const NET_DM_ATTR_HW_ENTRIES: u16 = 17;
 /// `NET_DM_ATTR_HW_ENTRY` (nested): one HW trap entry inside `HW_ENTRIES`.
 const NET_DM_ATTR_HW_ENTRY: u16 = 18;
 /// `NET_DM_ATTR_HW_TRAP_COUNT` (u32): drop count for one HW trap entry.
-/// Value 19 in `enum net_dm_attr` (net_dropmon.h:85) — NOT 22 (FLOW_ACTION_COOKIE).
+/// Value 19 in `enum net_dm_attr` (`net_dropmon.h:85`) — NOT 22 (`FLOW_ACTION_COOKIE`).
 const NET_DM_ATTR_HW_TRAP_COUNT: u16 = 19;
 
 /// Ancillary `net_dm_alert_msg` carried as `NLA_UNSPEC` (type 0) in an ALERT.
@@ -127,12 +127,12 @@ const NET_DM_DROP_POINT_LEN: usize = 12;
 // (it is the first value in its own enum starting at 0).
 // ---------------------------------------------------------------------------
 
-/// `NET_DM_ATTR_STATS_DROPPED` (u64) — inner attr type 0 inside the STATS/HW_STATS nested.
+/// `NET_DM_ATTR_STATS_DROPPED` (u64) — inner attr type 0 inside the `STATS/HW_STATS` nested.
 const NET_DM_ATTR_STATS_DROPPED: u16 = 0;
 
 /// Summary alert mode (kernel: `NET_DM_ALERT_MODE_SUMMARY = 0`).
 ///
-/// From uapi/linux/net_dropmon.h:
+/// From `uapi/linux/net_dropmon.h`:
 /// ```c
 /// enum net_dm_alert_mode {
 ///     NET_DM_ALERT_MODE_SUMMARY,   // = 0
@@ -251,7 +251,7 @@ impl NetlinkDropMonitorPort for DropMonitorCollector {
 // ---------------------------------------------------------------------------
 
 impl Collector for DropMonitorCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "drop_monitor"
     }
 
@@ -322,6 +322,10 @@ fn genl_hdr(cmd: u8) -> [u8; 4] {
 }
 
 /// Append one `nlattr` TLV to `buf`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nlattr length fits u16 by construction; payloads are small kernel attrs"
+)]
 fn push_nla(buf: &mut Vec<u8>, ty: u16, payload: &[u8]) {
     let nla_len = (NLA_HDRLEN + payload.len()) as u16;
     buf.extend_from_slice(&nla_len.to_ne_bytes());
@@ -354,7 +358,11 @@ async fn start_monitoring(
     // --- NET_DM_CMD_CONFIG: set SUMMARY alert mode ---
     // Payload: genlmsghdr(cmd=2,ver=2) + NLA(ALERT_MODE=0).
     let mut config_payload = genl_hdr(NET_DM_CMD_CONFIG).to_vec();
-    push_nla(&mut config_payload, NET_DM_ATTR_ALERT_MODE, &[NET_DM_ALERT_MODE_SUMMARY]);
+    push_nla(
+        &mut config_payload,
+        NET_DM_ATTR_ALERT_MODE,
+        &[NET_DM_ALERT_MODE_SUMMARY],
+    );
 
     // NLM_F_ACK = 4 so the kernel sends an ack/err frame we can read.
     match sock.request_single(family_id, 4, &config_payload).await {
@@ -365,7 +373,10 @@ async fn start_monitoring(
             // Monitoring already active — CONFIG is rejected while monitoring is
             // running (kernel: "Cannot configure drop monitor during monitoring").
             // This is expected on the second and subsequent scrapes.
-            debug!(errno, "NET_DM_CMD_CONFIG EBUSY/EALREADY/EAGAIN — monitoring already active");
+            debug!(
+                errno,
+                "NET_DM_CMD_CONFIG EBUSY/EALREADY/EAGAIN — monitoring already active"
+            );
         }
         Err(e) => return Err(e),
     }
@@ -378,7 +389,10 @@ async fn start_monitoring(
         Err(NetlinkError::KernelError { errno })
             if errno == EBUSY || errno == EALREADY || errno == EAGAIN =>
         {
-            debug!(errno, "NET_DM_CMD_START EBUSY/EALREADY/EAGAIN — already monitoring");
+            debug!(
+                errno,
+                "NET_DM_CMD_START EBUSY/EALREADY/EAGAIN — already monitoring"
+            );
         }
         Err(e) => return Err(e),
     }
@@ -425,7 +439,10 @@ async fn fetch_stats(
 
     // Skip genlmsghdr (4 bytes): cmd + version + reserved[2].
     if payload.len() < 4 {
-        warn!(len = payload.len(), "NET_DM_CMD_STATS_GET reply too short for genlmsghdr");
+        warn!(
+            len = payload.len(),
+            "NET_DM_CMD_STATS_GET reply too short for genlmsghdr"
+        );
         return Ok(vec![]);
     }
     let attrs_buf = &payload[4..];
@@ -562,7 +579,7 @@ fn parse_summary_alert(attrs_buf: &[u8]) -> (u64, u64) {
 // Multicast ALERT listener — background thread, lock-free atomics (ADR-0020)
 // ---------------------------------------------------------------------------
 
-/// Perform the privileged NET_DM listener setup, then spawn the recv-only
+/// Perform the privileged `NET_DM` listener setup, then spawn the recv-only
 /// background thread.
 ///
 /// **Capability ordering (ADR-0009 / ADR-0026).** The privileged setup —
@@ -574,6 +591,12 @@ fn parse_summary_alert(attrs_buf: &[u8]) -> (u64, u64) {
 ///
 /// Returns `Err` if setup fails; the caller logs and continues (totals stay 0,
 /// the overflow-pull health metric still works). On non-Linux this is a no-op.
+///
+/// # Errors
+///
+/// Returns `Err(String)` if the netlink socket cannot be opened, the `NET_DM`
+/// family cannot be resolved, capability-gated commands (`CONFIG`/`START`) fail
+/// with an unexpected errno, or the background thread cannot be spawned.
 #[cfg(target_os = "linux")]
 pub fn setup_and_spawn_listener(counters: Arc<DropCounters>) -> std::result::Result<(), String> {
     // Privileged phase — caller thread, pre cap-drop.
@@ -603,6 +626,10 @@ pub fn setup_and_spawn_listener(_counters: Arc<DropCounters>) -> std::result::Re
 
 /// Build a complete `nlmsghdr`-framed request (`NLM_F_REQUEST | flags`).
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nlmsg total length fits u32 by construction; netlink messages are bounded well below 4 GiB"
+)]
 fn build_nlmsg(msg_type: u16, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
     let total = crate::transport::NLMSG_HDRLEN + payload.len();
     let mut b = Vec::with_capacity(align4(total));
@@ -617,7 +644,7 @@ fn build_nlmsg(msg_type: u16, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
 
 /// Privileged setup (caller thread, pre cap-drop): open the genl socket, resolve
 /// the family + `events` group, enable SUMMARY monitoring, and join the group —
-/// all over io_uring. Returns the joined+configured fd and the family id.
+/// all over `io_uring`. Returns the joined+configured fd and the family id.
 #[cfg(target_os = "linux")]
 fn setup_listener_socket() -> std::result::Result<(std::os::fd::OwnedFd, u16), String> {
     use std::os::fd::AsRawFd;
@@ -634,7 +661,11 @@ fn setup_listener_socket() -> std::result::Result<(std::os::fd::OwnedFd, u16), S
     //    with multicast ALERT frames. Benign "already monitoring" errnos are
     //    tolerated (a previous run may have left monitoring on).
     let mut cfg = genl_hdr(NET_DM_CMD_CONFIG).to_vec();
-    push_nla(&mut cfg, NET_DM_ATTR_ALERT_MODE, &[NET_DM_ALERT_MODE_SUMMARY]);
+    push_nla(
+        &mut cfg,
+        NET_DM_ATTR_ALERT_MODE,
+        &[NET_DM_ALERT_MODE_SUMMARY],
+    );
     unicast_ack(&mut ring, raw, family_id, &cfg, 1)?;
     let start = genl_hdr(NET_DM_CMD_START).to_vec();
     unicast_ack(&mut ring, raw, family_id, &start, 2)?;
@@ -651,7 +682,7 @@ fn setup_listener_socket() -> std::result::Result<(std::os::fd::OwnedFd, u16), S
 }
 
 /// Recv-only loop (background thread, no capabilities): receive `NET_DM_CMD_ALERT`
-/// frames over io_uring and accumulate SW/HW drop counts into the atomics.
+/// frames over `io_uring` and accumulate SW/HW drop counts into the atomics.
 #[cfg(target_os = "linux")]
 fn recv_loop(
     fd: &std::os::fd::OwnedFd,
@@ -722,8 +753,7 @@ fn unicast_ack(
         let ty = u16::from_ne_bytes([buf[4], buf[5]]);
         if ty == 2 {
             // NLMSG_ERROR: errno is the first 4 bytes of the payload.
-            let errno =
-                i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]).abs();
+            let errno = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]).abs();
             if errno != 0 && errno != EBUSY && errno != EAGAIN && errno != EALREADY {
                 return Err(format!("ACK errno={errno}"));
             }
@@ -732,7 +762,7 @@ fn unicast_ack(
     Ok(())
 }
 
-/// Resolve `(family_id, events_group_id)` for NET_DM via `CTRL_CMD_GETFAMILY`.
+/// Resolve `(family_id, events_group_id)` for `NET_DM` via `CTRL_CMD_GETFAMILY`.
 #[cfg(target_os = "linux")]
 fn resolve_family_and_group(
     ring: &mut io_uring::IoUring,
@@ -787,9 +817,8 @@ fn resolve_family_and_group(
                                     .iter()
                                     .position(|&b| b == 0)
                                     .unwrap_or(f.payload.len());
-                                gname = Some(
-                                    String::from_utf8_lossy(&f.payload[..end]).into_owned(),
-                                );
+                                gname =
+                                    Some(String::from_utf8_lossy(&f.payload[..end]).into_owned());
                             }
                             _ => {}
                         }
@@ -815,18 +844,23 @@ const SOL_NETLINK: u32 = 270;
 #[cfg(target_os = "linux")]
 const NETLINK_ADD_MEMBERSHIP: u32 = 1;
 
-/// Join a generic-netlink multicast group via **io_uring**
+/// Join a generic-netlink multicast group via **`io_uring`**
 /// `IORING_OP_URING_CMD` / `SOCKET_URING_OP_SETSOCKOPT` (kernel ≥ 6.7).
 ///
-/// This keeps the entire NET_DM control + data path on io_uring (ADR-0024): the
-/// group-join `setsockopt(NETLINK_ADD_MEMBERSHIP)` is submitted as an io_uring
+/// This keeps the entire `NET_DM` control + data path on `io_uring` (ADR-0024): the
+/// group-join `setsockopt(NETLINK_ADD_MEMBERSHIP)` is submitted as an `io_uring`
 /// op rather than a blocking syscall. On kernels < 6.7 (where the op returns
 /// `EOPNOTSUPP`/`EINVAL`) it falls back to a blocking `libc::setsockopt`.
 ///
-/// Requires `CAP_SYS_ADMIN`: the NET_DM `events` group is declared
+/// Requires `CAP_SYS_ADMIN`: the `NET_DM` `events` group is declared
 /// `GENL_MCAST_CAP_SYS_ADMIN` (`net/core/drop_monitor.c:187`), so this must run
 /// before the process drops capabilities (ADR-0009 / ADR-0026).
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::cast_possible_truncation,
+    unsafe_code,
+    reason = "size_of::<u32>() fits u32 by construction; unsafe required for io_uring SQ push (SAFETY documented inline)"
+)]
 fn join_mcast_group(
     ring: &mut io_uring::IoUring,
     raw: std::os::fd::RawFd,
@@ -864,7 +898,10 @@ fn join_mcast_group(
     if res < 0 {
         let e = -res;
         if e == libc::EOPNOTSUPP || e == libc::EINVAL || e == libc::ENOSYS {
-            debug!(errno = e, "io_uring SETSOCKOPT unsupported (kernel < 6.7); falling back");
+            debug!(
+                errno = e,
+                "io_uring SETSOCKOPT unsupported (kernel < 6.7); falling back"
+            );
             return join_mcast_group_libc(raw, group_id);
         }
         return Err(format!("io_uring NETLINK_ADD_MEMBERSHIP errno={e}"));
@@ -874,6 +911,12 @@ fn join_mcast_group(
 
 /// Blocking `setsockopt(NETLINK_ADD_MEMBERSHIP)` fallback for kernels < 6.7.
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    unsafe_code,
+    reason = "u32 group/socket-option constants are cast to c_int/socklen_t per POSIX ABI; unsafe required for libc::setsockopt (SAFETY documented inline)"
+)]
 fn join_mcast_group_libc(
     raw: std::os::fd::RawFd,
     group_id: u32,
@@ -918,9 +961,12 @@ fn join_mcast_group_libc(
 ///
 /// This function handles both; returns `None` when required fields are absent.
 ///
-/// **Not called in the STATS_GET pull model.** Retained for the future multicast
-/// subscriber integration (NET_DM_GRP_ALERT group, group index 1).
-#[expect(dead_code, reason = "reserved for future NET_DM_GRP_ALERT multicast integration")]
+/// **Not called in the `STATS_GET` pull model.** Retained for the future multicast
+/// subscriber integration (`NET_DM_GRP_ALERT` group, group index 1).
+#[allow(
+    dead_code,
+    reason = "reserved for future NET_DM_GRP_ALERT multicast integration"
+)]
 pub(crate) fn parse_alert_frame(attrs_buf: &[u8]) -> Option<DropEvent> {
     // Attribute type constants used only in this function (from enum net_dm_attr).
     // Counting from UNSPEC=0: ORIGIN=14, HW_TRAP_NAME=16, REASON=23.
@@ -966,18 +1012,21 @@ pub(crate) fn parse_alert_frame(attrs_buf: &[u8]) -> Option<DropEvent> {
         }
     }
 
-    let origin_str = if origin_raw == NET_DM_ORIGIN_SW { "sw" } else { "hw" };
+    let origin_str = if origin_raw == NET_DM_ORIGIN_SW {
+        "sw"
+    } else {
+        "hw"
+    };
 
     let reason_str = if origin_raw == NET_DM_ORIGIN_SW {
-        match reason {
-            Some(r) => r,
-            None => {
-                // NET_DM_ATTR_REASON absent — summary-mode ALERT or kernel < 5.17.
-                // Summary-mode ALERT frames carry per-PC drop counts in the legacy
-                // net_dm_alert_msg struct (NLA_UNSPEC) without a reason string.
-                warn!("NET_DM alert missing NET_DM_ATTR_REASON (summary-mode or kernel < 5.17)");
-                return None;
-            }
+        if let Some(r) = reason {
+            r
+        } else {
+            // NET_DM_ATTR_REASON absent — summary-mode ALERT or kernel < 5.17.
+            // Summary-mode ALERT frames carry per-PC drop counts in the legacy
+            // net_dm_alert_msg struct (NLA_UNSPEC) without a reason string.
+            warn!("NET_DM alert missing NET_DM_ATTR_REASON (summary-mode or kernel < 5.17)");
+            return None;
         }
     } else {
         hw_trap.unwrap_or_else(|| "unknown".to_owned())
@@ -995,11 +1044,19 @@ pub(crate) fn parse_alert_frame(attrs_buf: &[u8]) -> Option<DropEvent> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test code; panics are acceptable assertion failures"
+)]
 mod tests {
     use super::*;
     use crate::wire::{NLA_HDRLEN, align4};
 
     /// Build a minimal nlattr TLV.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "nlattr length fits u16 in tests; payloads are small synthetic buffers"
+    )]
     fn make_nla(ty: u16, payload: &[u8]) -> Vec<u8> {
         let nla_len = NLA_HDRLEN + payload.len();
         let padded = align4(nla_len);
@@ -1018,7 +1075,7 @@ mod tests {
     }
 
     /// Synthesise a `NET_DM_CMD_STATS_NEW` reply payload (after nlmsghdr):
-    /// genlmsghdr(4 B) + STATS nested + HW_STATS nested.
+    /// genlmsghdr(4 B) + STATS nested + `HW_STATS` nested.
     fn make_stats_reply(sw: u64, hw: u64) -> Vec<u8> {
         // genlmsghdr: cmd=NET_DM_CMD_STATS_NEW(9), ver=2, reserved[2].
         let mut buf = vec![9u8, 2u8, 0u8, 0u8];
@@ -1027,8 +1084,8 @@ mod tests {
         let inner_sw = make_nla(NET_DM_ATTR_STATS_DROPPED, &sw.to_ne_bytes());
         buf.extend_from_slice(&make_nested_nla(NET_DM_ATTR_STATS, &inner_sw));
 
-        let inner_hw = make_nla(NET_DM_ATTR_STATS_DROPPED, &hw.to_ne_bytes());
-        buf.extend_from_slice(&make_nested_nla(NET_DM_ATTR_HW_STATS, &inner_hw));
+        let hw_dropped_nla = make_nla(NET_DM_ATTR_STATS_DROPPED, &hw.to_ne_bytes());
+        buf.extend_from_slice(&make_nested_nla(NET_DM_ATTR_HW_STATS, &hw_dropped_nla));
 
         buf
     }
@@ -1163,8 +1220,12 @@ mod tests {
         assert_eq!(DropMonitorCollector::new().name(), "drop_monitor");
     }
 
-    /// Build a SUMMARY-mode SW ALERT attribute region: NLA_UNSPEC(0) wrapping a
+    /// Build a SUMMARY-mode SW ALERT attribute region: `NLA_UNSPEC(0)` wrapping a
     /// `net_dm_alert_msg { u32 entries; net_dm_drop_point[] }`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "test helper; slice length is a small synthetic count that fits u32"
+    )]
     fn make_sw_alert(counts: &[u32]) -> Vec<u8> {
         let mut alert = Vec::new();
         alert.extend_from_slice(&(counts.len() as u32).to_ne_bytes()); // entries

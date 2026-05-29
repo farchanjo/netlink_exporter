@@ -1,6 +1,6 @@
 //! Minimal hand-rolled HTTP/1 server over `monoio::net::TcpListener`.
 //!
-//! **ADR-0023:** Replaces axum + tokio TcpListener.  The three routes
+//! **ADR-0023:** Replaces axum + tokio `TcpListener`.  The three routes
 //! (`/metrics`, `/healthz`, `/ready`) are implemented as a path-dispatch
 //! match.  No axum `Router`, `State`, tower middleware, or `IntoResponse`
 //! trait is used.
@@ -13,11 +13,11 @@
 //! The port trait signatures (`ScrapeTriggerPort`, `HealthPort`,
 //! `ReadinessPort`, `MetricRegistryPort`) are unchanged.
 //!
-//! # BufResult ownership model
+//! # `BufResult` ownership model
 //!
 //! monoio `AsyncReadRent::read` and `AsyncWriteRentExt::write_all` both use
 //! the owned-buffer model: the buffer is *moved into* the call, pinned by the
-//! kernel for the io_uring SQ entry lifetime, and returned in the result tuple.
+//! kernel for the `io_uring` SQ entry lifetime, and returned in the result tuple.
 
 use std::sync::Arc;
 
@@ -36,8 +36,10 @@ use nlx_ports::driving::{HealthPort, ReadinessPort, ScrapeTriggerPort};
 // ---------------------------------------------------------------------------
 
 const HTTP_200_PLAIN: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-const HTTP_503_PLAIN: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const HTTP_500: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_503_PLAIN: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const HTTP_500: &[u8] =
+    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const HTTP_404: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 // ---------------------------------------------------------------------------
@@ -167,7 +169,7 @@ async fn handle_conn<S, H, R, M>(
     let path = parse_path(&buf[..n]);
 
     match path {
-        "/metrics" => handle_metrics::<S, H, R, M>(stream, scrape, registry).await,
+        "/metrics" => handle_metrics::<S, M>(stream, scrape, registry).await,
         "/healthz" => handle_healthz(stream, health).await,
         "/ready" => handle_ready(stream, readiness).await,
         _ => {
@@ -177,14 +179,9 @@ async fn handle_conn<S, H, R, M>(
 }
 
 /// `GET /metrics` — trigger scrape, encode, respond.
-async fn handle_metrics<S, H, R, M>(
-    mut stream: TcpStream,
-    scrape: Arc<S>,
-    registry: Arc<M>,
-) where
+async fn handle_metrics<S, M>(mut stream: TcpStream, scrape: Arc<S>, registry: Arc<M>)
+where
     S: ScrapeTriggerPort,
-    H: HealthPort,
-    R: ReadinessPort,
     M: MetricRegistryPort,
 {
     if let Err(e) = scrape.scrape().await {
@@ -245,4 +242,3 @@ fn parse_path(buf: &[u8]) -> &str {
     let _method = parts.next().unwrap_or("");
     parts.next().unwrap_or("/")
 }
-

@@ -42,8 +42,6 @@ const ETHTOOL_A_HEADER_DEV_INDEX: u16 = 2;
 const ETHTOOL_A_HEADER_DEV_NAME: u16 = 3;
 
 // ETHTOOL_A_STATS_GRP sub-attributes.
-const ETHTOOL_A_STATS_GRP_ID: u16 = 2;
-const ETHTOOL_A_STATS_GRP_SS_ID: u16 = 3;
 const ETHTOOL_A_STATS_GRP_STAT: u16 = 4;
 
 // ETHTOOL_A_STATS_GRP_STAT sub-attrs.
@@ -87,7 +85,6 @@ impl NetlinkEthtoolPort for EthtoolCollector {
                             "ethtool dump interrupted (NLM_F_DUMP_INTR) too many times".into(),
                         ));
                     }
-                    continue;
                 }
                 Err(e) => return Err(DomainError::Collector(e.to_string())),
             }
@@ -104,10 +101,14 @@ impl NetlinkEthtoolPort for EthtoolCollector {
 }
 
 impl Collector for EthtoolCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ethtool"
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "metric gauge values are f64; precision loss on large u64 counters is inherent to Prometheus exposition"
+    )]
     fn collect(&self) -> BoxFuture<'_, Result<Vec<MetricSample>, CollectError>> {
         Box::pin(async move {
             let mut sock = NetlinkSocket::open(NETLINK_GENERIC)
@@ -133,7 +134,6 @@ impl Collector for EthtoolCollector {
                         if restarts >= crate::transport::MAX_DUMP_RESTARTS {
                             return Err(CollectError::DumpIntr);
                         }
-                        continue;
                     }
                     Err(crate::transport::NetlinkError::RecvBufOverflow) => {
                         return Err(CollectError::RecvBufOverflow);
@@ -184,7 +184,7 @@ impl Collector for EthtoolCollector {
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-/// Build the `ETHTOOL_MSG_STATS_GET` payload (genlmsghdr + ETHTOOL_A_STATS_GROUPS).
+/// Build the `ETHTOOL_MSG_STATS_GET` payload (genlmsghdr + `ETHTOOL_A_STATS_GROUPS`).
 fn build_stats_get_payload() -> Vec<u8> {
     let mut buf = Vec::with_capacity(32);
     // genlmsghdr (4 bytes): cmd=37, version=1, reserved=0.
@@ -200,6 +200,10 @@ fn build_stats_get_payload() -> Vec<u8> {
 }
 
 /// Push a flat nlattr into `buf`.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nlattr length fits u16 by construction: NLA_HDRLEN + payload never exceeds 65535"
+)]
 fn push_nlattr(buf: &mut Vec<u8>, ty: u16, payload: &[u8]) {
     use crate::wire::{NLA_HDRLEN, align4};
     let nla_len = (NLA_HDRLEN + payload.len()) as u16;
@@ -236,39 +240,32 @@ fn parse_stats_attrs(attrs_buf: &[u8]) -> Option<(String, BTreeMap<String, u64>)
             ETHTOOL_A_STATS_GRP => {
                 // Nested per-group: each contains multiple ETHTOOL_A_STATS_GRP_STAT.
                 for grp_attr in nested_attrs(attr.payload) {
-                    match grp_attr.ty {
-                        ETHTOOL_A_STATS_GRP_ID | ETHTOOL_A_STATS_GRP_SS_ID => {
-                            // Group ID / string-set ID — informational; skip.
-                        }
-                        ETHTOOL_A_STATS_GRP_STAT => {
-                            // Nested: ETHTOOL_A_STATS_GRP_STAT_NAME + VALUE.
-                            let mut stat_name = String::new();
-                            let mut stat_val: Option<u64> = None;
-                            for stat_attr in nested_attrs(grp_attr.payload) {
-                                match stat_attr.ty {
-                                    ETHTOOL_A_STATS_GRP_STAT_NAME => {
-                                        let end = stat_attr
-                                            .payload
-                                            .iter()
-                                            .position(|&b| b == 0)
-                                            .unwrap_or(stat_attr.payload.len());
-                                        stat_name =
-                                            String::from_utf8_lossy(&stat_attr.payload[..end])
-                                                .into_owned();
-                                    }
-                                    ETHTOOL_A_STATS_GRP_STAT_VALUE => {
-                                        stat_val = read_u64(stat_attr.payload);
-                                    }
-                                    _ => {}
+                    if grp_attr.ty == ETHTOOL_A_STATS_GRP_STAT {
+                        // Nested: ETHTOOL_A_STATS_GRP_STAT_NAME + VALUE.
+                        let mut stat_name = String::new();
+                        let mut stat_val: Option<u64> = None;
+                        for stat_attr in nested_attrs(grp_attr.payload) {
+                            match stat_attr.ty {
+                                ETHTOOL_A_STATS_GRP_STAT_NAME => {
+                                    let end = stat_attr
+                                        .payload
+                                        .iter()
+                                        .position(|&b| b == 0)
+                                        .unwrap_or(stat_attr.payload.len());
+                                    stat_name = String::from_utf8_lossy(&stat_attr.payload[..end])
+                                        .into_owned();
                                 }
-                            }
-                            if !stat_name.is_empty() {
-                                if let Some(v) = stat_val {
-                                    stats.insert(stat_name, v);
+                                ETHTOOL_A_STATS_GRP_STAT_VALUE => {
+                                    stat_val = read_u64(stat_attr.payload);
                                 }
+                                _ => {}
                             }
                         }
-                        _ => {}
+                        if !stat_name.is_empty() {
+                            if let Some(v) = stat_val {
+                                stats.insert(stat_name, v);
+                            }
+                        }
                     }
                 }
             }

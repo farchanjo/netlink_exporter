@@ -2,7 +2,7 @@
 //!
 //! Netlink family: `NETLINK_SOCK_DIAG` (4).
 //! Messages used: `SOCK_DIAG_BY_FAMILY` (20) with `inet_diag_req_v2` for
-//! AF_INET + AF_INET6, IPPROTO_TCP + IPPROTO_UDP.
+//! `AF_INET` + `AF_INET6`, `IPPROTO_TCP` + `IPPROTO_UDP`.
 //!
 //! Wire reference: netlink-protocol.md §6.
 //! ADR refs: ADR-0011, ADR-0014.
@@ -36,13 +36,13 @@ use crate::transport::{MAX_DUMP_RESTARTS, NetlinkError, NetlinkSocket};
 /// `NETLINK_SOCK_DIAG` protocol constant (ADR-0011 §socket model).
 const NETLINK_SOCK_DIAG: i32 = 4;
 
-/// `SOCK_DIAG_BY_FAMILY` — msg_type for inet_diag requests.
+/// `SOCK_DIAG_BY_FAMILY` — `msg_type` for `inet_diag` requests.
 /// kernel: `include/uapi/linux/sock_diag.h`.
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 
 /// `inet_diag_req_v2` size: 56 bytes.
-/// Layout: sdiag_family(1) + sdiag_protocol(1) + idiag_ext(1) + pad(1)
-///       + idiag_states(4) + inet_diag_sockid(48) = 56.
+/// Layout: `sdiag_family(1)` + `sdiag_protocol(1)` + `idiag_ext(1)` + pad(1)
+///       + `idiag_states(4)` + `inet_diag_sockid(48)` = 56.
 const INET_DIAG_REQ_V2_LEN: usize = 56;
 
 /// Address families (netlink-protocol.md §6.5).
@@ -53,8 +53,8 @@ const AF_INET6: u8 = 10;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-/// `idiag_ext` bitmask: request INET_DIAG_SKMEMINFO (bit 5=0x20) +
-/// INET_DIAG_INFO (bit 1=0x02) for tcp_info retransmits.
+/// `idiag_ext` bitmask: request `INET_DIAG_SKMEMINFO` (bit 5=0x20) +
+/// `INET_DIAG_INFO` (bit 1=0x02) for `tcp_info` retransmits.
 /// Combined = 0x22 per §6.1.
 const IDIAG_EXT_SKMEMINFO_AND_INFO: u8 = 0x22;
 
@@ -73,10 +73,10 @@ const IDIAG_RQUEUE_OFFSET: usize = 56;
 /// `inet_diag_msg.idiag_wqueue` offset: 60.
 const IDIAG_WQUEUE_OFFSET: usize = 60;
 
-/// nlattr types in a sock_diag reply (netlink-protocol.md §6.3, §6.4).
-/// `INET_DIAG_INFO` nla_type = 2.
+/// nlattr types in a `sock_diag` reply (netlink-protocol.md §6.3, §6.4).
+/// `INET_DIAG_INFO` `nla_type` = 2.
 const INET_DIAG_INFO: u16 = 2;
-/// `INET_DIAG_SKMEMINFO` nla_type = 6.
+/// `INET_DIAG_SKMEMINFO` `nla_type` = 6.
 const INET_DIAG_SKMEMINFO: u16 = 6;
 
 /// Byte offset of `skmem_drop` within `INET_DIAG_SKMEMINFO` payload
@@ -136,7 +136,7 @@ enum SocketState {
     Listen,
     Closing,
     NewSynRecv,
-    /// UDP-only pseudo-state (maps from idiag_state=7 for UDP). G-12.
+    /// UDP-only pseudo-state (maps from `idiag_state=7` for UDP). G-12.
     Unconnected,
     /// Unknown kernel state value — bounded bucket for future-proofing.
     Other(u8),
@@ -205,8 +205,8 @@ struct Bucket {
 /// Adapter implementing [`NetlinkSockDiagPort`] and [`Collector`] for
 /// socket diagnostics via `NETLINK_SOCK_DIAG` (protocol 4).
 ///
-/// Issues four dump requests per scrape (AF_INET×{TCP,UDP} and
-/// AF_INET6×{TCP,UDP}) and aggregates counts by `(protocol, state)`.
+/// Issues four dump requests per scrape (`AF_INET×{TCP,UDP`} and
+/// `AF_INET6×{TCP,UDP`}) and aggregates counts by `(protocol, state)`.
 pub struct SockDiagCollector;
 
 impl NetlinkSockDiagPort for SockDiagCollector {
@@ -219,7 +219,7 @@ impl NetlinkSockDiagPort for SockDiagCollector {
 }
 
 impl Collector for SockDiagCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "sock_diag"
     }
 
@@ -246,6 +246,10 @@ impl Collector for SockDiagCollector {
 // ---------------------------------------------------------------------------
 
 /// Collect socket diagnostics and produce `MetricSample`s.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge values are f64; precision loss on large counters is inherent to Prometheus exposition"
+)]
 async fn collect_sockdiag() -> Result<Vec<MetricSample>, CollectError> {
     let mut sock =
         NetlinkSocket::open(NETLINK_SOCK_DIAG).map_err(|e| CollectError::Io(e.to_string()))?;
@@ -372,7 +376,6 @@ async fn dump_one_family(
                     attempt,
                     family, proto, "SOCK_DIAG dump interrupted; retrying"
                 );
-                continue;
             }
             Err(e) => return Err(e),
         }
@@ -403,18 +406,18 @@ fn parse_frame(
     let state = SocketState::from_kernel(frame[IDIAG_STATE_OFFSET], is_udp);
 
     // idiag_rqueue @ offset 56 (u32 LE) per §10.
-    let rqueue = u32::from_le_bytes(
+    let rqueue = u64::from(u32::from_le_bytes(
         frame[IDIAG_RQUEUE_OFFSET..IDIAG_RQUEUE_OFFSET + 4]
             .try_into()
             .map_err(|_| "idiag_rqueue slice error".to_owned())?,
-    ) as u64;
+    ));
 
     // idiag_wqueue @ offset 60 (u32 LE).
-    let wqueue = u32::from_le_bytes(
+    let wqueue = u64::from(u32::from_le_bytes(
         frame[IDIAG_WQUEUE_OFFSET..IDIAG_WQUEUE_OFFSET + 4]
             .try_into()
             .map_err(|_| "idiag_wqueue slice error".to_owned())?,
-    ) as u64;
+    ));
 
     // Accumulate into bucket.
     let bucket = bucket_map.entry(SockKey { protocol, state }).or_default();
@@ -432,22 +435,22 @@ fn parse_frame(
             INET_DIAG_SKMEMINFO => {
                 // 9 × u32 LE; skmem_drop at index 8 (offset 32). G-13.
                 if nla.payload.len() >= SKMEMINFO_DROP_OFFSET + 4 {
-                    let drop_val = u32::from_le_bytes(
+                    let drop_val = u64::from(u32::from_le_bytes(
                         nla.payload[SKMEMINFO_DROP_OFFSET..SKMEMINFO_DROP_OFFSET + 4]
                             .try_into()
                             .map_err(|_| "skmem_drop slice error".to_owned())?,
-                    ) as u64;
+                    ));
                     *drops.entry(protocol).or_insert(0) += drop_val;
                 }
             }
             INET_DIAG_INFO if !is_udp => {
                 // tcp_info blob; tcpi_retransmits at offset 12 (u32 LE). G-14.
                 if nla.payload.len() >= TCP_INFO_RETRANSMITS_OFFSET + 4 {
-                    let r = u32::from_le_bytes(
+                    let r = u64::from(u32::from_le_bytes(
                         nla.payload[TCP_INFO_RETRANSMITS_OFFSET..TCP_INFO_RETRANSMITS_OFFSET + 4]
                             .try_into()
                             .map_err(|_| "tcp retransmits slice error".to_owned())?,
-                    ) as u64;
+                    ));
                     *retransmits += r;
                 }
             }

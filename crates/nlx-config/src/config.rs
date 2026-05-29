@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Each flag corresponds to one [`nlx_ports::collector::Collector`]
 /// implementation.  Disabled collectors are skipped at startup probe time and
 /// produce no metric series.
+#[allow(clippy::struct_excessive_bools, reason = "collector enable flags")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectorFlags {
@@ -43,7 +44,7 @@ impl Default for CollectorFlags {
     /// All 13 collectors are **default-enabled**.
     ///
     /// Runtime availability for the kernel-subsystem-gated collectors (ethtool,
-    /// ipvs, wireguard, devlink, drop_monitor, xfrm) is decided by
+    /// ipvs, wireguard, devlink, `drop_monitor`, xfrm) is decided by
     /// `probe_available()` at scrape time, not by these flags.  Setting a flag
     /// to `false` here is an **operator opt-out**, not a signal that the
     /// subsystem is absent.  Shipping with these flags as `false` would hide
@@ -86,9 +87,15 @@ mod tests {
             flags.rtnetlink_extended,
             "rtnetlink_extended must default to true"
         );
-        assert!(flags.traffic_control, "traffic_control must default to true");
+        assert!(
+            flags.traffic_control,
+            "traffic_control must default to true"
+        );
         assert!(flags.conntrack, "conntrack must default to true");
-        assert!(flags.conntrack_expect, "conntrack_expect must default to true");
+        assert!(
+            flags.conntrack_expect,
+            "conntrack_expect must default to true"
+        );
         assert!(flags.nftables, "nftables must default to true");
         assert!(flags.sock_diag, "sock_diag must default to true");
         assert!(flags.ethtool, "ethtool must default to true");
@@ -126,7 +133,7 @@ pub struct ExporterConfig {
     /// Optional regex for interface names to exclude (none if `None`).
     pub interface_exclude_regex: Option<String>,
 
-    /// Maximum number of WireGuard peers to export per interface.
+    /// Maximum number of `WireGuard` peers to export per interface.
     pub wireguard_max_peers: usize,
 
     /// Collector enable flags.

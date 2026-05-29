@@ -2,17 +2,17 @@
 //!
 //! Netlink family: `NETLINK_ROUTE` (0).
 //! Messages used: `RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`, `RTM_GETNEIGH`.
-//! ADR refs: ADR-0011 (direct wire), ADR-0014 (tokio AsyncFd confinement).
+//! ADR refs: ADR-0011 (direct wire), ADR-0014 (tokio `AsyncFd` confinement).
 //!
 //! ## Wire layout references (netlink-protocol.md §4)
 //!
 //! - `ifinfomsg` 16 B: family(1) pad(1) type(2) index(4) flags(4) change(4)
 //! - `ifaddrmsg` 8 B: family(1) prefixlen(1) flags(1) scope(1) index(4)
-//! - `rtmsg` 12 B: family(1) dst_len(1) src_len(1) tos(1) table(1) proto(1)
+//! - `rtmsg` 12 B: family(1) `dst_len(1)` `src_len(1)` tos(1) table(1) proto(1)
 //!   scope(1) type(1) flags(4)
 //! - `ndmsg` 12 B: family(1) pad1(1) pad2(2) ifindex(4) state(2) flags(1)
 //!   type(1)
-//! - `rtnl_link_stats64` at IFLA_STATS64: 192-200 B of u64 LE fields
+//! - `rtnl_link_stats64` at `IFLA_STATS64`: 192-200 B of u64 LE fields
 
 use std::collections::BTreeMap;
 
@@ -46,7 +46,6 @@ const RTM_GETROUTE: u16 = 26;
 const RTM_GETNEIGH: u16 = 30;
 
 // Address families
-const AF_UNSPEC: u8 = 0;
 const AF_BRIDGE: u8 = 7;
 
 // IFF flags (ifi_flags)
@@ -142,15 +141,15 @@ fn decode_ifname(payload: &[u8]) -> Option<String> {
     std::str::from_utf8(trimmed).ok().map(str::to_owned)
 }
 
-/// Build a zeroed `ifinfomsg` (16 bytes), ifi_family=AF_UNSPEC, for a full
-/// RTM_GETLINK dump. A correctly-sized fixed header is mandatory when the
-/// kernel has NETLINK_GET_STRICT_CHK enabled — a short `rtgenmsg` yields
+/// Build a zeroed `ifinfomsg` (16 bytes), `ifi_family=AF_UNSPEC`, for a full
+/// `RTM_GETLINK` dump. A correctly-sized fixed header is mandatory when the
+/// kernel has `NETLINK_GET_STRICT_CHK` enabled — a short `rtgenmsg` yields
 /// EINVAL and an empty dump.
 fn ifinfomsg_payload() -> [u8; 16] {
     [0u8; 16]
 }
 
-/// Build a zeroed `ifaddrmsg` (8 bytes) for a full RTM_GETADDR dump.
+/// Build a zeroed `ifaddrmsg` (8 bytes) for a full `RTM_GETADDR` dump.
 fn ifaddrmsg_payload() -> [u8; 8] {
     [0u8; 8]
 }
@@ -160,7 +159,7 @@ fn rtmsg_payload() -> [u8; 12] {
     [0u8; 12]
 }
 
-/// Build a zeroed `ndmsg` (12 bytes) for a full RTM_GETNEIGH dump.
+/// Build a zeroed `ndmsg` (12 bytes) for a full `RTM_GETNEIGH` dump.
 fn ndmsg_payload() -> [u8; 12] {
     [0u8; 12]
 }
@@ -373,14 +372,14 @@ fn count_addresses(frames: &[Vec<u8>]) -> BTreeMap<String, u64> {
 // Route count (RTM_GETROUTE)
 // ---------------------------------------------------------------------------
 
-/// Key for aggregating routes: (family_label, table_str).
+/// Key for aggregating routes: (`family_label`, `table_str`).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct RouteKey {
     family: String,
     table: String,
 }
 
-/// Count routes by (family, table). Parse `rtmsg` (12 B) + RTA_TABLE attr.
+/// Count routes by (family, table). Parse `rtmsg` (12 B) + `RTA_TABLE` attr.
 fn count_routes(frames: &[Vec<u8>]) -> BTreeMap<RouteKey, u64> {
     let mut counts: BTreeMap<RouteKey, u64> = BTreeMap::new();
     for frame in frames {
@@ -417,7 +416,7 @@ fn count_routes(frames: &[Vec<u8>]) -> BTreeMap<RouteKey, u64> {
 // Neighbour count (RTM_GETNEIGH)
 // ---------------------------------------------------------------------------
 
-/// Key for aggregating neighbours: (family_label, state_label).
+/// Key for aggregating neighbours: (`family_label`, `state_label`).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct NeighKey {
     family: String,
@@ -425,7 +424,7 @@ struct NeighKey {
 }
 
 /// Count neighbours by (family, state). Parse `ndmsg` (12 B).
-/// Skip AF_BRIDGE entries.
+/// Skip `AF_BRIDGE` entries.
 fn count_neighbours(frames: &[Vec<u8>]) -> BTreeMap<NeighKey, u64> {
     let mut counts: BTreeMap<NeighKey, u64> = BTreeMap::new();
     for frame in frames {
@@ -478,10 +477,14 @@ impl NetlinkRtPort for RtCollector {
 }
 
 impl Collector for RtCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "rtnetlink"
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "metric gauge values are f64; precision loss on large u64 counters is inherent to Prometheus exposition"
+    )]
     fn collect(&self) -> BoxFuture<'_, Result<Vec<MetricSample>, CollectError>> {
         Box::pin(async move {
             let mut sock =

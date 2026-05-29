@@ -20,14 +20,14 @@
 //! - [`NetlinkSockDiagPort`] — `NETLINK_SOCK_DIAG`.
 //! - [`NetlinkEthtoolPort`] — ethtool genetlink family.
 //! - [`NetlinkIpvsPort`] — IPVS genetlink family.
-//! - [`NetlinkWireguardPort`] — WireGuard genetlink family.
+//! - [`NetlinkWireguardPort`] — `WireGuard` genetlink family.
 //! - [`NetlinkDevlinkPort`] — devlink genetlink family.
 //! - [`NetlinkDropMonitorPort`] — drop-monitor genetlink family.
 //! - [`NetlinkXfrmPort`] — `NETLINK_XFRM`.
 //!
 //! ## Infrastructure ports
 //!
-//! - [`MetricRegistryPort`] — OpenMetrics text exposition.
+//! - [`MetricRegistryPort`] — `OpenMetrics` text exposition.
 //! - [`ClockPort`] — monotonic clock abstraction for testability.
 //! - [`ConfigPort`] — runtime configuration access.
 
@@ -275,10 +275,10 @@ pub trait NetlinkIpvsPort: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Vec<IpvsDestination>, DomainError>> + Send;
 }
 
-/// Driven port for the WireGuard genetlink family (`WG_CMD_GET_DEVICE`).
+/// Driven port for the `WireGuard` genetlink family (`WG_CMD_GET_DEVICE`).
 /// Adapter: `nlx-netlink` (ADR-0011).
 pub trait NetlinkWireguardPort: Send + Sync {
-    /// Dump WireGuard device and peer metadata.
+    /// Dump `WireGuard` device and peer metadata.
     ///
     /// # Errors
     ///
@@ -381,7 +381,7 @@ pub trait NetlinkXfrmPort: Send + Sync {
 // Infrastructure driven ports
 // ---------------------------------------------------------------------------
 
-/// Driven port for OpenMetrics text exposition.
+/// Driven port for `OpenMetrics` text exposition.
 ///
 /// The `nlx-metrics` adapter implements this using `prometheus-client`.
 pub trait MetricRegistryPort: Send + Sync {
@@ -400,7 +400,7 @@ pub trait MetricRegistryPort: Send + Sync {
         samples: Vec<MetricSample>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
-    /// Encode the current registry state as an OpenMetrics text body.
+    /// Encode the current registry state as an `OpenMetrics` text body.
     ///
     /// Returns the UTF-8 encoded text exposition suitable for HTTP response.
     ///

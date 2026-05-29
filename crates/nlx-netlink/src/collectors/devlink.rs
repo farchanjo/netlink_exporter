@@ -91,10 +91,14 @@ impl NetlinkDevlinkPort for DevlinkCollector {
 }
 
 impl Collector for DevlinkCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "devlink"
     }
 
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "metric gauge/counter values are f64; precision loss on large counters is inherent to Prometheus exposition"
+    )]
     fn collect(&self) -> BoxFuture<'_, Result<Vec<MetricSample>, CollectError>> {
         Box::pin(async move {
             let mut sock = NetlinkSocket::open(NETLINK_GENERIC)
@@ -299,6 +303,10 @@ fn genl_payload(cmd: u8) -> Vec<u8> {
     vec![cmd, DEVLINK_GENL_VERSION, 0u8, 0u8]
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nlattr length fits u16 by construction; kernel rejects NLA payloads larger than 65535 bytes"
+)]
 fn push_nla(buf: &mut Vec<u8>, ty: u16, payload: &[u8]) {
     let nla_len = (NLA_HDRLEN + payload.len()) as u16;
     buf.extend_from_slice(&nla_len.to_ne_bytes());

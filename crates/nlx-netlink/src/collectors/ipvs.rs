@@ -15,7 +15,7 @@
 //!
 //! - `IPVS_SVC_ATTR_STATS64` is type **12**, not 11 (11 is `IPVS_SVC_ATTR_PE_NAME`).
 //! - `GET_DEST` requests wrap service key attrs inside `IPVS_CMD_ATTR_SERVICE`
-//!   (type=1) NLA_NESTED container — the kernel's handler rejects top-level attrs.
+//!   (type=1) `NLA_NESTED` container — the kernel's handler rejects top-level attrs.
 //! - Dest address family is read from `IPVS_DEST_ATTR_ADDR_FAMILY` (id=11) with
 //!   fallback to service AF; the old colon-check fails for fwmark services.
 //! - STATS32 fallback: when STATS64 absent, parse STATS (type=10) u32 fields and
@@ -46,7 +46,9 @@ use tracing::debug;
 
 use crate::{
     transport::NetlinkSocket,
-    wire::{NLA_HDRLEN, align4, nested_attrs, parse_attrs, read_u16, read_u16_be, read_u32, read_u64},
+    wire::{
+        NLA_HDRLEN, align4, nested_attrs, parse_attrs, read_u16, read_u16_be, read_u32, read_u64,
+    },
 };
 
 const NETLINK_GENERIC: i32 = 16;
@@ -137,7 +139,7 @@ impl NetlinkIpvsPort for IpvsCollector {
 }
 
 impl Collector for IpvsCollector {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ipvs"
     }
 
@@ -276,12 +278,16 @@ fn build_genl_payload(cmd: u8) -> Vec<u8> {
     vec![cmd, IPVS_GENL_VERSION, 0, 0]
 }
 
-/// Build a GET_DEST request with service key attrs wrapped in
-/// `IPVS_CMD_ATTR_SERVICE` (type=1) NLA_NESTED container.
+/// Build a `GET_DEST` request with service key attrs wrapped in
+/// `IPVS_CMD_ATTR_SERVICE` (type=1) `NLA_NESTED` container.
 ///
 /// The kernel `GET_DEST` handler calls `nlmsg_parse()` expecting service key
 /// attrs inside this outer nest (§13.7 / G-34). Omitting the nest returns
 /// `EINVAL` or an empty multipart response.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "nlattr length fits u16 by construction; NLA payloads are bounded to u16::MAX by the kernel ABI"
+)]
 fn build_dest_request(svc: &IpvsService) -> Vec<u8> {
     let mut buf = vec![IPVS_CMD_GET_DEST, IPVS_GENL_VERSION, 0u8, 0u8];
 
@@ -410,6 +416,10 @@ fn parse_stats32(payload: &[u8]) -> Stats64 {
     s
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "signature kept uniform with sibling parsers"
+)]
 fn parse_service(attrs_buf: &[u8]) -> Option<IpvsService> {
     let mut af: u16 = AF_INET;
     let mut proto: u16 = 0;
@@ -491,11 +501,19 @@ fn parse_service(attrs_buf: &[u8]) -> Option<IpvsService> {
     })
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "signature kept uniform with sibling parsers"
+)]
 fn parse_destination(attrs_buf: &[u8], svc: &IpvsService) -> Option<IpvsDestination> {
     // Prefer IPVS_DEST_ATTR_ADDR_FAMILY (id=11) for AF.
     // Fallback: derive from service AF (not from svc.vip colon-check, which
     // fails for fwmark services where vip is empty — §13.6 / G-35).
-    let svc_af: u16 = if svc.vip.contains(':') { AF_INET6 } else { AF_INET };
+    let svc_af: u16 = if svc.vip.contains(':') {
+        AF_INET6
+    } else {
+        AF_INET
+    };
 
     let mut dest_af: Option<u16> = None;
     let mut addr_bytes: Option<Vec<u8>> = None;
@@ -578,6 +596,10 @@ fn svc_labels(svc: &IpvsService) -> BTreeMap<String, String> {
     m
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "metric gauge values are f64; precision loss on large u64 counters is inherent to Prometheus exposition"
+)]
 fn push_svc_metrics(
     out: &mut Vec<MetricSample>,
     svc: &IpvsService,
@@ -712,6 +734,12 @@ fn push_dest_metrics(out: &mut Vec<MetricSample>, svc: &IpvsService, dest: &Ipvs
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    reason = "test code; inputs are controlled constants and truncation is safe for test NLA sizes"
+)]
 mod tests {
     use super::*;
     use crate::wire::NLA_HDRLEN;
@@ -728,7 +756,7 @@ mod tests {
         out
     }
 
-    /// Build a nested NLA (NLA_F_NESTED | type) wrapping inner bytes.
+    /// Build a nested NLA (`NLA_F_NESTED` | type) wrapping inner bytes.
     fn make_nested(ty: u16, inner: &[u8]) -> Vec<u8> {
         make_nla(ty | 0x8000, inner)
     }
@@ -821,7 +849,10 @@ mod tests {
         buf.extend(make_nested(IPVS_SVC_ATTR_STATS64, &stats64)); // type=12
 
         let svc = parse_service(&buf).expect("parse_service must return Some");
-        assert_eq!(svc.conns, 999, "STATS64 (type=12) must win over STATS32 (type=10)");
+        assert_eq!(
+            svc.conns, 999,
+            "STATS64 (type=12) must win over STATS32 (type=10)"
+        );
     }
 
     // --- parse_service: falls back to STATS32 when STATS64 absent ---
@@ -857,7 +888,10 @@ mod tests {
 
         let svc = parse_service(&buf).expect("parse_service pe_name test");
         // Stats must be default zero — type 11 must NOT be parsed as stats64
-        assert_eq!(svc.conns, 0, "type=11 is PE_NAME; must not be mistaken for STATS64");
+        assert_eq!(
+            svc.conns, 0,
+            "type=11 is PE_NAME; must not be mistaken for STATS64"
+        );
     }
 
     // --- build_dest_request wraps attrs in IPVS_CMD_ATTR_SERVICE nest ---
@@ -888,7 +922,10 @@ mod tests {
 
         // Next NLA must be IPVS_CMD_ATTR_SERVICE (type=1, possibly with NLA_F_NESTED bit).
         let top_attrs: Vec<_> = parse_attrs(&payload[4..]).collect();
-        assert!(!top_attrs.is_empty(), "must have at least one top-level NLA");
+        assert!(
+            !top_attrs.is_empty(),
+            "must have at least one top-level NLA"
+        );
         assert_eq!(
             top_attrs[0].ty, IPVS_CMD_ATTR_SERVICE,
             "first top-level NLA must be IPVS_CMD_ATTR_SERVICE (type=1)"
@@ -901,11 +938,17 @@ mod tests {
 
         // Must contain IPVS_SVC_ATTR_PROTOCOL (type=2) for ip:port service.
         let has_proto = inner_attrs.iter().any(|a| a.ty == IPVS_SVC_ATTR_PROTOCOL);
-        assert!(has_proto, "service nest must contain IPVS_SVC_ATTR_PROTOCOL for ip:port service");
+        assert!(
+            has_proto,
+            "service nest must contain IPVS_SVC_ATTR_PROTOCOL for ip:port service"
+        );
 
         // Must contain IPVS_SVC_ATTR_PORT (type=4) with big-endian 80.
         let port_attr = inner_attrs.iter().find(|a| a.ty == IPVS_SVC_ATTR_PORT);
-        assert!(port_attr.is_some(), "service nest must contain IPVS_SVC_ATTR_PORT");
+        assert!(
+            port_attr.is_some(),
+            "service nest must contain IPVS_SVC_ATTR_PORT"
+        );
         let port_val = read_u16_be(port_attr.unwrap().payload).expect("port must be readable");
         assert_eq!(port_val, 80u16, "port must be 80 (big-endian on wire)");
     }
@@ -937,9 +980,15 @@ mod tests {
 
         let inner_attrs: Vec<_> = parse_attrs(top_attrs[0].payload).collect();
         let has_fwmark = inner_attrs.iter().any(|a| a.ty == IPVS_SVC_ATTR_FWMARK);
-        assert!(has_fwmark, "fwmark service must contain IPVS_SVC_ATTR_FWMARK");
+        assert!(
+            has_fwmark,
+            "fwmark service must contain IPVS_SVC_ATTR_FWMARK"
+        );
         let has_port = inner_attrs.iter().any(|a| a.ty == IPVS_SVC_ATTR_PORT);
-        assert!(!has_port, "fwmark service must NOT contain IPVS_SVC_ATTR_PORT");
+        assert!(
+            !has_port,
+            "fwmark service must NOT contain IPVS_SVC_ATTR_PORT"
+        );
     }
 
     // --- parse_destination: reads IPVS_DEST_ATTR_ADDR_FAMILY (id=11) for AF ---
@@ -968,7 +1017,10 @@ mod tests {
         // IPv6 loopback ::1
         let v6_addr: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         let mut buf = Vec::new();
-        buf.extend(make_nla(IPVS_DEST_ATTR_ADDR_FAMILY, &AF_INET6.to_ne_bytes()));
+        buf.extend(make_nla(
+            IPVS_DEST_ATTR_ADDR_FAMILY,
+            &AF_INET6.to_ne_bytes(),
+        ));
         buf.extend(make_nla(IPVS_DEST_ATTR_ADDR, &v6_addr));
         buf.extend(make_nla(IPVS_DEST_ATTR_PORT, &9100u16.to_be_bytes()));
         buf.extend(make_nla(IPVS_DEST_ATTR_WEIGHT, &1u32.to_ne_bytes()));
