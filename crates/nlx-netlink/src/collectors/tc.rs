@@ -42,8 +42,6 @@ const RTM_GETQDISC: u16 = 38;
 /// `RTM_GETLINK` — used to build the ifindex → name map.
 const RTM_GETLINK: u16 = 18;
 
-const AF_UNSPEC: u8 = 0;
-
 // TCA_* attribute types
 const TCA_KIND: u16 = 1;
 const TCA_STATS2: u16 = 7;
@@ -59,9 +57,11 @@ const IFLA_IFNAME: u16 = 3;
 // Payload builders
 // ---------------------------------------------------------------------------
 
-/// Minimal `rtgenmsg` payload (1 byte, AF_UNSPEC) for RTM_GETLINK dump.
-fn rtgenmsg_payload() -> [u8; 1] {
-    [AF_UNSPEC]
+/// `ifinfomsg` payload (16 bytes, ifi_family=AF_UNSPEC) for the RTM_GETLINK
+/// dump used to build the ifindex→name map. A short rtgenmsg is rejected under
+/// NETLINK_GET_STRICT_CHK (empty dump → every device resolves to "unknown").
+fn ifinfomsg_payload() -> [u8; 16] {
+    [0u8; 16]
 }
 
 /// `tcmsg` payload for RTM_GETQDISC dump: 20 bytes all-zero except family=0.
@@ -112,7 +112,7 @@ fn nl_err_to_collect(e: NetlinkError) -> CollectError {
 async fn build_ifindex_map(
     sock: &mut NetlinkSocket,
 ) -> Result<BTreeMap<i32, String>, NetlinkError> {
-    let frames = dump_with_retries(sock, RTM_GETLINK, &rtgenmsg_payload()).await?;
+    let frames = dump_with_retries(sock, RTM_GETLINK, &ifinfomsg_payload()).await?;
     let mut map = BTreeMap::new();
     for frame in &frames {
         // ifinfomsg: 16 bytes; ifi_index at offset 4 (i32 LE).
