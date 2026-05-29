@@ -564,6 +564,7 @@ dependencies = [
  "nlx-domain",
  "nlx-ports",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

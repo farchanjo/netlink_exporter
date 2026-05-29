@@ -36,9 +36,10 @@ use arc_swap::ArcSwap;
 
 use nlx_domain::metric::{MetricKind, MetricSample, MetricValue};
 use nlx_ports::driven::MetricRegistryPort;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as FmtWrite;
 use thiserror::Error;
+use tracing::warn;
 
 /// Errors emitted by the prometheus-client adapter.
 #[derive(Debug, Error)]
@@ -86,6 +87,20 @@ impl Default for PrometheusRegistryAdapter {
 
 impl MetricRegistryPort for PrometheusRegistryAdapter {
     async fn update_samples(&self, samples: Vec<MetricSample>) -> Result<(), String> {
+        // Observability for the dedup guard in `encode_samples`: if any collector
+        // emitted the same metric name with an identical label set, the guard
+        // silently drops the later copies to keep /metrics scrapeable — but that
+        // masks a collector bug, so surface it loudly here.
+        let dups = duplicate_series(&samples);
+        if !dups.is_empty() {
+            warn!(
+                duplicate_metric_count = dups.len(),
+                metrics = ?dups,
+                "dropped duplicate metric series before encoding — a collector \
+                 emitted a metric name with an identical label set more than once \
+                 (likely a bug); keeping the first occurrence so the scrape stays valid"
+            );
+        }
         let text = encode_samples(&samples).map_err(|e| e.to_string())?;
         // Atomic RCU store — no lock, no blocking, safe from any thread.
         self.encoded.store(Arc::new(Arc::from(text.as_str())));
@@ -110,6 +125,16 @@ impl MetricRegistryPort for PrometheusRegistryAdapter {
 /// sorted for deterministic output.  No `# EOF` trailer is emitted — the body
 /// is classic 0.0.4, not `OpenMetrics` (see module docs).
 ///
+/// # Dedup guard
+///
+/// Within each metric name, an identical label set is emitted **once** — the
+/// first occurrence wins; later duplicates are dropped. Two sample lines with
+/// the same name and label set are a duplicate series, which Prometheus rejects
+/// on scrape ("duplicate sample for timestamp") and which drops the **entire**
+/// `/metrics` payload, not just the offending metric. This guard guarantees the
+/// body is always valid even if a collector regresses; [`update_samples`] logs a
+/// warning when it fires so the underlying collector bug stays visible.
+///
 /// # Errors
 ///
 /// Returns [`RegistryError::Encode`] if string formatting fails (practically
@@ -121,9 +146,13 @@ fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
         let entry = groups.entry(sample.name).or_insert_with(|| GroupEntry {
             help: sample.help,
             kind: sample.kind,
+            seen: HashSet::new(),
             observations: Vec::new(),
         });
-        entry.observations.push((&sample.labels, &sample.value));
+        // Dedup guard: keep only the first observation per unique label set.
+        if entry.seen.insert(series_key(&sample.labels)) {
+            entry.observations.push((&sample.labels, &sample.value));
+        }
     }
 
     let mut out = String::with_capacity(samples.len().saturating_mul(64));
@@ -148,7 +177,37 @@ fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
 struct GroupEntry<'a> {
     help: &'static str,
     kind: MetricKind,
+    /// Label-set keys already emitted for this metric name (dedup guard).
+    seen: HashSet<String>,
     observations: Vec<(&'a BTreeMap<String, String>, &'a MetricValue)>,
+}
+
+/// Canonical, collision-resistant key for a label set (a "series" identity
+/// within a metric name). Keys are sorted by `BTreeMap` iteration; `\u{1}` /
+/// `\u{2}` separators cannot appear in label keys (`[a-zA-Z_][a-zA-Z0-9_]*`).
+fn series_key(labels: &BTreeMap<String, String>) -> String {
+    let mut key = String::new();
+    for (k, v) in labels {
+        key.push_str(k);
+        key.push('\u{1}');
+        key.push_str(v);
+        key.push('\u{2}');
+    }
+    key
+}
+
+/// Return the metric names that appear more than once with an identical label
+/// set in `samples` (i.e. the series the dedup guard in [`encode_samples`] will
+/// collapse). Empty when every series is unique.
+fn duplicate_series(samples: &[MetricSample]) -> Vec<&'static str> {
+    let mut seen: HashSet<(&str, String)> = HashSet::new();
+    let mut dups: BTreeSet<&'static str> = BTreeSet::new();
+    for s in samples {
+        if !seen.insert((s.name, series_key(&s.labels))) {
+            dups.insert(s.name);
+        }
+    }
+    dups.into_iter().collect()
 }
 
 /// Prometheus metric type string.
@@ -513,6 +572,81 @@ mod tests {
             !between.contains("nft_other "),
             "interleaved family broke grouping: {text}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dedup guard: identical (name, label-set) must collapse to one series
+    // -----------------------------------------------------------------------
+
+    /// Two observations with the same name AND label set must emit exactly one
+    /// sample line (the first occurrence wins) — never a duplicate series, which
+    /// would make Prometheus reject the whole scrape.
+    #[test]
+    fn encode_samples_dedups_identical_series() {
+        let samples = vec![
+            MetricSample::gauge("nft_dup", "Dup.", BTreeMap::new(), 100.0),
+            MetricSample::gauge("nft_dup", "Dup.", BTreeMap::new(), 200.0),
+        ];
+        let text = encode_samples(&samples).expect("encode ok");
+        let sample_lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            sample_lines.len(),
+            1,
+            "duplicate series must collapse to one line: {text}"
+        );
+        assert!(
+            text.contains("nft_dup 100"),
+            "first occurrence kept: {text}"
+        );
+        assert!(
+            !text.contains("nft_dup 200"),
+            "later duplicate must be dropped: {text}"
+        );
+    }
+
+    /// Same metric name with DIFFERENT label sets are distinct series and must
+    /// both be emitted — the guard must not over-collapse.
+    #[test]
+    fn encode_samples_keeps_distinct_label_sets() {
+        let mut la = BTreeMap::new();
+        la.insert("if".to_owned(), "a".to_owned());
+        let mut lb = BTreeMap::new();
+        lb.insert("if".to_owned(), "b".to_owned());
+        let samples = vec![
+            MetricSample::gauge("nft_x", "X.", la, 1.0),
+            MetricSample::gauge("nft_x", "X.", lb, 2.0),
+        ];
+        let text = encode_samples(&samples).expect("encode ok");
+        let sample_lines = text.lines().filter(|l| !l.starts_with('#')).count();
+        assert_eq!(
+            sample_lines, 2,
+            "distinct label sets must NOT be deduped: {text}"
+        );
+    }
+
+    /// `duplicate_series` reports the metric name when a series repeats.
+    #[test]
+    fn duplicate_series_detects_repeats() {
+        let samples = vec![
+            MetricSample::counter("nft_a", "A.", BTreeMap::new(), 1),
+            MetricSample::counter("nft_a", "A.", BTreeMap::new(), 2),
+            MetricSample::gauge("nft_b", "B.", BTreeMap::new(), 3.0),
+        ];
+        assert_eq!(duplicate_series(&samples), vec!["nft_a"]);
+    }
+
+    /// `duplicate_series` is empty when every (name, label-set) is unique.
+    #[test]
+    fn duplicate_series_empty_when_unique() {
+        let mut la = BTreeMap::new();
+        la.insert("k".to_owned(), "1".to_owned());
+        let mut lb = BTreeMap::new();
+        lb.insert("k".to_owned(), "2".to_owned());
+        let samples = vec![
+            MetricSample::gauge("nft_a", "A.", la, 1.0),
+            MetricSample::gauge("nft_a", "A.", lb, 2.0),
+        ];
+        assert!(duplicate_series(&samples).is_empty());
     }
 
     // -----------------------------------------------------------------------
