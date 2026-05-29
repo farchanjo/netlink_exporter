@@ -1,5 +1,5 @@
 //! `PrometheusRegistryAdapter` — implements `MetricRegistryPort` via
-//! hand-encoded Prometheus/OpenMetrics text.
+//! hand-encoded Prometheus text (exposition format version 0.0.4).
 //!
 //! # ADR-0006 deviation
 //!
@@ -14,6 +14,15 @@
 //! **Decision**: hand-encode the Prometheus text format from `MetricSample`
 //! values.  This produces spec-compliant output, keeps the adapter simple, and
 //! avoids forcing the domain model to conform to the library's type constraints.
+//!
+//! # Exposition format
+//!
+//! The body is classic Prometheus text **version 0.0.4** — the format declared
+//! by the HTTP adapter's `Content-Type` (`text/plain; version=0.0.4`). This is
+//! deliberately **not** `OpenMetrics`: counter `# TYPE` lines keep the `_total`
+//! suffix and the body carries **no `# EOF` trailer** (the `OpenMetrics`
+//! terminator). Mixing the `OpenMetrics` trailer into a 0.0.4-typed body is a
+//! format inconsistency, so it is not emitted.
 //!
 //! # ADR-0023 — lock-free storage
 //!
@@ -39,7 +48,7 @@ pub enum RegistryError {
     Encode(String),
 }
 
-/// Driven adapter that maps [`MetricSample`]s into Prometheus/OpenMetrics text.
+/// Driven adapter that maps [`MetricSample`]s into Prometheus text (0.0.4).
 ///
 /// The encoded body is stored after every [`MetricRegistryPort::update_samples`]
 /// call.  The HTTP `/metrics` handler reads it via
@@ -94,11 +103,12 @@ impl MetricRegistryPort for PrometheusRegistryAdapter {
 // Text encoding
 // ---------------------------------------------------------------------------
 
-/// Produce a valid Prometheus/OpenMetrics text exposition from `samples`.
+/// Produce a valid Prometheus text exposition (version 0.0.4) from `samples`.
 ///
 /// Groups by metric name; emits one `# HELP` + `# TYPE` header per name,
 /// followed by all sample lines.  Within a name group, label sets are
-/// sorted for deterministic output.
+/// sorted for deterministic output.  No `# EOF` trailer is emitted — the body
+/// is classic 0.0.4, not `OpenMetrics` (see module docs).
 ///
 /// # Errors
 ///
@@ -130,9 +140,6 @@ fn encode_samples(samples: &[MetricSample]) -> Result<String, RegistryError> {
                 .map_err(|e| RegistryError::Encode(e.to_string()))?;
         }
     }
-
-    // OpenMetrics spec: body MUST end with "# EOF\n".
-    out.push_str("# EOF\n");
 
     Ok(out)
 }
@@ -166,13 +173,13 @@ fn escape_help(s: &str) -> String {
     out
 }
 
-/// Escape a label value per the `OpenMetrics` text-format spec.
+/// Escape a label value per the Prometheus 0.0.4 text-format spec.
 ///
 /// Defined escapes: `\` → `\\`, `"` → `\"`, newline → `\n`.
 ///
 /// Non-printable ASCII control characters below `U+0020` (other than the
 /// newline `U+000A` which receives its own escape above) are **stripped**.
-/// The OpenMetrics/Prometheus text format defines no escape sequence for
+/// The Prometheus/OpenMetrics text format defines no escape sequence for
 /// arbitrary control bytes; including them unescaped causes spec-violating
 /// output that parsers may reject or misinterpret.  Stripping is the safe
 /// conforming choice (SEC-INFO-002).
@@ -288,7 +295,32 @@ mod tests {
             text.contains(r#"nft_scrape_collector_error_total{collector="rtnetlink"} 7"#),
             "missing labelled counter value"
         );
-        assert!(text.ends_with("# EOF\n"), "missing EOF marker");
+    }
+
+    /// The body is classic 0.0.4 — it must NOT carry the `OpenMetrics` `# EOF`
+    /// trailer, because the HTTP adapter serves `Content-Type: text/plain;
+    /// version=0.0.4`. A trailing `OpenMetrics` marker under a 0.0.4
+    /// content-type is a format inconsistency (parses as a comment; should not
+    /// exist).
+    #[test]
+    fn encode_samples_has_no_openmetrics_eof_trailer() {
+        let samples = vec![MetricSample::gauge(
+            "nft_up",
+            "Exporter up.",
+            BTreeMap::new(),
+            1.0,
+        )];
+        let text = encode_samples(&samples).expect("encode ok");
+        assert!(
+            !text.contains("# EOF"),
+            "0.0.4 body must not contain the OpenMetrics # EOF trailer: {text}"
+        );
+        // The body still ends with a newline-terminated sample line.
+        assert!(text.ends_with('\n'), "body must end with a newline");
+        assert!(
+            text.trim_end().ends_with("nft_up 1"),
+            "last line must be the sample, not a trailer: {text}"
+        );
     }
 
     #[test]
@@ -439,7 +471,8 @@ mod tests {
     }
 
     /// Multiple samples for the same metric name must all appear under a
-    /// single `# HELP` / `# TYPE` header pair (stable group + dedup of headers).
+    /// single `# HELP` / `# TYPE` header pair (stable group + dedup of headers),
+    /// even when the input pushes them NON-consecutively (interleaved).
     #[test]
     fn encode_samples_stable_sort_and_dedup_headers() {
         let mut labels_a = BTreeMap::new();
@@ -447,9 +480,10 @@ mod tests {
         let mut labels_b = BTreeMap::new();
         labels_b.insert("iface".to_owned(), "eth1".to_owned());
 
-        // Intentionally insert in reverse label order; BTreeMap sorts keys.
+        // Interleave two metric names to prove grouping is by name, not order.
         let samples = vec![
             MetricSample::counter("nft_rx_total", "RX bytes total.", labels_b.clone(), 200),
+            MetricSample::gauge("nft_other", "Other.", BTreeMap::new(), 9.0),
             MetricSample::counter("nft_rx_total", "RX bytes total.", labels_a.clone(), 100),
         ];
         let text = encode_samples(&samples).expect("encode ok");
@@ -468,6 +502,49 @@ mod tests {
         assert!(
             text.contains(r#"nft_rx_total{iface="eth1"} 200"#),
             "eth1 sample missing: {text}"
+        );
+
+        // The two nft_rx_total samples must be contiguous (grouped), with the
+        // interleaved nft_other not appearing between them.
+        let first = text.find("nft_rx_total{").expect("first rx sample");
+        let last = text.rfind("nft_rx_total{").expect("last rx sample");
+        let between = &text[first..last];
+        assert!(
+            !between.contains("nft_other "),
+            "interleaved family broke grouping: {text}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // f64 special-value rendering (Inf / NaN)
+    // -----------------------------------------------------------------------
+
+    /// `+Inf`, `-Inf`, and `NaN` must render in their Prometheus spellings,
+    /// not Rust's `inf` / `-inf` / `NaN` Display defaults (`inf` is invalid).
+    #[test]
+    fn encode_samples_f64_inf_and_nan() {
+        let samples = vec![
+            MetricSample::gauge(
+                "nft_pos_inf",
+                "positive inf.",
+                BTreeMap::new(),
+                f64::INFINITY,
+            ),
+            MetricSample::gauge(
+                "nft_neg_inf",
+                "negative inf.",
+                BTreeMap::new(),
+                f64::NEG_INFINITY,
+            ),
+            MetricSample::gauge("nft_nan", "nan.", BTreeMap::new(), f64::NAN),
+        ];
+        let text = encode_samples(&samples).expect("encode ok");
+        assert!(text.contains("nft_pos_inf +Inf"), "want +Inf: {text}");
+        assert!(text.contains("nft_neg_inf -Inf"), "want -Inf: {text}");
+        assert!(text.contains("nft_nan NaN"), "want NaN: {text}");
+        assert!(
+            !text.contains(" inf\n") && !text.contains(" -inf\n"),
+            "raw Rust inf spelling leaked: {text}"
         );
     }
 
