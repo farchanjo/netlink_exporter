@@ -100,7 +100,10 @@ fn parse(text: &str) -> Vec<MetricSample> {
         };
 
         // Parse decimal count columns after the colon.
-        let counts: Vec<u64> = line[colon_pos + 1..]
+        let Some(after_colon) = line.get(colon_pos.saturating_add(1)..) else {
+            continue;
+        };
+        let counts: Vec<u64> = after_colon
             .split_whitespace()
             .map(|s| s.parse::<u64>().unwrap_or(0))
             .collect();
@@ -132,6 +135,7 @@ mod tests {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::items_after_statements,
+        clippy::indexing_slicing,
         reason = "test"
     )]
 

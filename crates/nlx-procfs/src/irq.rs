@@ -88,7 +88,7 @@ fn parse(text: &str) -> Vec<MetricSample> {
         }
 
         // Everything after the colon is: <counts...> <chip> [<hwirq>] [Level|Edge[-name]] [  <device>]
-        let rest = &trimmed[colon_pos + 1..];
+        let rest = &trimmed[colon_pos.saturating_add(1)..];
 
         // Walk the rest byte-by-byte, consuming whitespace-separated tokens.
         // Collect all leading all-digit tokens as per-CPU counts; stop at the
@@ -100,16 +100,16 @@ fn parse(text: &str) -> Vec<MetricSample> {
         while cursor < rest.len() {
             // Skip leading whitespace.
             let ws_start = cursor;
-            while cursor < rest.len() && rest.as_bytes()[cursor] == b' ' {
-                cursor += 1;
+            while cursor < rest.len() && rest.as_bytes().get(cursor).copied() == Some(b' ') {
+                cursor = cursor.saturating_add(1);
             }
             if cursor == rest.len() {
                 break;
             }
             // Find end of this token.
             let tok_start = cursor;
-            while cursor < rest.len() && rest.as_bytes()[cursor] != b' ' {
-                cursor += 1;
+            while cursor < rest.len() && rest.as_bytes().get(cursor).copied() != Some(b' ') {
+                cursor = cursor.saturating_add(1);
             }
             let token = &rest[tok_start..cursor];
 

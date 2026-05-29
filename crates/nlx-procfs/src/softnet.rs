@@ -84,50 +84,60 @@ fn parse(text: &str) -> Vec<MetricSample> {
             continue;
         }
 
+        // All get() calls are guaranteed to succeed by the MIN_COLS guard above;
+        // unwrap_or(0) is unreachable and exists solely to satisfy clippy::indexing_slicing.
+        let cpu = cols.get(COL_CPU).copied().unwrap_or(0);
+        let processed = cols.get(COL_PROCESSED).copied().unwrap_or(0);
+        let dropped = cols.get(COL_DROPPED).copied().unwrap_or(0);
+        let time_squeeze = cols.get(COL_TIME_SQUEEZE).copied().unwrap_or(0);
+        let received_rps = cols.get(COL_RECEIVED_RPS).copied().unwrap_or(0);
+        let flow_limit = cols.get(COL_FLOW_LIMIT).copied().unwrap_or(0);
+        let backlog = cols.get(COL_BACKLOG).copied().unwrap_or(0);
+
         let mut labels = BTreeMap::new();
-        labels.insert("cpu".to_owned(), cols[COL_CPU].to_string());
+        labels.insert("cpu".to_owned(), cpu.to_string());
 
         push_counter(
             &mut out,
             "nft_softnet_processed_total",
             "Packets processed in the per-CPU softirq receive path (softnet processed).",
             &labels,
-            cols[COL_PROCESSED],
+            processed,
         );
         push_counter(
             &mut out,
             "nft_softnet_dropped_total",
             "Packets dropped because the per-CPU backlog queue was full.",
             &labels,
-            cols[COL_DROPPED],
+            dropped,
         );
         push_counter(
             &mut out,
             "nft_softnet_time_squeeze_total",
             "Times the NAPI poll loop ran out of budget/time with work remaining (time_squeeze).",
             &labels,
-            cols[COL_TIME_SQUEEZE],
+            time_squeeze,
         );
         push_counter(
             &mut out,
             "nft_softnet_received_rps_total",
             "Times this CPU was woken to process packets steered to it via RPS.",
             &labels,
-            cols[COL_RECEIVED_RPS],
+            received_rps,
         );
         push_counter(
             &mut out,
             "nft_softnet_flow_limit_count_total",
             "Packets dropped by the flow-limit mechanism (CONFIG_NET_FLOW_LIMIT).",
             &labels,
-            cols[COL_FLOW_LIMIT],
+            flow_limit,
         );
 
         out.push(MetricSample::gauge(
             "nft_softnet_backlog_length",
             "Current per-CPU backlog queue length (input + process queues).",
             labels,
-            cols[COL_BACKLOG] as f64,
+            backlog as f64,
         ));
     }
 

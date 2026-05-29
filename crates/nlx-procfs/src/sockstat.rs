@@ -84,18 +84,18 @@ fn parse(text: &str) -> Vec<MetricSample> {
         };
 
         // Remaining tokens are alternating key/value pairs.
-        // Collect into a Vec so we can walk pairs safely.
+        // Walk them in chunks of two; odd-count remainder is silently ignored.
         let rest: Vec<&str> = tokens.collect();
-
-        // Walk key/value pairs; odd-count remainder is silently ignored.
-        let mut i = 0;
-        while i + 1 < rest.len() {
-            let key = rest[i];
+        for pair in rest.chunks(2) {
+            let (key, raw_val) = match pair {
+                [k, v] => (*k, *v),
+                // Single trailing token with no value — ignore.
+                _ => break,
+            };
             // Try decimal parse; non-integer values are skipped.
-            let value: i64 = if let Ok(v) = rest[i + 1].parse() {
+            let value: i64 = if let Ok(v) = raw_val.parse() {
                 v
             } else {
-                i += 2;
                 continue;
             };
 
@@ -110,8 +110,6 @@ fn parse(text: &str) -> Vec<MetricSample> {
                 labels,
                 value as f64,
             ));
-
-            i += 2;
         }
     }
 
