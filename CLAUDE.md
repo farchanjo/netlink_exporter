@@ -18,10 +18,10 @@ at `/metrics`, `/healthz`, and `/ready`. 21 collectors — 13 netlink (default O
 
 > **Before building:** Linux-only full build (no macOS for `nlx-netlink`/`nlx-http`/binary).
 > Builds are **dynamic glibc** — **musl does NOT work** (`monoio`'s io_uring path will not compile
-> against `*-linux-musl`; verified). The release binary and the container image are both glibc; the
-> `Makefile`/`Dockerfile` musl history (ADR-0008) is stale drift — ignore it. Rust pinned to
-> `1.96.0` (`rust-toolchain.toml`). Binary name is `netlink_exporter`; env prefix is `NLX_`; port
-> is `9456`.
+> against `*-linux-musl`; verified). Release binary, `.deb`, and container image are all glibc.
+> `make deb` builds the package end-to-end from a clean `git clone` (validated). Release profile is
+> optimized (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `strip`). Rust pinned to `1.96.0`
+> (`rust-toolchain.toml`). Binary name is `netlink_exporter`; env prefix `NLX_`; port `9456`.
 
 ---
 
@@ -84,12 +84,11 @@ If `cargo` refuses with an MSRV error, you are on the wrong host — use the Lin
 Linux-specific. Only `nlx-domain`, `nlx-ports`, `nlx-config`, `nlx-metrics`, and `nlx-procfs` build
 on macOS (no `monoio` dependency).
 
-**Musl does NOT build — ignore the musl targets.** The `Makefile` carries `build-musl-x86` /
-`build-musl-arm64` targets and the `Dockerfile` once built static musl (ADR-0008), but `monoio`'s
-io_uring data path does not compile against `*-linux-musl` (verified: `monoio` fails with ~15
-compile errors). These targets are **stale drift** — they also reference `BINARY := nft_exporter`,
-which is the wrong binary name (it is `netlink_exporter`). Build glibc only
-(`*-unknown-linux-gnu`); the container image is glibc distroless.
+**Musl does NOT build.** `monoio`'s io_uring data path does not compile against `*-linux-musl`
+(verified: ~15 `monoio` compile errors). Build glibc only (`*-unknown-linux-gnu`). The `Makefile`
+(`make release` / `make deb`), the `.deb`, and the container image are all glibc; the historical
+musl targets and the old `nft_exporter`-named drift were removed (Makefile rewritten), and ADR-0008's
+static-musl approach is superseded (ADR-0023).
 
 ### Linux kernel requirement
 
@@ -349,8 +348,9 @@ regardless of partial failures.
 ### Capability model (ADR-0009)
 
 After all sockets are opened, `main.rs` calls `drop_caps_to_net_admin()` via the `caps` crate —
-restricts the process to `CAP_NET_ADMIN` only (Effective, Permitted, Inheritable). Release profile
-sets `panic = "abort"` so a capability-drop failure terminates immediately.
+restricts the process to `CAP_NET_ADMIN` only (Effective, Permitted, Inheritable). The release
+profile is optimized — `opt-level=3`, `lto="fat"`, `codegen-units=1`, `strip="symbols"`,
+`panic="abort"`; `panic="abort"` makes a capability-drop failure terminate immediately.
 
 ---
 
@@ -556,9 +556,8 @@ Three-phase loop:
 
 **Phase 1 — build (glibc, on the Linux host):**
 ```sh
-# musl does NOT work (monoio) — build glibc. Do NOT use `make build-musl-x86`
-# (it targets musl + the stale `nft_exporter` binary name).
-cargo build --release --locked --bin netlink_exporter --target x86_64-unknown-linux-gnu
+make release        # cargo build --release --bin netlink_exporter --target x86_64-unknown-linux-gnu
+# or the full package:  make deb   -> netlink-exporter_<ver>_<arch>.deb
 # Produces: target/x86_64-unknown-linux-gnu/release/netlink_exporter
 ```
 
@@ -573,9 +572,9 @@ cargo build --release --locked --bin netlink_exporter --target x86_64-unknown-li
 curl -sf http://127.0.0.1:9456/metrics | cue vet - docs/arch/schemas/metric_contract.cue
 ```
 
-> ⚠️ `make test-remote` is **drifted**: it depends on the non-functional musl build and the stale
-> `nft_exporter` binary name, so it does not run as-is. The reliable loop is manual: `rsync` the tree
-> to the Linux host, build glibc there (above), run a short foreground scrape, then clean up. See
+> The Makefile no longer has a `test-remote` target (the drifted musl/vault one was removed). The
+> integration loop is manual: `git clone` (or `rsync`) to the Linux host, `make deb` / `make release`
+> there, run a short foreground scrape, then clean up. See
 > "Dev-loop & Gotchas".
 
 ### macOS partial-build matrix
@@ -655,7 +654,8 @@ All ADRs under `docs/arch/adr/` in MADR 4.0 format. Status must be `accepted` be
 | Workspace manifest (lints, shared deps) | `Cargo.toml` |
 | Toolchain pin | `rust-toolchain.toml` |
 | Container image definition | `Dockerfile` |
-| Make targets | `Makefile` |
+| Debian package (unit, /etc/default, conffiles, build-deb.sh) | `packaging/deb/` |
+| Make targets (`make deb`, `release`, `lint`, `test`, …) | `Makefile` |
 | Wire references: kernel, nftables, iproute2 | `~/dev/linux-6.17.13`, `~/dev/nftables`, `~/dev/iproute2` |
 
 ---
