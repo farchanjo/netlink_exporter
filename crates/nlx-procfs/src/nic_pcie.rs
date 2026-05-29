@@ -1,6 +1,6 @@
 //! `nic_pcie` collector — `/sys/class/net/<dev>/device/{current_link_speed,
 //! current_link_width,aer_dev_correctable,aer_dev_fatal,aer_dev_nonfatal}`
-//! (ADR-0027).
+//! (ADR-0027, amended by ADR-0028).
 //!
 //! `PCIe` link health and AER error counters for **physical functions** only.
 //! A device is processed when it exposes `current_link_speed` (implying a `PCIe`
@@ -35,23 +35,31 @@
 //!
 //! ### `aer_dev_correctable` / `aer_dev_fatal` / `aer_dev_nonfatal`
 //!
-//! Each line is `"<Key> <u64>\n"`.  Final line is always
-//! `"TOTAL_<ERR_TYPE> <u64>\n"`.
+//! Each line is `"<Key> <u64>\n"`. The final line is always
+//! `"TOTAL_<ERR_TYPE> <u64>\n"` (a kernel-computed summary).
 //! `drivers/pci/pcie/aer.c::aer_stats_dev_attr` (line 546).
+//!
+//! **Aggregation (ADR-0028):** `collect_aer` sums every per-bit line and emits
+//! exactly **one counter per AER file** labelled by `device` only — the `kind`
+//! label (lowercased bit name) is no longer emitted. The `TOTAL_<ERR_TYPE>`
+//! summary line is excluded from the sum (the result equals the kernel total by
+//! construction). Cardinality is 3 AER series per device instead of ~54.
 //!
 //! Example (`aer_dev_correctable`):
 //!
-//! | Line               | kind (lowercased) |
-//! |--------------------|-------------------|
-//! | `RxErr 0`          | `rxerr`           |
-//! | `BadTLP 3`         | `badtlp`          |
-//! | `BadDLLP 0`        | `baddllp`         |
-//! | `Rollover 0`       | `rollover`        |
-//! | `Timeout 0`        | `timeout`         |
-//! | `NonFatalErr 0`    | `nonfatalerr`     |
-//! | `CorrIntErr 0`     | `corrinterr`      |
-//! | `HeaderOF 0`       | `headerof`        |
-//! | `TOTAL_ERR_COR 3`  | skipped (summary) |
+//! | Line               | Action                         |
+//! |--------------------|--------------------------------|
+//! | `RxErr 0`          | added to sum (contributes 0)   |
+//! | `BadTLP 3`         | added to sum (contributes 3)   |
+//! | `BadDLLP 0`        | added to sum (contributes 0)   |
+//! | `Rollover 1`       | added to sum (contributes 1)   |
+//! | `Timeout 0`        | added to sum (contributes 0)   |
+//! | `NonFatalErr 0`    | added to sum (contributes 0)   |
+//! | `CorrIntErr 0`     | added to sum (contributes 0)   |
+//! | `HeaderOF 0`       | added to sum (contributes 0)   |
+//! | `TOTAL_ERR_COR 4`  | skipped (TOTAL_ summary line)  |
+//!
+//! Result: one counter with value 4 and label `{device="<dev>"}`.
 
 use std::collections::BTreeMap;
 
@@ -161,7 +169,7 @@ fn collect_dev(dev: &str, out: &mut Vec<MetricSample>) {
         dev,
         "aer_dev_correctable",
         "nft_nic_pcie_aer_correctable_total",
-        "PCIe AER correctable error event count (from sysfs aer_dev_correctable).",
+        "PCIe AER correctable error event count, aggregated across all error bits; TOTAL_ summary excluded (from sysfs aer_dev_correctable).",
         &labels,
         out,
     );
@@ -169,7 +177,7 @@ fn collect_dev(dev: &str, out: &mut Vec<MetricSample>) {
         dev,
         "aer_dev_fatal",
         "nft_nic_pcie_aer_fatal_total",
-        "PCIe AER fatal uncorrectable error event count (from sysfs aer_dev_fatal).",
+        "PCIe AER fatal uncorrectable error event count, aggregated across all error bits; TOTAL_ summary excluded (from sysfs aer_dev_fatal).",
         &labels,
         out,
     );
@@ -177,17 +185,27 @@ fn collect_dev(dev: &str, out: &mut Vec<MetricSample>) {
         dev,
         "aer_dev_nonfatal",
         "nft_nic_pcie_aer_nonfatal_total",
-        "PCIe AER non-fatal uncorrectable error event count (from sysfs aer_dev_nonfatal).",
+        "PCIe AER non-fatal uncorrectable error event count, aggregated across all error bits; TOTAL_ summary excluded (from sysfs aer_dev_nonfatal).",
         &labels,
         out,
     );
 }
 
-/// Parse one AER sysfs file and push one counter per `"Key Value"` line.
+/// Parse one AER sysfs file and push a **single** aggregated counter.
 ///
-/// Lines whose key starts with `"TOTAL_"` are summary lines emitted by the
-/// kernel (`TOTAL_ERR_COR`, `TOTAL_ERR_FATAL`, `TOTAL_ERR_NONFATAL`) and are
-/// skipped to avoid duplicating the per-bit counters.
+/// All per-bit `"Key Value"` lines are summed into one total. Lines whose key
+/// starts with `"TOTAL_"` are the kernel summary (`TOTAL_ERR_COR`,
+/// `TOTAL_ERR_FATAL`, `TOTAL_ERR_NONFATAL`) and are excluded from the sum —
+/// the computed sum equals the kernel total by construction, so there is no
+/// double-counting. Unparseable lines are skipped (not added to the sum).
+///
+/// If the AER file is unreadable (`safe_read` returns `Err`) the function
+/// returns without emitting. If the file is readable but has zero valid bit
+/// lines the counter is emitted with value 0 — a present AER file signals the
+/// device supports AER, so 0 errors is meaningful information.
+///
+/// The emitted counter carries only the `base_labels` (i.e. `device`); no
+/// `kind` label is added (ADR-0028).
 fn collect_aer(
     dev: &str,
     attr: &str,
@@ -200,6 +218,7 @@ fn collect_aer(
     let Ok(text) = safe_read(&path) else {
         return; // AER not present on this device — skip silently.
     };
+    let mut sum: u64 = 0;
     for line in text.lines() {
         let mut parts = line.splitn(2, ' ');
         let key = match parts.next() {
@@ -214,11 +233,14 @@ fn collect_aer(
             Some(v) => v,
             None => continue, // Unparseable — skip defensively.
         };
-        let kind = key.to_lowercase();
-        let mut labels = base_labels.clone();
-        labels.insert("kind".to_owned(), kind);
-        out.push(MetricSample::counter(metric_name, help, labels, value));
+        sum = sum.saturating_add(value);
     }
+    out.push(MetricSample::counter(
+        metric_name,
+        help,
+        base_labels.clone(),
+        sum,
+    ));
 }
 
 /// Parse the leading float from a `current_link_speed` string.
@@ -263,10 +285,12 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // AER parsing via collect_aer (exercised through a fake text)
+    // AER aggregation via collect_aer (exercised through a fake text)
     // -------------------------------------------------------------------------
 
     /// Simulate what the kernel emits for `aer_dev_correctable`.
+    /// RxErr(0) + BadTLP(3) + BadDLLP(0) + Rollover(1) + … = 4 bits set.
+    /// `TOTAL_ERR_COR(4)` must NOT be added to the sum.
     const AER_COR_SAMPLE: &str = "\
 RxErr 0
 BadTLP 3
@@ -279,14 +303,15 @@ HeaderOF 0
 TOTAL_ERR_COR 4
 ";
 
+    /// Mirror the aggregation logic of `collect_aer`: sum all non-TOTAL_ lines,
+    /// emit one counter with `base_labels` only (no `kind`).
     fn run_aer(text: &str) -> Vec<MetricSample> {
-        let mut out = Vec::new();
         let base = {
             let mut m = BTreeMap::new();
             m.insert("device".to_owned(), "eth0".to_owned());
             m
         };
-        // Parse the sample text directly rather than through safe_read.
+        let mut sum: u64 = 0;
         for line in text.lines() {
             let mut parts = line.splitn(2, ' ');
             let key = match parts.next() {
@@ -300,73 +325,97 @@ TOTAL_ERR_COR 4
                 Some(v) => v,
                 None => continue,
             };
-            let mut labels = base.clone();
-            labels.insert("kind".to_owned(), key.to_lowercase());
-            out.push(MetricSample::counter(
-                "nft_nic_pcie_aer_correctable_total",
-                "help",
-                labels,
-                value,
-            ));
+            sum = sum.saturating_add(value);
         }
-        out
+        vec![MetricSample::counter(
+            "nft_nic_pcie_aer_correctable_total",
+            "help",
+            base,
+            sum,
+        )]
+    }
+
+    // -------------------------------------------------------------------------
+    // AER aggregation correctness tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn aer_emits_exactly_one_sample() {
+        let samples = run_aer(AER_COR_SAMPLE);
+        assert_eq!(samples.len(), 1, "must emit exactly one aggregated counter");
     }
 
     #[test]
-    fn aer_skips_total_summary_line() {
+    fn aer_aggregated_value_equals_bit_sum() {
+        // RxErr(0) + BadTLP(3) + BadDLLP(0) + Rollover(1) + rest(0) = 4.
         let samples = run_aer(AER_COR_SAMPLE);
-        // TOTAL_ERR_COR must not appear.
-        assert!(
-            samples
-                .iter()
-                .all(|s| s.labels.get("kind").is_none_or(|k| k != "total_err_cor")),
-            "TOTAL_* summary line must be skipped"
+        let s = samples.first().unwrap();
+        assert_eq!(
+            s.value,
+            MetricValue::U64(4),
+            "aggregated value must be the sum of per-bit lines"
         );
     }
 
     #[test]
-    fn aer_parses_non_zero_values() {
+    fn aer_counter_has_no_kind_label() {
         let samples = run_aer(AER_COR_SAMPLE);
-        let badtlp = samples
-            .iter()
-            .find(|s| s.labels.get("kind").map(String::as_str) == Some("badtlp"))
-            .unwrap();
-        assert_eq!(badtlp.value, MetricValue::U64(3));
-        assert_eq!(badtlp.kind, MetricKind::Counter);
+        let s = samples.first().unwrap();
+        assert!(
+            !s.labels.contains_key("kind"),
+            "aggregated counter must not carry a kind label"
+        );
     }
 
     #[test]
-    fn aer_all_named_bits_present() {
+    fn aer_counter_has_device_label_only() {
         let samples = run_aer(AER_COR_SAMPLE);
-        let kinds: Vec<&str> = samples
-            .iter()
-            .filter_map(|s| s.labels.get("kind").map(String::as_str))
-            .collect();
-        // All named correctable-bit keys must appear.
-        for expected in &[
-            "rxerr",
-            "badtlp",
-            "baddllp",
-            "rollover",
-            "timeout",
-            "nonfatalerr",
-            "corrinterr",
-            "headerof",
-        ] {
-            assert!(kinds.contains(expected), "missing kind: {expected}");
-        }
-        // Exactly 8 entries (no TOTAL_*).
-        assert_eq!(samples.len(), 8);
+        let s = samples.first().unwrap();
+        let labels = &s.labels;
+        assert_eq!(labels.len(), 1, "only the device label must be present");
+        assert_eq!(
+            labels.get("device").map(String::as_str),
+            Some("eth0"),
+            "device label must match"
+        );
     }
 
     #[test]
-    fn aer_skips_unparseable_lines() {
+    fn aer_counter_is_counter_kind() {
+        let samples = run_aer(AER_COR_SAMPLE);
+        let s = samples.first().unwrap();
+        assert_eq!(
+            s.kind,
+            MetricKind::Counter,
+            "AER sample must be Counter kind"
+        );
+    }
+
+    #[test]
+    fn aer_total_line_not_double_counted() {
+        // TOTAL_ERR_COR = 4 (kernel summary). Per-bit sum = 3 + 1 = 4.
+        // If TOTAL_ were naively included the sum would be 8 instead of 4.
+        let samples = run_aer(AER_COR_SAMPLE);
+        let s = samples.first().unwrap();
+        assert_eq!(
+            s.value,
+            MetricValue::U64(4),
+            "TOTAL_ summary line must not be added to the sum (would produce 8)"
+        );
+    }
+
+    #[test]
+    fn aer_unparseable_lines_excluded_from_sum() {
+        // "RxErr" has no value field; "BadTLP three" is non-numeric.
+        // Both lines are skipped — sum stays 0, but one counter is still emitted.
         let bad = "RxErr\nBadTLP three\n";
         let samples = run_aer(bad);
-        // Neither line is valid: first has no value, second is non-numeric.
-        assert!(
-            samples.is_empty(),
-            "unparseable lines must yield no samples"
+        assert_eq!(samples.len(), 1, "one counter must still be emitted");
+        let s = samples.first().unwrap();
+        assert_eq!(
+            s.value,
+            MetricValue::U64(0),
+            "unparseable lines contribute 0 to the sum"
         );
     }
 
