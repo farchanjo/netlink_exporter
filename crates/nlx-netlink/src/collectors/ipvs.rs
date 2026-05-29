@@ -21,11 +21,26 @@
 //! - STATS32 fallback: when STATS64 absent, parse STATS (type=10) u32 fields and
 //!   widen to u64 so older kernels produce non-zero metrics.
 //!
-//! ## Cardinality
+//! ## Cardinality (MC-003)
 //!
-//! Labels: `{proto, vip, port}` for services; `{proto, vip, port, rip, rport}`
-//! for destinations.  Per-flow / per-IP addresses are bounded by the IPVS
-//! service table (operator-controlled).  Hard cap: 512 services, 256 dests/svc.
+//! **Service metrics** carry `{proto, vip, port}` labels.  The IPVS service table
+//! is operator-defined and bounded by `IPVS_MAX_SERVICES` (512).  VIP addresses
+//! appear in labels; this is intentional and safe because the number of distinct
+//! VIPs equals the number of services, which is already bounded.
+//!
+//! **Destination metrics** carry `{proto, vip, port, rip, rport}` labels.  The
+//! number of real servers per service is bounded by `IPVS_MAX_DESTS` (256) and is
+//! operator-controlled via `ipvsadm`.  The total destination series count is
+//! bounded by `IPVS_MAX_SERVICES × IPVS_MAX_DESTS = 131 072`.  This is well
+//! within Prometheus cardinality limits for typical IPVS deployments; operators
+//! managing unusually large pools should reduce the caps via config.
+//!
+//! ## Metric naming (MC-006)
+//!
+//! EMA rate gauges (CPS / PPS / BPS) use the `_rate` suffix per Prometheus
+//! naming conventions — `_per_second` is not a recognised standard suffix.
+//! The kernel stats are exponential moving averages, not instantaneous rates,
+//! but `_rate` correctly signals "this is a rate gauge, not a counter".
 
 use std::{
     collections::BTreeMap,
@@ -643,33 +658,34 @@ fn push_svc_metrics(
         "IPVS virtual service outgoing bytes.",
         svc.out_bytes,
     );
+    // MC-006: use _rate suffix (Prometheus naming); _per_second is non-standard.
     push_gauge(
         out,
-        "nft_ipvs_connections_per_second",
+        "nft_ipvs_connections_rate",
         "IPVS virtual service EMA connections per second.",
         svc.cps as f64,
     );
     push_gauge(
         out,
-        "nft_ipvs_incoming_packets_per_second",
+        "nft_ipvs_incoming_packets_rate",
         "IPVS virtual service EMA incoming packets per second.",
         svc.in_pps as f64,
     );
     push_gauge(
         out,
-        "nft_ipvs_outgoing_packets_per_second",
+        "nft_ipvs_outgoing_packets_rate",
         "IPVS virtual service EMA outgoing packets per second.",
         svc.out_pps as f64,
     );
     push_gauge(
         out,
-        "nft_ipvs_incoming_bytes_per_second",
+        "nft_ipvs_incoming_bytes_rate",
         "IPVS virtual service EMA incoming bytes per second.",
         svc.in_bps as f64,
     );
     push_gauge(
         out,
-        "nft_ipvs_outgoing_bytes_per_second",
+        "nft_ipvs_outgoing_bytes_rate",
         "IPVS virtual service EMA outgoing bytes per second.",
         svc.out_bps as f64,
     );
@@ -738,6 +754,10 @@ fn push_dest_metrics(out: &mut Vec<MetricSample>, svc: &IpvsService, dest: &Ipvs
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::panic,
+    clippy::match_wildcard_for_single_variants,
+    clippy::float_cmp,
     reason = "test code; inputs are controlled constants and truncation is safe for test NLA sizes"
 )]
 mod tests {
@@ -1085,5 +1105,88 @@ mod tests {
     #[test]
     fn addr_to_str_unknown_af_returns_empty() {
         assert_eq!(addr_to_str(99, &[1, 2, 3, 4]), String::new());
+    }
+
+    // --- MC-006: rate gauge names use _rate suffix, not _per_second ---
+
+    fn make_test_svc() -> IpvsService {
+        IpvsService {
+            proto: "tcp".to_owned(),
+            vip: "10.0.0.1".to_owned(),
+            port: "80".to_owned(),
+            sched: "rr".to_owned(),
+            conns: 0,
+            in_pkts: 0,
+            out_pkts: 0,
+            in_bytes: 0,
+            out_bytes: 0,
+            cps: 10,
+            in_pps: 20,
+            out_pps: 30,
+            in_bps: 40,
+            out_bps: 50,
+        }
+    }
+
+    #[test]
+    fn push_svc_metrics_uses_rate_suffix_not_per_second() {
+        let svc = make_test_svc();
+        let labels = svc_labels(&svc);
+        let mut out = Vec::new();
+        push_svc_metrics(&mut out, &svc, &labels);
+
+        let names: Vec<&str> = out.iter().map(|s| s.name).collect();
+
+        // _rate gauges must be present.
+        assert!(
+            names.contains(&"nft_ipvs_connections_rate"),
+            "connections_rate gauge must exist"
+        );
+        assert!(
+            names.contains(&"nft_ipvs_incoming_packets_rate"),
+            "incoming_packets_rate gauge must exist"
+        );
+        assert!(
+            names.contains(&"nft_ipvs_outgoing_packets_rate"),
+            "outgoing_packets_rate gauge must exist"
+        );
+        assert!(
+            names.contains(&"nft_ipvs_incoming_bytes_rate"),
+            "incoming_bytes_rate gauge must exist"
+        );
+        assert!(
+            names.contains(&"nft_ipvs_outgoing_bytes_rate"),
+            "outgoing_bytes_rate gauge must exist"
+        );
+
+        // _per_second gauges must NOT appear (MC-006 rename).
+        for name in &names {
+            assert!(
+                !name.ends_with("_per_second"),
+                "gauge name must not use _per_second suffix (MC-006): {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_svc_metrics_rate_values_match_stats() {
+        let svc = make_test_svc();
+        let labels = svc_labels(&svc);
+        let mut out = Vec::new();
+        push_svc_metrics(&mut out, &svc, &labels);
+
+        let find_f64 = |name: &str| -> f64 {
+            let s = out.iter().find(|s| s.name == name).expect(name);
+            match s.value {
+                nlx_domain::metric::MetricValue::F64(v) => v,
+                _ => panic!("{name} must have F64 value"),
+            }
+        };
+
+        assert!((find_f64("nft_ipvs_connections_rate") - 10.0_f64).abs() < f64::EPSILON);
+        assert!((find_f64("nft_ipvs_incoming_packets_rate") - 20.0_f64).abs() < f64::EPSILON);
+        assert!((find_f64("nft_ipvs_outgoing_packets_rate") - 30.0_f64).abs() < f64::EPSILON);
+        assert!((find_f64("nft_ipvs_incoming_bytes_rate") - 40.0_f64).abs() < f64::EPSILON);
+        assert!((find_f64("nft_ipvs_outgoing_bytes_rate") - 50.0_f64).abs() < f64::EPSILON);
     }
 }

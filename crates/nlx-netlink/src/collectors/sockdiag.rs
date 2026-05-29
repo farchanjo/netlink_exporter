@@ -53,10 +53,14 @@ const AF_INET6: u8 = 10;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
-/// `idiag_ext` bitmask: request `INET_DIAG_SKMEMINFO` (bit 5=0x20) +
-/// `INET_DIAG_INFO` (bit 1=0x02) for `tcp_info` retransmits.
-/// Combined = 0x22 per §6.1.
-const IDIAG_EXT_SKMEMINFO_AND_INFO: u8 = 0x22;
+/// `idiag_ext` bitmask: request `INET_DIAG_SKMEMINFO` (bit 6 = 0x40, i.e.
+/// `1 << (INET_DIAG_SKMEMINFO - 1)` = `1 << 6`) +
+/// `INET_DIAG_INFO` (bit 1 = 0x02, i.e. `1 << (INET_DIAG_INFO - 1)` = `1 << 1`).
+/// Combined = 0x42 per §6.1.
+/// kernel: `include/uapi/linux/inet_diag.h` enum, line 134–143
+///   (`INET_DIAG_NONE=0`, `INET_DIAG_MEMINFO=1`, `INET_DIAG_INFO=2`, …,
+///    `INET_DIAG_TCLASS=6`, `INET_DIAG_SKMEMINFO=7`).
+const IDIAG_EXT_SKMEMINFO_AND_INFO: u8 = 0x42;
 
 /// Request all socket states.
 const IDIAG_STATES_ALL: u32 = 0xFFFF_FFFF;
@@ -75,17 +79,53 @@ const IDIAG_WQUEUE_OFFSET: usize = 60;
 
 /// nlattr types in a `sock_diag` reply (netlink-protocol.md §6.3, §6.4).
 /// `INET_DIAG_INFO` `nla_type` = 2.
+/// kernel: `include/uapi/linux/inet_diag.h` line 137.
 const INET_DIAG_INFO: u16 = 2;
-/// `INET_DIAG_SKMEMINFO` `nla_type` = 6.
-const INET_DIAG_SKMEMINFO: u16 = 6;
+/// `INET_DIAG_SKMEMINFO` `nla_type` = 7.
+/// kernel: `include/uapi/linux/inet_diag.h` line 142
+///   (`INET_DIAG_NONE=0` … `INET_DIAG_TCLASS=6`, `INET_DIAG_SKMEMINFO=7`).
+/// WC-006 fix: was incorrectly 6 (`INET_DIAG_TCLASS`).
+const INET_DIAG_SKMEMINFO: u16 = 7;
 
 /// Byte offset of `skmem_drop` within `INET_DIAG_SKMEMINFO` payload
 /// (index 8, byte offset 32). See §6.3 / gotcha G-13.
 const SKMEMINFO_DROP_OFFSET: usize = 32;
 
-/// Byte offset of `tcpi_retransmits` within `INET_DIAG_INFO` / `tcp_info`
+/// Byte offset of `tcpi_total_retrans` within `INET_DIAG_INFO` / `tcp_info`
 /// payload (§6.4 / gotcha G-14).
-const TCP_INFO_RETRANSMITS_OFFSET: usize = 12;
+///
+/// `struct tcp_info` layout (kernel `include/uapi/linux/tcp.h` line 229):
+///   offset 0–7:   8 × u8 fields (`tcpi_state` … `tcpi_delivery_rate_app_limited`)
+///   offset 8:     `tcpi_rto`     (u32)
+///   offset 12:    `tcpi_ato`     (u32)  ← old (wrong) offset read `tcpi_ato`
+///   offset 16:    `tcpi_snd_mss` (u32)
+///   offset 20:    `tcpi_rcv_mss` (u32)
+///   offset 24:    `tcpi_unacked` (u32)
+///   offset 28:    `tcpi_sacked`  (u32)
+///   offset 32:    `tcpi_lost`    (u32)
+///   offset 36:    `tcpi_retrans` (u32)
+///   offset 40:    `tcpi_fackets` (u32)
+///   offset 44:    `tcpi_last_data_sent` (u32)
+///   offset 48:    `tcpi_last_ack_sent`  (u32)
+///   offset 52:    `tcpi_last_data_recv` (u32)
+///   offset 56:    `tcpi_last_ack_recv`  (u32)
+///   offset 60:    `tcpi_pmtu`           (u32)
+///   offset 64:    `tcpi_rcv_ssthresh`   (u32)
+///   offset 68:    `tcpi_rtt`            (u32)
+///   offset 72:    `tcpi_rttvar`         (u32)
+///   offset 76:    `tcpi_snd_ssthresh`   (u32)
+///   offset 80:    `tcpi_snd_cwnd`       (u32)
+///   offset 84:    `tcpi_advmss`         (u32)
+///   offset 88:    `tcpi_reordering`     (u32)
+///   offset 92:    `tcpi_rcv_rtt`        (u32)
+///   offset 96:    `tcpi_rcv_space`      (u32)
+///   offset 100:   `tcpi_total_retrans`  (u32)  ← cumulative retransmit counter
+///
+/// TC-004 fix: the metric `nft_socket_retransmits_total` is a *cumulative*
+/// counter; the correct field is `tcpi_total_retrans` (u32 @ offset 100),
+/// not `tcpi_retransmits` (u8 @ offset 2, current in-flight only) and not
+/// `tcpi_ato` (u32 @ offset 12, ACK timeout).
+const TCP_INFO_TOTAL_RETRANS_OFFSET: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Internal aggregation key
@@ -259,7 +299,7 @@ async fn collect_sockdiag() -> Result<Vec<MetricSample>, CollectError> {
     let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
     // drops per protocol (from INET_DIAG_SKMEMINFO index 8)
     let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
-    // retransmits (TCP only, from INET_DIAG_INFO / tcp_info offset 12)
+    // retransmits (TCP only, from INET_DIAG_INFO / tcp_info tcpi_total_retrans @ offset 100)
     let mut retransmits: u64 = 0;
 
     // Issue four dumps: AF_INET×TCP, AF_INET×UDP, AF_INET6×TCP, AF_INET6×UDP.
@@ -444,12 +484,14 @@ fn parse_frame(
                 }
             }
             INET_DIAG_INFO if !is_udp => {
-                // tcp_info blob; tcpi_retransmits at offset 12 (u32 LE). G-14.
-                if nla.payload.len() >= TCP_INFO_RETRANSMITS_OFFSET + 4 {
+                // tcp_info blob; tcpi_total_retrans at offset 100 (u32 LE). G-14.
+                // kernel: include/uapi/linux/tcp.h struct tcp_info line 269.
+                if nla.payload.len() >= TCP_INFO_TOTAL_RETRANS_OFFSET + 4 {
                     let r = u64::from(u32::from_le_bytes(
-                        nla.payload[TCP_INFO_RETRANSMITS_OFFSET..TCP_INFO_RETRANSMITS_OFFSET + 4]
+                        nla.payload
+                            [TCP_INFO_TOTAL_RETRANS_OFFSET..TCP_INFO_TOTAL_RETRANS_OFFSET + 4]
                             .try_into()
-                            .map_err(|_| "tcp retransmits slice error".to_owned())?,
+                            .map_err(|_| "tcp total_retrans slice error".to_owned())?,
                     ));
                     *retransmits += r;
                 }
@@ -459,4 +501,340 @@ fn parse_frame(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests (TC-021)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        reason = "test"
+    )]
+
+    use std::collections::BTreeMap;
+
+    use super::{
+        Bucket, IDIAG_EXT_SKMEMINFO_AND_INFO, INET_DIAG_INFO, INET_DIAG_MSG_MIN,
+        INET_DIAG_SKMEMINFO, TCP_INFO_TOTAL_RETRANS_OFFSET,
+    };
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal (72-byte) `inet_diag_msg` payload with `idiag_state=1`
+    /// (ESTABLISHED) and the given rqueue/wqueue values.
+    fn make_inet_diag_msg(rqueue: u32, wqueue: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; INET_DIAG_MSG_MIN];
+        // offset 0: sdiag_family (AF_INET = 2)
+        buf[0] = 2;
+        // offset 1: idiag_state = TCP_ESTABLISHED = 1
+        buf[1] = 1;
+        // offset 56: idiag_rqueue (u32 LE)
+        buf[56..60].copy_from_slice(&rqueue.to_le_bytes());
+        // offset 60: idiag_wqueue (u32 LE)
+        buf[60..64].copy_from_slice(&wqueue.to_le_bytes());
+        buf
+    }
+
+    /// Build a 4-byte-aligned NLA header + payload.
+    ///
+    /// `nla_len` = 4 (header) + `payload.len()`.
+    /// Wire layout: `nla_len` (u16 LE) | `nla_type` (u16 LE) | payload | padding.
+    fn make_nla(nla_type: u16, payload: &[u8]) -> Vec<u8> {
+        let nla_len = 4u16 + payload.len() as u16;
+        let pad = (4 - (payload.len() % 4)) % 4;
+        let mut buf = Vec::with_capacity(4 + payload.len() + pad);
+        buf.extend_from_slice(&nla_len.to_le_bytes());
+        buf.extend_from_slice(&nla_type.to_le_bytes());
+        buf.extend_from_slice(payload);
+        buf.extend(std::iter::repeat_n(0u8, pad));
+        buf
+    }
+
+    /// Build a 9-element SKMEMINFO payload (9 × u32 LE), setting index `i` to `val`.
+    fn make_skmeminfo_payload(index: usize, val: u32) -> Vec<u8> {
+        let mut payload = vec![0u8; 9 * 4];
+        payload[index * 4..index * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        payload
+    }
+
+    /// Build a `tcp_info`-shaped payload of `len` bytes, setting `tcpi_total_retrans`
+    /// (offset 100, u32 LE) to `val`.
+    fn make_tcp_info_payload(val: u32) -> Vec<u8> {
+        // Minimum size to reach tcpi_total_retrans (offset 100) + 4 bytes = 104.
+        let mut payload = vec![0u8; TCP_INFO_TOTAL_RETRANS_OFFSET + 4];
+        payload[TCP_INFO_TOTAL_RETRANS_OFFSET..TCP_INFO_TOTAL_RETRANS_OFFSET + 4]
+            .copy_from_slice(&val.to_le_bytes());
+        payload
+    }
+
+    // -----------------------------------------------------------------------
+    // WC-006 / WC-007: constant correctness
+    // -----------------------------------------------------------------------
+
+    /// `INET_DIAG_SKMEMINFO` must equal 7 (kernel `inet_diag.h` line 142).
+    #[test]
+    fn test_inet_diag_skmeminfo_ordinal() {
+        assert_eq!(
+            INET_DIAG_SKMEMINFO, 7,
+            "WC-006: INET_DIAG_SKMEMINFO must be 7"
+        );
+    }
+
+    /// `INET_DIAG_INFO` must equal 2 (kernel `inet_diag.h` line 137).
+    #[test]
+    fn test_inet_diag_info_ordinal() {
+        assert_eq!(INET_DIAG_INFO, 2, "INET_DIAG_INFO must be 2");
+    }
+
+    /// `idiag_ext` bitmask: bit for SKMEMINFO = 1<<(7-1) = 0x40; INFO = 1<<(2-1) = 0x02.
+    /// Combined = 0x42.  (WC-007)
+    #[test]
+    fn test_idiag_ext_bitmask() {
+        let skmeminfo_bit: u8 = 1 << (INET_DIAG_SKMEMINFO as u8 - 1); // 0x40
+        let info_bit: u8 = 1 << (INET_DIAG_INFO as u8 - 1); // 0x02
+        assert_eq!(
+            IDIAG_EXT_SKMEMINFO_AND_INFO,
+            skmeminfo_bit | info_bit,
+            "WC-007: ext bitmask must be 0x42"
+        );
+        assert_eq!(IDIAG_EXT_SKMEMINFO_AND_INFO, 0x42);
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-004: TCP_INFO_TOTAL_RETRANS_OFFSET
+    // -----------------------------------------------------------------------
+
+    /// The cumulative retransmit counter `tcpi_total_retrans` sits at byte
+    /// offset 100 in `struct tcp_info`.
+    ///
+    /// Layout derivation (kernel tcp.h line 229):
+    ///   8 u8 fields → 8 bytes (offsets 0–7)
+    ///   `tcpi_rto` .. `tcpi_rcv_space`: 23 u32 fields × 4 = 92 bytes (offsets 8–99)
+    ///   `tcpi_total_retrans`: u32 @ offset 100.
+    #[test]
+    fn test_tcp_info_total_retrans_offset() {
+        assert_eq!(
+            TCP_INFO_TOTAL_RETRANS_OFFSET, 100,
+            "TC-004: tcpi_total_retrans must be at byte offset 100"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-021: parse_frame correctly reads skmem_drop and total_retrans
+    // -----------------------------------------------------------------------
+
+    /// Verify that `INET_DIAG_SKMEMINFO` NLA (type=7) with `skmem_drop` at
+    /// index 8 (byte offset 32) is correctly parsed and accumulated into `drops`.
+    #[test]
+    fn test_parse_frame_skmem_drop() {
+        use super::{Protocol, SockKey, parse_frame};
+
+        let expected_drop: u32 = 0x0000_00AB;
+
+        // Build frame: inet_diag_msg + INET_DIAG_SKMEMINFO NLA
+        let mut frame = make_inet_diag_msg(1024, 512);
+        let skmem_payload = make_skmeminfo_payload(8, expected_drop); // index 8 = offset 32
+        frame.extend_from_slice(&make_nla(INET_DIAG_SKMEMINFO, &skmem_payload));
+
+        let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
+        let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
+        let mut retransmits: u64 = 0;
+
+        parse_frame(
+            &frame,
+            Protocol::Tcp,
+            false,
+            &mut bucket_map,
+            &mut drops,
+            &mut retransmits,
+        )
+        .expect("parse_frame must not fail on well-formed SKMEMINFO NLA");
+
+        assert_eq!(
+            drops.get(&Protocol::Tcp).copied().unwrap_or(0),
+            u64::from(expected_drop),
+            "skmem_drop must be read from SKMEMINFO payload index 8 (offset 32)"
+        );
+        assert_eq!(
+            retransmits, 0,
+            "retransmits must remain zero when no INET_DIAG_INFO NLA"
+        );
+    }
+
+    /// Verify that `INET_DIAG_INFO` NLA (type=2) with `tcpi_total_retrans` at
+    /// offset 100 is correctly parsed and accumulated into `retransmits`.
+    #[test]
+    fn test_parse_frame_total_retrans() {
+        use super::{Protocol, SockKey, parse_frame};
+
+        let expected_retrans: u32 = 0x0000_1234;
+
+        // Build frame: inet_diag_msg + INET_DIAG_INFO NLA
+        let mut frame = make_inet_diag_msg(0, 0);
+        let tcp_info_payload = make_tcp_info_payload(expected_retrans);
+        frame.extend_from_slice(&make_nla(INET_DIAG_INFO, &tcp_info_payload));
+
+        let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
+        let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
+        let mut retransmits: u64 = 0;
+
+        parse_frame(
+            &frame,
+            Protocol::Tcp,
+            false,
+            &mut bucket_map,
+            &mut drops,
+            &mut retransmits,
+        )
+        .expect("parse_frame must not fail on well-formed INET_DIAG_INFO NLA");
+
+        assert_eq!(
+            retransmits,
+            u64::from(expected_retrans),
+            "tcpi_total_retrans must be read from tcp_info at byte offset 100"
+        );
+        assert!(
+            drops.is_empty(),
+            "drops must remain empty when no INET_DIAG_SKMEMINFO NLA"
+        );
+    }
+
+    /// Verify that both NLAs in a single frame are parsed together correctly.
+    #[test]
+    fn test_parse_frame_both_nlas() {
+        use super::{Protocol, SockKey, parse_frame};
+
+        let expected_drop: u32 = 42;
+        let expected_retrans: u32 = 99;
+
+        let mut frame = make_inet_diag_msg(2048, 1024);
+        // Append SKMEMINFO NLA (type 7) then INET_DIAG_INFO NLA (type 2).
+        let skmem_payload = make_skmeminfo_payload(8, expected_drop);
+        frame.extend_from_slice(&make_nla(INET_DIAG_SKMEMINFO, &skmem_payload));
+        let tcp_info_payload = make_tcp_info_payload(expected_retrans);
+        frame.extend_from_slice(&make_nla(INET_DIAG_INFO, &tcp_info_payload));
+
+        let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
+        let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
+        let mut retransmits: u64 = 0;
+
+        parse_frame(
+            &frame,
+            Protocol::Tcp,
+            false,
+            &mut bucket_map,
+            &mut drops,
+            &mut retransmits,
+        )
+        .expect("parse_frame must not fail on combined NLA frame");
+
+        assert_eq!(
+            drops.get(&Protocol::Tcp).copied().unwrap_or(0),
+            u64::from(expected_drop),
+            "skmem_drop must be accumulated from SKMEMINFO NLA"
+        );
+        assert_eq!(
+            retransmits,
+            u64::from(expected_retrans),
+            "tcpi_total_retrans must be accumulated from INET_DIAG_INFO NLA"
+        );
+    }
+
+    /// Verify that `INET_DIAG_INFO` NLA is ignored for UDP sockets (`is_udp=true`).
+    #[test]
+    fn test_parse_frame_udp_skips_tcp_info() {
+        use super::{Protocol, SockKey, parse_frame};
+
+        let mut frame = make_inet_diag_msg(0, 0);
+        // idiag_state = 7 for UDP (TCP_CLOSE → maps to Unconnected)
+        frame[1] = 7;
+        let tcp_info_payload = make_tcp_info_payload(9999);
+        frame.extend_from_slice(&make_nla(INET_DIAG_INFO, &tcp_info_payload));
+
+        let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
+        let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
+        let mut retransmits: u64 = 0;
+
+        parse_frame(
+            &frame,
+            Protocol::Udp,
+            true, // is_udp = true
+            &mut bucket_map,
+            &mut drops,
+            &mut retransmits,
+        )
+        .expect("parse_frame must not fail for UDP frame");
+
+        assert_eq!(
+            retransmits, 0,
+            "INET_DIAG_INFO must be ignored for UDP sockets"
+        );
+    }
+
+    /// Verify that a frame shorter than `INET_DIAG_MSG_MIN` is silently skipped.
+    #[test]
+    fn test_parse_frame_short_frame_silently_skipped() {
+        use super::{Protocol, SockKey, parse_frame};
+
+        let frame = vec![0u8; INET_DIAG_MSG_MIN - 1];
+
+        let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
+        let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
+        let mut retransmits: u64 = 0;
+
+        parse_frame(
+            &frame,
+            Protocol::Tcp,
+            false,
+            &mut bucket_map,
+            &mut drops,
+            &mut retransmits,
+        )
+        .expect("short frame must be silently skipped, not errored");
+
+        assert!(
+            bucket_map.is_empty(),
+            "no bucket must be created for a short frame"
+        );
+    }
+
+    /// Verify that a `tcp_info` payload that is shorter than
+    /// `TCP_INFO_TOTAL_RETRANS_OFFSET + 4` does not produce a retransmit count
+    /// (rather than panicking or returning an error).
+    #[test]
+    fn test_parse_frame_truncated_tcp_info_no_retrans() {
+        use super::{Protocol, SockKey, parse_frame};
+
+        // Payload is only 12 bytes — does not reach offset 100.
+        let short_tcp_info = vec![0xFFu8; 12];
+
+        let mut frame = make_inet_diag_msg(0, 0);
+        frame.extend_from_slice(&make_nla(INET_DIAG_INFO, &short_tcp_info));
+
+        let mut bucket_map: BTreeMap<SockKey, Bucket> = BTreeMap::new();
+        let mut drops: BTreeMap<Protocol, u64> = BTreeMap::new();
+        let mut retransmits: u64 = 0;
+
+        parse_frame(
+            &frame,
+            Protocol::Tcp,
+            false,
+            &mut bucket_map,
+            &mut drops,
+            &mut retransmits,
+        )
+        .expect("truncated tcp_info must be tolerated");
+
+        assert_eq!(
+            retransmits, 0,
+            "truncated tcp_info must produce zero retransmits"
+        );
+    }
 }

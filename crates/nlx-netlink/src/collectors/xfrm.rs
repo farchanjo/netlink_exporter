@@ -22,10 +22,10 @@
 //!
 //! **SADINFO/SPDINFO response format:**
 //! The reply message body is: `u32 flags` (echoed) + zero or more NLAs.
-//! - SADINFO NLAs: `XFRMA_SAD_CNT` (type 2, u32) and `XFRMA_SAD_HINFO`
-//!   (type 3, struct `xfrmu_sadhinfo` = {sadhcnt: u32, sadhmcnt: u32}).
-//! - SPDINFO NLAs: `XFRMA_SPD_INFO` (type 2, struct `xfrmu_spdinfo`, ignored),
-//!   `XFRMA_SPD_HINFO` (type 3, {spdhcnt: u32, spdhmcnt: u32}).
+//! - SADINFO NLAs: `XFRMA_SAD_CNT` (type 1, u32) and `XFRMA_SAD_HINFO`
+//!   (type 2, struct `xfrmu_sadhinfo` = {sadhcnt: u32, sadhmcnt: u32}).
+//! - SPDINFO NLAs: `XFRMA_SPD_INFO` (type 1, struct `xfrmu_spdinfo`, ignored),
+//!   `XFRMA_SPD_HINFO` (type 2, {spdhcnt: u32, spdhmcnt: u32}).
 //!
 //! **SA/Policy dump frame layout:**
 //! `XFRM_MSG_GETSA` dump responses contain `XFRM_MSG_NEWSA` frames.  Each
@@ -72,7 +72,7 @@ use nlx_ports::{
     driven::NetlinkXfrmPort,
     error::CollectError,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     transport::{MAX_DUMP_RESTARTS, NetlinkError, NetlinkSocket},
@@ -158,13 +158,19 @@ const POLICY_ACTION_OFFSET: usize = 161;
 // SADINFO / SPDINFO NLA type constants
 // ---------------------------------------------------------------------------
 
-/// NLA type `XFRMA_SAD_HINFO` (3) — `struct xfrmu_sadhinfo` in SADINFO reply.
+/// NLA type `XFRMA_SAD_HINFO` (2) — `struct xfrmu_sadhinfo` in SADINFO reply.
+///
+/// Kernel source: `include/uapi/linux/xfrm.h` line 347.
+/// Enum: `XFRMA_SAD_UNSPEC=0, XFRMA_SAD_CNT=1, XFRMA_SAD_HINFO=2`.
 /// Layout: `sadhcnt: u32` (current hash bucket count), `sadhmcnt: u32` (max).
-const XFRMA_SAD_HINFO: u16 = 3;
+const XFRMA_SAD_HINFO: u16 = 2;
 
-/// NLA type `XFRMA_SPD_HINFO` (3) — `struct xfrmu_spdhinfo` in SPDINFO reply.
+/// NLA type `XFRMA_SPD_HINFO` (2) — `struct xfrmu_spdhinfo` in SPDINFO reply.
+///
+/// Kernel source: `include/uapi/linux/xfrm.h` line 361.
+/// Enum: `XFRMA_SPD_UNSPEC=0, XFRMA_SPD_INFO=1, XFRMA_SPD_HINFO=2`.
 /// Layout: `spdhcnt: u32` (current hash bucket count), `spdhmcnt: u32` (max).
-const XFRMA_SPD_HINFO: u16 = 3;
+const XFRMA_SPD_HINFO: u16 = 2;
 
 /// Minimum payload size for `XFRMA_SAD_HINFO` / `XFRMA_SPD_HINFO`.
 const XFRM_HASHINFO_MIN: usize = 8; // sadhcnt(4) + sadhmcnt(4)
@@ -329,10 +335,15 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
 
         for frame in &frames {
             if frame.len() < XFRM_SA_INFO_MIN {
-                return Err(CollectError::Parse(format!(
-                    "XFRM_MSG_GETSA frame too short: {} < {XFRM_SA_INFO_MIN}",
-                    frame.len()
-                )));
+                // ERR-004: short frame — warn and skip this frame so that
+                // the remaining dump entries and the subsequent GETSADINFO /
+                // GETSPDINFO unicast queries are still executed.
+                warn!(
+                    len = frame.len(),
+                    min = XFRM_SA_INFO_MIN,
+                    "XFRM_MSG_GETSA frame too short; skipping"
+                );
+                continue;
             }
             // id.proto: sel(56) + id.daddr(16) + id.spi(4) = offset 76
             let proto = frame[SA_PROTO_OFFSET];
@@ -366,10 +377,15 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
 
         for frame in &frames {
             if frame.len() < XFRM_POLICY_INFO_MIN {
-                return Err(CollectError::Parse(format!(
-                    "XFRM_MSG_GETPOLICY frame too short: {} < {XFRM_POLICY_INFO_MIN}",
-                    frame.len()
-                )));
+                // ERR-004: short frame — warn and skip this frame so that
+                // the remaining dump entries and the subsequent GETSADINFO /
+                // GETSPDINFO unicast queries are still executed.
+                warn!(
+                    len = frame.len(),
+                    min = XFRM_POLICY_INFO_MIN,
+                    "XFRM_MSG_GETPOLICY frame too short; skipping"
+                );
+                continue;
             }
             // dir: sel(56) + lft(64) + curlft(32) + priority(4) + index(4) = offset 160
             let dir = frame[POLICY_DIR_OFFSET];
@@ -407,7 +423,7 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
             if let Some(nla_buf) = payload.get(4..) {
                 let (mut sadhcnt, mut sad_hash_max) = (0u32, 0u32);
                 for attr in parse_attrs(nla_buf) {
-                    // XFRMA_SAD_CNT (2): u32 total SA count — informational,
+                    // XFRMA_SAD_CNT (1): u32 total SA count — informational,
                     // not exposed as a metric (we count from the dump directly).
                     if attr.ty == XFRMA_SAD_HINFO && attr.payload.len() >= XFRM_HASHINFO_MIN {
                         // struct xfrmu_sadhinfo: sadhcnt(u32) + sadhmcnt(u32)
@@ -455,7 +471,7 @@ async fn collect_xfrm() -> Result<Vec<MetricSample>, CollectError> {
             if let Some(nla_buf) = payload.get(4..) {
                 let (mut spdhcnt, mut spd_hash_max) = (0u32, 0u32);
                 for attr in parse_attrs(nla_buf) {
-                    // XFRMA_SPD_INFO (2): xfrmu_spdinfo — not exposed as metrics.
+                    // XFRMA_SPD_INFO (1): xfrmu_spdinfo — not exposed as metrics.
                     if attr.ty == XFRMA_SPD_HINFO && attr.payload.len() >= XFRM_HASHINFO_MIN {
                         // struct xfrmu_spdhinfo: spdhcnt(u32) + spdhmcnt(u32)
                         if let (Some(hcnt_bytes), Some(hmcnt_bytes)) =
@@ -522,3 +538,190 @@ async fn dump_with_restarts(
 }
 
 // /proc/net/xfrm_stat parser removed per ADR-0023 §NATIVE API ONLY.
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        clippy::similar_names,
+        reason = "test"
+    )]
+
+    // parse_attrs is a private `use` in the parent module; access it directly
+    // from the crate to avoid relying on parent-module private use visibility.
+    use crate::wire::parse_attrs;
+
+    use super::{
+        XFRM_HASHINFO_MIN, XFRMA_SAD_HINFO, action_label, dir_label, mode_label, proto_label,
+    };
+
+    // ── TC-008: label helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn proto_label_known_protocols() {
+        assert_eq!(proto_label(50), "esp");
+        assert_eq!(proto_label(51), "ah");
+        assert_eq!(proto_label(108), "comp");
+    }
+
+    #[test]
+    fn proto_label_unknown_falls_back() {
+        assert_eq!(proto_label(0), "other");
+        assert_eq!(proto_label(255), "other");
+        assert_eq!(proto_label(17), "other"); // UDP is not an IPsec proto
+    }
+
+    #[test]
+    fn mode_label_known_modes() {
+        assert_eq!(mode_label(0), "transport");
+        assert_eq!(mode_label(1), "tunnel");
+        assert_eq!(mode_label(4), "beet");
+    }
+
+    #[test]
+    fn mode_label_unknown_falls_back() {
+        assert_eq!(mode_label(2), "other");
+        assert_eq!(mode_label(3), "other");
+        assert_eq!(mode_label(255), "other");
+    }
+
+    #[test]
+    fn dir_label_xfrm_policy_directions() {
+        // XFRM_POLICY_IN=0, XFRM_POLICY_OUT=1, XFRM_POLICY_FWD=2
+        // include/uapi/linux/xfrm.h:137-139
+        assert_eq!(dir_label(0), "in");
+        assert_eq!(dir_label(1), "out");
+        assert_eq!(dir_label(2), "fwd");
+    }
+
+    #[test]
+    fn dir_label_unknown_falls_back() {
+        assert_eq!(dir_label(3), "other");
+        assert_eq!(dir_label(255), "other");
+    }
+
+    #[test]
+    fn action_label_allow_and_block() {
+        assert_eq!(action_label(0), "allow");
+        assert_eq!(action_label(1), "block");
+        assert_eq!(action_label(2), "block");
+        assert_eq!(action_label(255), "block");
+    }
+
+    // ── M-30: synthetic GETSADINFO reply parse test ──────────────────────────
+    //
+    // Validates that XFRMA_SAD_HINFO is correctly recognised at NLA type 2
+    // (not 3) and that sadhcnt / sadhmcnt are decoded from the right offsets.
+    //
+    // Wire layout of a synthetic GETSADINFO unicast reply payload (after the
+    // netlink message header):
+    //
+    //   [0..4]   u32 flags (echoed) = 0xFFFF_FFFF (native-endian)
+    //   [4..]    NLA sequence:
+    //     NLA 1: XFRMA_SAD_CNT (type=1)  — 4-byte header + 4-byte u32 payload
+    //       nla_len=8, nla_type=1, payload=42 (u32 native-endian)
+    //     NLA 2: XFRMA_SAD_HINFO (type=2) — 4-byte header + 8-byte struct payload
+    //       nla_len=12, nla_type=2, payload={sadhcnt=7, sadhmcnt=64} (u32 ne each)
+    //
+    // NLA header format (include/uapi/linux/netlink.h):
+    //   u16 nla_len  (LE) — total length including 4-byte header
+    //   u16 nla_type (LE) — attribute type; bits 14-15 reserved, masked by NlaIter
+    //
+    // Total payload: 4 (flags) + 8 (NLA1) + 12 (NLA2) = 24 bytes.
+    // NLA1 stride = align4(8) = 8; NLA2 stride = align4(12) = 12.
+
+    #[test]
+    fn parse_getsadinfo_reply_hinfo_type2() {
+        // flags: 0xFFFF_FFFF in native-endian
+        let flags = 0xFFFF_FFFFu32.to_ne_bytes();
+
+        // NLA 1: XFRMA_SAD_CNT (type=1), payload=42u32
+        let nla1_len: u16 = 8; // 4 hdr + 4 payload
+        let nla1_type: u16 = 1; // XFRMA_SAD_CNT
+        let nla1_payload = 42u32.to_ne_bytes();
+
+        // NLA 2: XFRMA_SAD_HINFO (type=2), payload={sadhcnt=7, sadhmcnt=64}
+        let nla2_len: u16 = 12; // 4 hdr + 8 payload
+        let nla2_type: u16 = 2; // XFRMA_SAD_HINFO — must be 2, not 3
+        let sadhcnt = 7u32.to_ne_bytes();
+        let sadhmcnt = 64u32.to_ne_bytes();
+
+        let mut buf: Vec<u8> = Vec::with_capacity(24);
+        buf.extend_from_slice(&flags);
+        buf.extend_from_slice(&nla1_len.to_ne_bytes());
+        buf.extend_from_slice(&nla1_type.to_ne_bytes());
+        buf.extend_from_slice(&nla1_payload);
+        buf.extend_from_slice(&nla2_len.to_ne_bytes());
+        buf.extend_from_slice(&nla2_type.to_ne_bytes());
+        buf.extend_from_slice(&sadhcnt);
+        buf.extend_from_slice(&sadhmcnt);
+
+        assert_eq!(buf.len(), 24);
+
+        // Simulate the parse path in collect_xfrm: skip 4-byte flags prefix.
+        let nla_buf = buf.get(4..).expect("nla_buf slice");
+        let (mut parsed_sadhcnt, mut parsed_sadhmcnt) = (0u32, 0u32);
+        for attr in parse_attrs(nla_buf) {
+            if attr.ty == XFRMA_SAD_HINFO && attr.payload.len() >= XFRM_HASHINFO_MIN {
+                if let (Some(hcnt), Some(hmcnt)) = (attr.payload.get(0..4), attr.payload.get(4..8))
+                {
+                    parsed_sadhcnt = u32::from_ne_bytes(hcnt.try_into().expect("hcnt 4 bytes"));
+                    parsed_sadhmcnt = u32::from_ne_bytes(hmcnt.try_into().expect("hmcnt 4 bytes"));
+                }
+            }
+        }
+
+        // XFRMA_SAD_HINFO at type=2 must be matched (not skipped as type=3).
+        assert_eq!(
+            parsed_sadhcnt, 7,
+            "sadhcnt must be parsed when XFRMA_SAD_HINFO=2"
+        );
+        assert_eq!(
+            parsed_sadhmcnt, 64,
+            "sadhmcnt must be parsed when XFRMA_SAD_HINFO=2"
+        );
+    }
+
+    /// Regression guard: if `XFRMA_SAD_HINFO` were incorrectly 3, the NLA at
+    /// type=2 would not match and both counts would stay at 0.
+    #[test]
+    fn parse_getsadinfo_reply_wrong_type3_yields_zero() {
+        let flags = 0u32.to_ne_bytes();
+        // NLA with type=3 (the old wrong value)
+        let nla_len: u16 = 12;
+        let wrong_type: u16 = 3;
+        let sadhcnt = 99u32.to_ne_bytes();
+        let sadhmcnt = 128u32.to_ne_bytes();
+
+        let mut buf: Vec<u8> = Vec::with_capacity(16);
+        buf.extend_from_slice(&flags);
+        buf.extend_from_slice(&nla_len.to_ne_bytes());
+        buf.extend_from_slice(&wrong_type.to_ne_bytes());
+        buf.extend_from_slice(&sadhcnt);
+        buf.extend_from_slice(&sadhmcnt);
+
+        let nla_buf = buf.get(4..).expect("nla_buf");
+        let (mut parsed_sadhcnt, mut parsed_sadhmcnt) = (0u32, 0u32);
+        for attr in parse_attrs(nla_buf) {
+            // XFRMA_SAD_HINFO is 2 — type=3 must NOT match.
+            if attr.ty == XFRMA_SAD_HINFO && attr.payload.len() >= XFRM_HASHINFO_MIN {
+                if let (Some(hcnt), Some(hmcnt)) = (attr.payload.get(0..4), attr.payload.get(4..8))
+                {
+                    parsed_sadhcnt = u32::from_ne_bytes(hcnt.try_into().expect("hcnt"));
+                    parsed_sadhmcnt = u32::from_ne_bytes(hmcnt.try_into().expect("hmcnt"));
+                }
+            }
+        }
+        assert_eq!(parsed_sadhcnt, 0, "type=3 must not match XFRMA_SAD_HINFO=2");
+        assert_eq!(
+            parsed_sadhmcnt, 0,
+            "type=3 must not match XFRMA_SAD_HINFO=2"
+        );
+    }
+}

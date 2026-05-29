@@ -52,6 +52,23 @@ const NETLINK_NETFILTER: i32 = 12;
 const NFGENMSG_LEN: usize = 4;
 
 // `nlmsg_type` values: (NFNL_SUBSYS_CTNETLINK=1) << 8 | msg_type
+//
+// Enum `ipctnl_msg_ct_type` in
+// include/uapi/linux/netfilter/nfnetlink_conntrack.h:
+//   IPCTNL_MSG_CT_NEW           = 0  (line 7)
+//   IPCTNL_MSG_CT_GET           = 1  (line 8)
+//   IPCTNL_MSG_CT_GET_CTRZERO   = 2
+//   IPCTNL_MSG_CT_DELETE        = 3
+//   IPCTNL_MSG_CT_GET_STATS_CPU = 4  (line 11)
+//   IPCTNL_MSG_CT_GET_STATS     = 5  (line 12)
+// NFNL_SUBSYS_CTNETLINK = 1 (nfnetlink.h:52)
+
+/// Dump all active conntrack entries (`IPCTNL_MSG_CT_GET`).
+///
+/// Wire value: `(NFNL_SUBSYS_CTNETLINK=1) << 8 | IPCTNL_MSG_CT_GET=1 = 257`.
+/// Source: `nfnetlink_conntrack.h:8`, `nfnetlink.h:52`.
+const IPCTNL_MSG_CT_GET: u16 = (1u16 << 8) | 1;
+
 /// Per-CPU stats — raw `nf_conntrack_stat` body, no nlattr wrapping.
 const IPCTNL_MSG_CT_GET_STATS_CPU: u16 = (1u16 << 8) | 4;
 /// Global stats — carries `CTA_STATS_GLOBAL_ENTRIES`.
@@ -470,7 +487,9 @@ impl NetlinkConntrackPort for ConntrackCollector {
         let mut restarts: u32 = 0;
         let frames = loop {
             let nfgenmsg = nfgenmsg_unspec();
-            match sock.dump(1u16 << 8, 0, &nfgenmsg).await {
+            // M-1/WC-011: use IPCTNL_MSG_CT_GET (=257) not IPCTNL_MSG_CT_NEW
+            // (=256).  Dump must request GET; NEW is for creating entries.
+            match sock.dump(IPCTNL_MSG_CT_GET, 0, &nfgenmsg).await {
                 Ok(f) => break f,
                 Err(NetlinkError::DumpIntr) if restarts < MAX_DUMP_RESTARTS => {
                     restarts = restarts.saturating_add(1);
@@ -481,11 +500,13 @@ impl NetlinkConntrackPort for ConntrackCollector {
 
         let mut flows = Vec::new();
         for frame in &frames {
+            // ERR-003: early cap — stop processing frames once the entry limit
+            // is reached to bound CPU/memory cost on large conntrack tables.
+            if flows.len() >= CT_DUMP_MAX_ENTRIES {
+                break;
+            }
             if let Some(flow) = parse_flow_frame(frame) {
                 flows.push(flow);
-                if flows.len() >= CT_DUMP_MAX_ENTRIES {
-                    break;
-                }
             }
         }
         Ok(flows)
@@ -561,7 +582,61 @@ fn map_nl_err(e: NetlinkError) -> CollectError {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        reason = "test"
+    )]
+
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Wire-building helpers shared across TC-015 tests
+    // -----------------------------------------------------------------------
+
+    /// Append one big-endian u32 nlattr (type, value) — 4-byte header (native
+    /// `nla_len/nla_type`) + 4-byte big-endian payload (matches ctnetlink).
+    fn push_be32_nla(buf: &mut Vec<u8>, ty: u16, val: u32) {
+        let len: u16 = 8;
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&ty.to_ne_bytes());
+        buf.extend_from_slice(&val.to_be_bytes());
+    }
+
+    /// Append one u8 nlattr (type, value) — 4-byte header + 1 byte payload +
+    /// 3 bytes NLA padding (`NLA_ALIGN(5)` = 8).
+    fn push_u8_nla(buf: &mut Vec<u8>, ty: u16, val: u8) {
+        let len: u16 = 5; // 4-byte header + 1 byte payload
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&ty.to_ne_bytes());
+        buf.push(val);
+        buf.extend_from_slice(&[0u8, 0u8, 0u8]); // NLA_ALIGN(5) padding
+    }
+
+    /// Append one big-endian u64 nlattr — 4-byte header + 8 bytes BE payload.
+    fn push_be64_nla(buf: &mut Vec<u8>, ty: u16, val: u64) {
+        let len: u16 = 12; // 4 + 8
+        buf.extend_from_slice(&len.to_ne_bytes());
+        buf.extend_from_slice(&ty.to_ne_bytes());
+        buf.extend_from_slice(&val.to_be_bytes());
+    }
+
+    /// Wrap `inner` bytes in a nested nlattr with the given type.
+    /// Sets the `NLA_F_NESTED` flag (bit 15) on the type, matching kernel
+    /// `nla_nest_start`.  The parser strips the flag via `NLA_TYPE_MASK`.
+    fn wrap_nested(ty: u16, inner: &[u8]) -> Vec<u8> {
+        let nested_ty = ty | 0x8000u16; // NLA_F_NESTED
+        let total_len = 4 + inner.len(); // header + payload (no padding needed at outer level)
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(&(total_len as u16).to_ne_bytes());
+        out.extend_from_slice(&nested_ty.to_ne_bytes());
+        out.extend_from_slice(inner);
+        // NLA_ALIGN the outer attr so subsequent attrs parse correctly.
+        let padded = (total_len + 3) & !3;
+        out.resize(padded, 0u8);
+        out
+    }
 
     #[test]
     fn proto_label_known() {
@@ -576,15 +651,6 @@ mod tests {
         assert_eq!(tcp_state_label(3), "established");
         assert_eq!(tcp_state_label(7), "time_wait");
         assert_eq!(tcp_state_label(200), "other");
-    }
-
-    /// Append one big-endian u32 nlattr (type, value) — 4-byte header (native
-    /// `nla_len/nla_type`) + 4-byte big-endian payload (matches ctnetlink).
-    fn push_be32_nla(buf: &mut Vec<u8>, ty: u16, val: u32) {
-        let len: u16 = 8;
-        buf.extend_from_slice(&len.to_ne_bytes());
-        buf.extend_from_slice(&ty.to_ne_bytes());
-        buf.extend_from_slice(&val.to_be_bytes());
     }
 
     #[test]
@@ -659,5 +725,131 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "nft_conntrack_chaintoolong_total")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-015: parse_flow_frame — synthetic wire frames
+    // -----------------------------------------------------------------------
+
+    /// Verify the wire constants match the kernel enum ordinals.
+    ///
+    /// `nfnetlink_conntrack.h:7-8`, `nfnetlink.h:52`:
+    ///   `IPCTNL_MSG_CT_NEW=0`, `IPCTNL_MSG_CT_GET=1` → (1<<8)|1 = 257
+    #[test]
+    fn ipctnl_msg_ct_get_wire_value() {
+        assert_eq!(IPCTNL_MSG_CT_GET, 257u16, "must be (SUBSYS=1)<<8 | GET=1");
+        assert_eq!(
+            IPCTNL_MSG_CT_GET_STATS_CPU, 260u16,
+            "must be (SUBSYS=1)<<8 | STATS_CPU=4"
+        );
+        assert_eq!(
+            IPCTNL_MSG_CT_GET_STATS, 261u16,
+            "must be (SUBSYS=1)<<8 | STATS=5"
+        );
+    }
+
+    /// Build a synthetic conntrack flow frame for TCP proto=6, state=established(3),
+    /// orig 100 packets / 50000 bytes, reply 80 packets / 40000 bytes.
+    ///
+    /// Frame layout: 4-byte nfgenmsg + `CTA_TUPLE_ORIG` nest + `CTA_PROTOINFO` nest
+    /// + `CTA_COUNTERS_ORIG` nest + `CTA_COUNTERS_REPLY` nest.
+    fn build_tcp_flow_frame() -> Vec<u8> {
+        // CTA_PROTO_NUM (1) = 6 (TCP)
+        let mut proto_num_attr = Vec::new();
+        push_u8_nla(&mut proto_num_attr, CTA_PROTO_NUM, 6);
+
+        // CTA_TUPLE_PROTO (2) nested → proto_num
+        let proto_nest = wrap_nested(CTA_TUPLE_PROTO, &proto_num_attr);
+
+        // CTA_TUPLE_ORIG (1) nested → CTA_TUPLE_PROTO
+        let tuple_orig = wrap_nested(CTA_TUPLE_ORIG, &proto_nest);
+
+        // CTA_PROTOINFO_TCP_STATE (1) = 3 (established)
+        let mut tcp_state_attr = Vec::new();
+        push_u8_nla(&mut tcp_state_attr, CTA_PROTOINFO_TCP_STATE, 3);
+
+        // CTA_PROTOINFO_TCP (1) nested → state
+        let tcp_nest = wrap_nested(CTA_PROTOINFO_TCP, &tcp_state_attr);
+
+        // CTA_PROTOINFO (4) nested → CTA_PROTOINFO_TCP
+        let protoinfo = wrap_nested(CTA_PROTOINFO, &tcp_nest);
+
+        // CTA_COUNTERS_ORIG (9): packets=100, bytes=50000
+        let mut orig_counters = Vec::new();
+        push_be64_nla(&mut orig_counters, CTA_COUNTERS_PACKETS, 100);
+        push_be64_nla(&mut orig_counters, CTA_COUNTERS_BYTES, 50_000);
+        let counters_orig = wrap_nested(CTA_COUNTERS_ORIG, &orig_counters);
+
+        // CTA_COUNTERS_REPLY (10): packets=80, bytes=40000
+        let mut reply_counters = Vec::new();
+        push_be64_nla(&mut reply_counters, CTA_COUNTERS_PACKETS, 80);
+        push_be64_nla(&mut reply_counters, CTA_COUNTERS_BYTES, 40_000);
+        let counters_reply = wrap_nested(CTA_COUNTERS_REPLY, &reply_counters);
+
+        // Assemble: 4-byte nfgenmsg (all zeros = AF_UNSPEC, version 0, res_id 0)
+        // followed by the flat attr sequence.
+        let mut frame = vec![0u8; NFGENMSG_LEN];
+        frame.extend_from_slice(&tuple_orig);
+        frame.extend_from_slice(&protoinfo);
+        frame.extend_from_slice(&counters_orig);
+        frame.extend_from_slice(&counters_reply);
+        frame
+    }
+
+    #[test]
+    fn parse_flow_frame_tcp_established() {
+        let frame = build_tcp_flow_frame();
+        let flow = parse_flow_frame(&frame).expect("must parse synthetic TCP frame");
+
+        assert_eq!(flow.protocol, "tcp");
+        assert_eq!(flow.state, "established");
+        assert_eq!(flow.orig_packets, 100);
+        assert_eq!(flow.orig_bytes, 50_000);
+        assert_eq!(flow.reply_packets, 80);
+        assert_eq!(flow.reply_bytes, 40_000);
+    }
+
+    /// A frame shorter than `NFGENMSG_LEN` must yield None.
+    #[test]
+    fn parse_flow_frame_too_short() {
+        assert!(parse_flow_frame(&[0u8; 3]).is_none());
+        assert!(parse_flow_frame(&[]).is_none());
+    }
+
+    /// A frame with only the nfgenmsg header and no attrs yields Some with
+    /// default zero / "other" / "new" values — degenerate but not an error.
+    #[test]
+    fn parse_flow_frame_empty_attrs() {
+        let frame = vec![0u8; NFGENMSG_LEN]; // nfgenmsg only, no nlattrs
+        let flow = parse_flow_frame(&frame).expect("degenerate frame must still parse");
+        assert_eq!(flow.protocol, "other"); // proto=0 → "other"
+        assert_eq!(flow.state, "new"); // default
+        assert_eq!(flow.orig_packets, 0);
+        assert_eq!(flow.orig_bytes, 0);
+        assert_eq!(flow.reply_packets, 0);
+        assert_eq!(flow.reply_bytes, 0);
+    }
+
+    /// A UDP flow has no `CTA_PROTOINFO` so state falls back to `CTA_STATUS`
+    /// `IPS_ASSURED` check.  With status=4 (bit 2 set) → "established".
+    #[test]
+    fn parse_flow_frame_udp_assured() {
+        // CTA_PROTO_NUM = 17 (UDP)
+        let mut proto_num_attr = Vec::new();
+        push_u8_nla(&mut proto_num_attr, CTA_PROTO_NUM, 17);
+        let proto_nest = wrap_nested(CTA_TUPLE_PROTO, &proto_num_attr);
+        let tuple_orig = wrap_nested(CTA_TUPLE_ORIG, &proto_nest);
+
+        // CTA_STATUS (3) = 4 → IPS_ASSURED bit set → "established"
+        let mut status_attr = Vec::new();
+        push_be32_nla(&mut status_attr, CTA_STATUS, 4u32);
+
+        let mut frame = vec![0u8; NFGENMSG_LEN];
+        frame.extend_from_slice(&tuple_orig);
+        frame.extend_from_slice(&status_attr);
+
+        let flow = parse_flow_frame(&frame).expect("UDP assured frame must parse");
+        assert_eq!(flow.protocol, "udp");
+        assert_eq!(flow.state, "established");
     }
 }

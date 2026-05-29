@@ -23,6 +23,9 @@ bytemuck     = { workspace = true }
 byteorder    = { workspace = true }
 thiserror    = { workspace = true }
 tracing      = { workspace = true }
+# caps: drop listener-thread privileges to empty after privileged setup
+# (SEC-PRIV-002 / ADR-0026 — recv loop needs no capabilities).
+caps         = { workspace = true }
 
 [lints]
 workspace = true

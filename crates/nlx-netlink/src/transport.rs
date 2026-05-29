@@ -554,7 +554,8 @@ impl NetlinkSocket {
 ///
 /// # Errors
 ///
-/// Returns `NetlinkError::Send` if `submit_and_wait` fails or `cqe.result() < 0`.
+/// Returns `NetlinkError::Send` if `submit_and_wait` fails or `cqe.result() < 0`,
+/// or if the sent byte count does not equal `send_buf.len()` (partial send).
 ///
 /// # Safety (buffer lifetime contract)
 ///
@@ -605,7 +606,17 @@ pub(crate) fn uring_send(
                 std::io::Error::from_raw_os_error(-res).to_string(),
             ));
         }
-        return Ok(res as usize);
+        // IOU-02: AF_NETLINK is a datagram socket — the kernel must accept the
+        // entire message atomically.  A byte count that does not equal the
+        // request length means the message was not delivered; treat as an error.
+        let sent = res as usize;
+        if sent != send_buf.len() {
+            return Err(NetlinkError::Send(format!(
+                "partial send: {sent} of {} bytes",
+                send_buf.len()
+            )));
+        }
+        return Ok(sent);
     }
 
     Err(NetlinkError::Send("no CQE after submit_and_wait".into()))
@@ -766,9 +777,19 @@ fn blocking_dump(
 
 /// Execute a single unicast request on the blocking thread using `io_uring`.
 ///
-/// Submits one `IORING_OP_SEND` then one `IORING_OP_RECV`, each with
-/// `submit_and_wait(1)`.  Single-in-flight; buffer-lifetime SAFETY contract
-/// trivially satisfied (see module-level doc).
+/// Submits one `IORING_OP_SEND` then loops `IORING_OP_RECV` until
+/// `parse_datagram` signals `Ok(true)` (`NLMSG_DONE` or ACK).
+///
+/// # IOU-07
+///
+/// The previous single-recv design dropped the reply when the kernel sent the
+/// application frames in one datagram and `NLMSG_DONE` in a second datagram (the
+/// `NLM_F_MULTI` case used by `CTRL_CMD_GETFAMILY` and some unicast subsystems).
+/// The recv loop mirrors `blocking_dump`'s inner loop: continue on `Ok(false)`,
+/// return on `Ok(true)`, propagate all errors unchanged.
+///
+/// Single-in-flight; buffer-lifetime SAFETY contract trivially satisfied (see
+/// module-level doc).
 #[cfg(target_os = "linux")]
 #[allow(
     clippy::needless_pass_by_value,
@@ -787,14 +808,21 @@ fn blocking_request_single(
     // --- IORING_OP_SEND ---
     uring_send(&mut ring, raw_fd, &request)?;
 
-    // --- IORING_OP_RECV ---
+    // --- IORING_OP_RECV loop ---
+    // IOU-07: loop until parse_datagram returns Ok(true) so that multi-part
+    // unicast replies (NLM_F_MULTI + NLMSG_DONE in a separate datagram) are
+    // fully consumed before we return the first payload frame.
     let buf_len = rcvbuf_size.max(RECV_BUF_LEN);
     let mut recv_buf = vec![0u8; buf_len];
-    let n = uring_recv(&mut ring, raw_fd, &mut recv_buf)?;
+    let mut out: Vec<Vec<u8>> = Vec::new();
 
-    let mut out = Vec::new();
-    NetlinkSocket::parse_datagram(&recv_buf, n, &mut out)?;
-    Ok(out.into_iter().next())
+    loop {
+        let n = uring_recv(&mut ring, raw_fd, &mut recv_buf)?;
+
+        if NetlinkSocket::parse_datagram(&recv_buf, n, &mut out)? {
+            return Ok(out.into_iter().next());
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -814,3 +842,337 @@ fn blocking_request_single(
 
 /// Alias kept for existing stub callers; prefer [`NetlinkError`] in new code.
 pub type TransportError = NetlinkError;
+
+// ---------------------------------------------------------------------------
+// Unit tests (TC-001)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        reason = "test"
+    )]
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Helpers to build raw nlmsghdr frames
+    // -----------------------------------------------------------------------
+
+    /// Build a raw `nlmsghdr` + optional payload bytes.
+    ///
+    /// `nlmsg_len` is computed from `NLMSG_HDRLEN + payload.len()` unless the
+    /// caller requests a deliberately short value via `override_len`.
+    fn make_nlmsg(
+        nlmsg_type: u16,
+        nlmsg_flags: u16,
+        payload: &[u8],
+        override_len: Option<u32>,
+    ) -> Vec<u8> {
+        let total = NLMSG_HDRLEN + payload.len();
+        let nlmsg_len = override_len.unwrap_or(total as u32);
+
+        let mut buf = Vec::with_capacity(align4(total));
+        buf.extend_from_slice(&nlmsg_len.to_ne_bytes()); // nlmsg_len  (u32 LE)
+        buf.extend_from_slice(&nlmsg_type.to_ne_bytes()); // nlmsg_type (u16 LE)
+        buf.extend_from_slice(&nlmsg_flags.to_ne_bytes()); // nlmsg_flags(u16 LE)
+        buf.extend_from_slice(&1u32.to_ne_bytes()); // nlmsg_seq
+        buf.extend_from_slice(&0u32.to_ne_bytes()); // nl_pid
+        buf.extend_from_slice(payload);
+        // NLA-pad to 4-byte boundary so a chained second message is aligned.
+        let pad = align4(buf.len()) - buf.len();
+        buf.extend(std::iter::repeat_n(0u8, pad));
+        buf
+    }
+
+    /// Build a minimal `NLMSG_ERROR` frame with the given raw (kernel-signed) errno.
+    ///
+    /// The kernel stores `nlmsgerr.error` as a negative errno; zero means ACK.
+    fn make_nlmsg_error(raw_errno: i32) -> Vec<u8> {
+        make_nlmsg(NLMSG_ERROR, 0, &raw_errno.to_ne_bytes(), None)
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_datagram — TC-001
+    // -----------------------------------------------------------------------
+
+    /// `NLMSG_DONE` → Ok(true), out unchanged.
+    #[test]
+    fn parse_datagram_done_returns_true() {
+        let frame = make_nlmsg(NLMSG_DONE, 0, &[], None);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&frame, frame.len(), &mut out);
+        assert!(
+            matches!(result, Ok(true)),
+            "NLMSG_DONE must return Ok(true)"
+        );
+        assert!(out.is_empty(), "no payload expected for NLMSG_DONE");
+    }
+
+    /// `NLMSG_ERROR` with non-zero errno → `KernelError`.
+    #[test]
+    fn parse_datagram_error_nonzero_errno() {
+        // Kernel stores errno as negative; abs() is taken by parse_datagram.
+        let frame = make_nlmsg_error(-2i32); // ENOENT
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&frame, frame.len(), &mut out);
+        assert!(
+            matches!(result, Err(NetlinkError::KernelError { errno: 2 })),
+            "expected KernelError with errno=2, got {result:?}"
+        );
+    }
+
+    /// `NLMSG_ERROR` with errno == 0 → ACK → Ok(true).
+    #[test]
+    fn parse_datagram_error_zero_errno_is_ack() {
+        let frame = make_nlmsg_error(0);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&frame, frame.len(), &mut out);
+        assert!(
+            matches!(result, Ok(true)),
+            "NLMSG_ERROR errno=0 (ACK) must return Ok(true)"
+        );
+    }
+
+    /// `NLM_F_DUMP_INTR` set on any message → `DumpIntr` error.
+    #[test]
+    fn parse_datagram_dump_intr() {
+        // Use a normal application message type (0x10 = GENL_ID_CTRL) with the
+        // NLM_F_DUMP_INTR flag set.
+        let frame = make_nlmsg(0x10, NLM_F_DUMP_INTR, &[0xAAu8, 0xBBu8], None);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&frame, frame.len(), &mut out);
+        assert!(
+            matches!(result, Err(NetlinkError::DumpIntr)),
+            "NLM_F_DUMP_INTR must produce DumpIntr"
+        );
+    }
+
+    /// `NLMSG_OVERRUN` → `RecvBufOverflow` error.
+    #[test]
+    fn parse_datagram_overrun() {
+        let frame = make_nlmsg(NLMSG_OVERRUN, 0, &[], None);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&frame, frame.len(), &mut out);
+        assert!(
+            matches!(result, Err(NetlinkError::RecvBufOverflow)),
+            "NLMSG_OVERRUN must produce RecvBufOverflow"
+        );
+    }
+
+    /// `nlmsg_len` < `NLMSG_HDRLEN` → Parse error.
+    #[test]
+    fn parse_datagram_short_nlmsg_len() {
+        // override_len = 8, which is less than NLMSG_HDRLEN (16).
+        let frame = make_nlmsg(NLMSG_DONE, 0, &[], Some(8));
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&frame, frame.len(), &mut out);
+        assert!(
+            matches!(result, Err(NetlinkError::Parse(_))),
+            "nlmsg_len < NLMSG_HDRLEN must produce Parse error"
+        );
+    }
+
+    /// Multi-message datagram: two application messages followed by `NLMSG_DONE`.
+    /// Verifies that `out` accumulates both payloads and the function returns Ok(true).
+    #[test]
+    fn parse_datagram_multi_message_accumulation() {
+        let payload_a = b"hello";
+        let payload_b = b"world!";
+
+        // Application message type outside the reserved range (e.g. 0x20).
+        let msg_a = make_nlmsg(0x20, NLM_F_MULTI, payload_a, None);
+        let msg_b = make_nlmsg(0x20, NLM_F_MULTI, payload_b, None);
+        let done = make_nlmsg(NLMSG_DONE, NLM_F_MULTI, &[], None);
+
+        let mut datagram = Vec::new();
+        datagram.extend_from_slice(&msg_a);
+        datagram.extend_from_slice(&msg_b);
+        datagram.extend_from_slice(&done);
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&datagram, datagram.len(), &mut out);
+
+        assert!(
+            matches!(result, Ok(true)),
+            "multi-message datagram ending with NLMSG_DONE must return Ok(true)"
+        );
+        assert_eq!(
+            out.len(),
+            2,
+            "both application payloads must be accumulated"
+        );
+        assert_eq!(out[0], payload_a);
+        assert_eq!(out[1], payload_b);
+    }
+
+    /// Multi-message datagram WITHOUT `NLMSG_DONE` (`NLM_F_MULTI` continuation).
+    /// Verifies that `out` accumulates the payload and the function returns Ok(false).
+    #[test]
+    fn parse_datagram_multi_no_done_returns_false() {
+        let payload = b"fragment";
+        let msg = make_nlmsg(0x20, NLM_F_MULTI, payload, None);
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let result = NetlinkSocket::parse_datagram(&msg, msg.len(), &mut out);
+
+        assert!(
+            matches!(result, Ok(false)),
+            "NLM_F_MULTI without NLMSG_DONE must return Ok(false)"
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_request — header and flag assertions (TC-001)
+    // -----------------------------------------------------------------------
+
+    /// Verify the wire layout of a `build_request` output:
+    /// - bytes [0..4]: `nlmsg_len` == `NLMSG_HDRLEN` + `payload.len()` (native-endian u32)
+    /// - bytes [4..6]: `nlmsg_type` (native-endian u16)
+    /// - bytes [6..8]: `nlmsg_flags` has `NLM_F_REQUEST` set
+    /// - bytes [12..16]: `nl_pid` == 0
+    #[test]
+    fn build_request_wire_layout() {
+        let payload = b"test_payload";
+        let msg_type: u16 = 0x1234;
+        let extra_flags: u16 = 0x0100; // NLM_F_ROOT
+
+        let buf = NetlinkSocket::build_request(msg_type, extra_flags, payload);
+
+        // nlmsg_len
+        let nlmsg_len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            nlmsg_len,
+            NLMSG_HDRLEN + payload.len(),
+            "nlmsg_len must be NLMSG_HDRLEN + payload len"
+        );
+
+        // nlmsg_type
+        let nlmsg_type = u16::from_ne_bytes(buf[4..6].try_into().unwrap());
+        assert_eq!(nlmsg_type, msg_type, "nlmsg_type must match argument");
+
+        // nlmsg_flags — NLM_F_REQUEST must always be set
+        let nlmsg_flags = u16::from_ne_bytes(buf[6..8].try_into().unwrap());
+        assert_ne!(
+            nlmsg_flags & NLM_F_REQUEST,
+            0,
+            "NLM_F_REQUEST must always be set"
+        );
+        assert_ne!(
+            nlmsg_flags & extra_flags,
+            0,
+            "caller-supplied flags must be or'd in"
+        );
+
+        // nl_pid (bytes 12..16) must be zero (kernel target)
+        let nl_pid = u32::from_ne_bytes(buf[12..16].try_into().unwrap());
+        assert_eq!(nl_pid, 0, "nl_pid must be 0 (kernel target)");
+
+        // payload must immediately follow the 16-byte header
+        assert_eq!(&buf[NLMSG_HDRLEN..NLMSG_HDRLEN + payload.len()], payload);
+    }
+
+    /// `NLM_F_DUMP` flag is OR'd in by `dump()` — verify `build_request` passes
+    /// flags through unchanged (the or-with-NLM_F_DUMP happens at the call site).
+    #[test]
+    fn build_request_dump_flag_passthrough() {
+        let buf = NetlinkSocket::build_request(0x12, NLM_F_DUMP, &[]);
+        let nlmsg_flags = u16::from_ne_bytes(buf[6..8].try_into().unwrap());
+        assert_ne!(
+            nlmsg_flags & NLM_F_DUMP,
+            0,
+            "NLM_F_DUMP must be present when passed as flags"
+        );
+    }
+
+    /// Empty payload: `nlmsg_len` == `NLMSG_HDRLEN` exactly.
+    #[test]
+    fn build_request_empty_payload() {
+        let buf = NetlinkSocket::build_request(NLMSG_DONE, 0, &[]);
+        let nlmsg_len = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+        assert_eq!(nlmsg_len, NLMSG_HDRLEN);
+        assert_eq!(buf.len(), NLMSG_HDRLEN, "no extra bytes for empty payload");
+    }
+
+    // -----------------------------------------------------------------------
+    // IOU-07: blocking_request_single Ok(false) handling
+    // -----------------------------------------------------------------------
+
+    /// `parse_datagram` returning `Ok(false)` with non-empty `out` means the
+    /// caller should continue receiving.  Verify that the *in-module* loop in
+    /// `blocking_request_single` (the fixed version) does not short-circuit.
+    ///
+    /// We test this at the `parse_datagram` level because `blocking_request_single`
+    /// requires a live `io_uring` ring + fd (Linux-only).  The test confirms that:
+    ///   1. A datagram containing only application messages (no `NLMSG_DONE`)
+    ///      returns Ok(false) and pushes into out — this is the "partial reply"
+    ///      state that the old code returned early on.
+    ///   2. A subsequent datagram with `NLMSG_DONE` returns Ok(true) and does not
+    ///      clear the previously accumulated out entries.
+    #[test]
+    fn iou07_parse_datagram_false_then_true_accumulates() {
+        let payload = b"unicast_reply_payload";
+        let msg = make_nlmsg(0x20, NLM_F_MULTI, payload, None);
+        let done = make_nlmsg(NLMSG_DONE, NLM_F_MULTI, &[], None);
+
+        let mut out: Vec<Vec<u8>> = Vec::new();
+
+        // First datagram: application message, no NLMSG_DONE → Ok(false)
+        let r1 = NetlinkSocket::parse_datagram(&msg, msg.len(), &mut out);
+        assert!(
+            matches!(r1, Ok(false)),
+            "first partial datagram must be Ok(false)"
+        );
+        assert_eq!(out.len(), 1, "payload must be accumulated on Ok(false)");
+
+        // Second datagram: NLMSG_DONE → Ok(true); out still has the first payload.
+        let r2 = NetlinkSocket::parse_datagram(&done, done.len(), &mut out);
+        assert!(
+            matches!(r2, Ok(true)),
+            "NLMSG_DONE datagram must be Ok(true)"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "out must retain the payload accumulated in the previous call"
+        );
+        assert_eq!(out[0], payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // IOU-02: partial send detection
+    // -----------------------------------------------------------------------
+
+    /// `uring_send` must reject a result where the CQE `res` < `send_buf.len()`.
+    ///
+    /// This is tested via the `parse_datagram` / `build_request` surface because
+    /// `uring_send` requires a live `io_uring` ring (Linux-only, ring creation
+    /// would fail in macOS CI).  Instead we verify the invariant at the logic
+    /// level: a send shorter than the request is a datagram-atomicity violation.
+    ///
+    /// The actual kernel-path coverage is provided by the live integration test
+    /// run by the lead on the remote Linux host.
+    #[test]
+    fn iou02_send_buf_len_invariant_documented() {
+        // AF_NETLINK is a SOCK_RAW datagram socket.  The kernel either delivers
+        // the entire write atomically or returns EMSGSIZE.  Any CQE result < len
+        // is therefore a bug — the IOU-02 check catches it.
+        //
+        // Verify our understanding of the build_request output length so the
+        // uring_send length check has the right baseline.
+        let payload = b"xfrm_getpolicy";
+        let req = NetlinkSocket::build_request(0x1A, 0, payload);
+        // The send buffer must be exactly NLMSG_HDRLEN + payload.len() bytes
+        // (no extra padding from build_request itself for this case).
+        assert_eq!(
+            req.len(),
+            NLMSG_HDRLEN + payload.len(),
+            "build_request must produce NLMSG_HDRLEN + payload bytes (no trailing padding)"
+        );
+    }
+}

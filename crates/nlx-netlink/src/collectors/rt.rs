@@ -372,7 +372,27 @@ fn count_addresses(frames: &[Vec<u8>]) -> BTreeMap<String, u64> {
 // Route count (RTM_GETROUTE)
 // ---------------------------------------------------------------------------
 
-/// Key for aggregating routes: (`family_label`, `table_str`).
+/// Map a routing table ID to a bounded label string.
+///
+/// Well-known kernel table IDs (`linux/rtnetlink.h` `enum rt_class_t`):
+/// - 0   = `RT_TABLE_UNSPEC`
+/// - 253 = `RT_TABLE_DEFAULT`
+/// - 254 = `RT_TABLE_MAIN`
+/// - 255 = `RT_TABLE_LOCAL`
+///
+/// All other IDs are bucketed as `"other"` to prevent unbounded label
+/// cardinality on systems with many policy-routing tables (MC-002).
+fn table_label(id: u32) -> &'static str {
+    match id {
+        0 => "unspec",
+        253 => "default",
+        254 => "main",
+        255 => "local",
+        _ => "other",
+    }
+}
+
+/// Key for aggregating routes: (`family_label`, `table_label`).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct RouteKey {
     family: String,
@@ -380,6 +400,10 @@ struct RouteKey {
 }
 
 /// Count routes by (family, table). Parse `rtmsg` (12 B) + `RTA_TABLE` attr.
+///
+/// The table label is bounded to the four well-known names (`unspec`,
+/// `default`, `main`, `local`) plus `"other"` for all user-defined tables,
+/// preventing unbounded Prometheus label cardinality (MC-002).
 fn count_routes(frames: &[Vec<u8>]) -> BTreeMap<RouteKey, u64> {
     let mut counts: BTreeMap<RouteKey, u64> = BTreeMap::new();
     for frame in frames {
@@ -405,7 +429,7 @@ fn count_routes(frames: &[Vec<u8>]) -> BTreeMap<RouteKey, u64> {
 
         let key = RouteKey {
             family,
-            table: table_id.to_string(),
+            table: table_label(table_id).to_owned(),
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -564,5 +588,311 @@ impl Collector for RtCollector {
             // NETLINK_ROUTE is always available; probe by attempting to open.
             NetlinkSocket::open(NETLINK_ROUTE).is_ok()
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        clippy::too_many_arguments,
+        reason = "test"
+    )]
+
+    use super::*;
+    use crate::wire::{NLA_HDRLEN, align4};
+
+    // -----------------------------------------------------------------------
+    // Wire-building helpers
+    // -----------------------------------------------------------------------
+
+    /// Build a flat nlattr TLV: `u16 nla_len LE | u16 nla_type LE | payload | padding`.
+    fn make_nla(ty: u16, payload: &[u8]) -> Vec<u8> {
+        let nla_len = NLA_HDRLEN + payload.len();
+        let padded = align4(nla_len);
+        let mut out = Vec::with_capacity(padded);
+        out.extend_from_slice(&(nla_len as u16).to_ne_bytes());
+        out.extend_from_slice(&ty.to_ne_bytes());
+        out.extend_from_slice(payload);
+        out.resize(padded, 0u8);
+        out
+    }
+
+    /// Build a minimal `ifinfomsg` (16 B) with `ifi_flags` at offset 8 (u32 LE).
+    ///
+    /// Wire layout (`linux/if_link.h` `struct ifinfomsg`):
+    ///   family(1) pad(1) type(2) index(4) flags(4) change(4)
+    fn make_ifinfomsg(ifi_flags: u32) -> Vec<u8> {
+        let mut hdr = vec![0u8; 16];
+        // ifi_flags: offset 8, u32 LE
+        hdr[8..12].copy_from_slice(&ifi_flags.to_ne_bytes());
+        hdr
+    }
+
+    /// Build a `rtnl_link_stats64` payload (at least 64 B covering through
+    /// `tx_dropped` at offset 56).
+    ///
+    /// Field offsets (all u64 LE, `linux/if_link.h` `struct rtnl_link_stats64`):
+    ///   `rx_packets@0`, `tx_packets@8`, `rx_bytes@16`, `tx_bytes@24`,
+    ///   `rx_errors@32`, `tx_errors@40`, `rx_dropped@48`, `tx_dropped@56`
+    fn make_stats64(
+        rx_packets: u64,
+        tx_packets: u64,
+        rx_bytes: u64,
+        tx_bytes: u64,
+        rx_errors: u64,
+        tx_errors: u64,
+        rx_dropped: u64,
+        tx_dropped: u64,
+    ) -> Vec<u8> {
+        let mut s = vec![0u8; 64];
+        s[0..8].copy_from_slice(&rx_packets.to_ne_bytes());
+        s[8..16].copy_from_slice(&tx_packets.to_ne_bytes());
+        s[16..24].copy_from_slice(&rx_bytes.to_ne_bytes());
+        s[24..32].copy_from_slice(&tx_bytes.to_ne_bytes());
+        s[32..40].copy_from_slice(&rx_errors.to_ne_bytes());
+        s[40..48].copy_from_slice(&tx_errors.to_ne_bytes());
+        s[48..56].copy_from_slice(&rx_dropped.to_ne_bytes());
+        s[56..64].copy_from_slice(&tx_dropped.to_ne_bytes());
+        s
+    }
+
+    /// Build a minimal `rtmsg` (12 B).
+    ///
+    /// Wire layout (linux/rtnetlink.h `struct rtmsg`):
+    ///   family(1) `dst_len(1)` `src_len(1)` tos(1) table(1) protocol(1) scope(1) type(1) flags(4)
+    fn make_rtmsg(family: u8, table: u8) -> Vec<u8> {
+        let mut hdr = vec![0u8; 12];
+        hdr[0] = family;
+        hdr[4] = table; // rtm_table: u8 at offset 4
+        hdr
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-002: parse_link_frame
+    // -----------------------------------------------------------------------
+
+    /// Happy path: `ifinfomsg` (`IFF_UP|IFF_RUNNING`, operstate=6) + `IFLA_IFNAME`
+    /// + `IFLA_STATS64`.  Verifies all eight counter fields are decoded correctly.
+    #[test]
+    fn parse_link_frame_happy() {
+        // IFF_UP = 0x1, IFF_RUNNING = 0x40
+        let ifi_flags: u32 = IFF_UP | IFF_RUNNING;
+        let mut frame = make_ifinfomsg(ifi_flags);
+
+        // IFLA_IFNAME = 3, NUL-terminated
+        frame.extend_from_slice(&make_nla(IFLA_IFNAME, b"eth0\0"));
+        // IFLA_OPERSTATE = 16, operstate = 6 (IF_OPER_UP)
+        frame.extend_from_slice(&make_nla(IFLA_OPERSTATE, &[6u8]));
+        // IFLA_STATS64 = 23
+        let stats = make_stats64(100, 200, 1000, 2000, 3, 4, 5, 6);
+        frame.extend_from_slice(&make_nla(IFLA_STATS64, &stats));
+
+        let link = parse_link_frame(&frame).unwrap();
+        assert_eq!(link.name, "eth0");
+        assert!(link.up, "interface should be up");
+        assert_eq!(link.rx_packets, 100);
+        assert_eq!(link.tx_packets, 200);
+        assert_eq!(link.rx_bytes, 1000);
+        assert_eq!(link.tx_bytes, 2000);
+        assert_eq!(link.rx_errors, 3);
+        assert_eq!(link.tx_errors, 4);
+        assert_eq!(link.rx_dropped, 5);
+        assert_eq!(link.tx_dropped, 6);
+    }
+
+    /// Frame too short (< 16 B) must return `None`.
+    #[test]
+    fn parse_link_frame_too_short_returns_none() {
+        let frame = vec![0u8; 10];
+        assert!(parse_link_frame(&frame).is_none());
+    }
+
+    /// Frame with `IFLA_IFNAME` absent must return `None` (name is required).
+    #[test]
+    fn parse_link_frame_no_ifname_returns_none() {
+        let ifi_flags: u32 = IFF_UP | IFF_RUNNING;
+        let mut frame = make_ifinfomsg(ifi_flags);
+        // Append only IFLA_OPERSTATE, no IFLA_IFNAME
+        frame.extend_from_slice(&make_nla(IFLA_OPERSTATE, &[6u8]));
+        assert!(parse_link_frame(&frame).is_none());
+    }
+
+    /// Frame with no `IFLA_STATS64` must still parse (stats default to zero).
+    #[test]
+    fn parse_link_frame_no_stats64_returns_zero_counters() {
+        let ifi_flags: u32 = IFF_UP | IFF_RUNNING;
+        let mut frame = make_ifinfomsg(ifi_flags);
+        frame.extend_from_slice(&make_nla(IFLA_IFNAME, b"lo\0"));
+        let link = parse_link_frame(&frame).unwrap();
+        assert_eq!(link.name, "lo");
+        assert_eq!(link.rx_bytes, 0);
+        assert_eq!(link.tx_bytes, 0);
+    }
+
+    /// Interface is reported down when `IFF_UP` is absent.
+    #[test]
+    fn parse_link_frame_down_interface() {
+        // No IFF_UP bit
+        let ifi_flags: u32 = 0;
+        let mut frame = make_ifinfomsg(ifi_flags);
+        frame.extend_from_slice(&make_nla(IFLA_IFNAME, b"eth1\0"));
+        let link = parse_link_frame(&frame).unwrap();
+        assert!(!link.up, "interface without IFF_UP must be down");
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-002: count_routes
+    // -----------------------------------------------------------------------
+
+    /// Route with `RTA_TABLE` NLA overriding `rtm_table` byte.
+    /// Table 254 (main) with inet family.
+    #[test]
+    fn count_routes_with_rta_table_nla_main() {
+        // rtmsg: family=2 (AF_INET), rtm_table=0 (will be overridden by NLA)
+        let mut frame = make_rtmsg(2, 0);
+        // RTA_TABLE = 15, payload = 254u32 LE (RT_TABLE_MAIN)
+        frame.extend_from_slice(&make_nla(RTA_TABLE, &254u32.to_ne_bytes()));
+
+        let counts = count_routes(&[frame]);
+        let key = counts.keys().next().unwrap();
+        assert_eq!(key.family, "inet");
+        assert_eq!(key.table, "main");
+        assert_eq!(counts[key], 1);
+    }
+
+    /// Route without `RTA_TABLE` NLA — uses `rtm_table` byte directly.
+    /// Table byte 255 (local).
+    #[test]
+    fn count_routes_without_rta_table_nla_local() {
+        // rtmsg: family=10 (AF_INET6), rtm_table=255 (RT_TABLE_LOCAL), no NLA
+        let frame = make_rtmsg(10, 255);
+
+        let counts = count_routes(&[frame]);
+        let key = counts.keys().next().unwrap();
+        assert_eq!(key.family, "inet6");
+        assert_eq!(key.table, "local");
+        assert_eq!(counts[key], 1);
+    }
+
+    /// User-defined table ID (e.g. 100) must be bucketed as `"other"`.
+    #[test]
+    fn count_routes_user_defined_table_bucketed_as_other() {
+        // rtmsg: family=2, rtm_table=100
+        let frame = make_rtmsg(2, 100);
+        let counts = count_routes(&[frame]);
+        let key = counts.keys().next().unwrap();
+        assert_eq!(
+            key.table, "other",
+            "user-defined table 100 must map to 'other'"
+        );
+    }
+
+    /// Large table ID via `RTA_TABLE` NLA (e.g. 1000) must also be `"other"`.
+    #[test]
+    fn count_routes_large_rta_table_bucketed_as_other() {
+        let mut frame = make_rtmsg(2, 0);
+        frame.extend_from_slice(&make_nla(RTA_TABLE, &1000u32.to_ne_bytes()));
+        let counts = count_routes(&[frame]);
+        let key = counts.keys().next().unwrap();
+        assert_eq!(key.table, "other");
+    }
+
+    /// Frames shorter than 12 B are skipped without panic.
+    #[test]
+    fn count_routes_short_frame_skipped() {
+        let frame: Vec<u8> = vec![0u8; 5];
+        let counts = count_routes(&[frame]);
+        assert!(counts.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-002: table_label
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn table_label_well_known_ids() {
+        assert_eq!(table_label(0), "unspec");
+        assert_eq!(table_label(253), "default");
+        assert_eq!(table_label(254), "main");
+        assert_eq!(table_label(255), "local");
+    }
+
+    #[test]
+    fn table_label_unknown_ids_are_other() {
+        assert_eq!(table_label(1), "other");
+        assert_eq!(table_label(100), "other");
+        assert_eq!(table_label(252), "other");
+        assert_eq!(table_label(256), "other");
+        assert_eq!(table_label(u32::MAX), "other");
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-002: nud_state_label
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nud_state_label_individual_bits() {
+        assert_eq!(nud_state_label(NUD_PERMANENT), "permanent");
+        assert_eq!(nud_state_label(NUD_REACHABLE), "reachable");
+        assert_eq!(nud_state_label(NUD_STALE), "stale");
+        assert_eq!(nud_state_label(NUD_DELAY), "delay");
+        assert_eq!(nud_state_label(NUD_PROBE), "probe");
+        assert_eq!(nud_state_label(NUD_FAILED), "failed");
+        assert_eq!(nud_state_label(NUD_NOARP), "noarp");
+        assert_eq!(nud_state_label(NUD_INCOMPLETE), "incomplete");
+    }
+
+    #[test]
+    fn nud_state_label_zero_is_unknown() {
+        assert_eq!(nud_state_label(0), "unknown");
+    }
+
+    /// When multiple bits are set, the highest-priority label wins.
+    /// `NUD_PERMANENT` has the highest priority in the chain.
+    #[test]
+    fn nud_state_label_permanent_wins_over_reachable() {
+        let state = NUD_PERMANENT | NUD_REACHABLE;
+        assert_eq!(nud_state_label(state), "permanent");
+    }
+
+    // -----------------------------------------------------------------------
+    // TC-002: decode_ifname
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_ifname_with_trailing_nul() {
+        let payload = b"eth0\0";
+        assert_eq!(decode_ifname(payload), Some("eth0".to_owned()));
+    }
+
+    #[test]
+    fn decode_ifname_without_trailing_nul() {
+        let payload = b"eth0";
+        assert_eq!(decode_ifname(payload), Some("eth0".to_owned()));
+    }
+
+    #[test]
+    fn decode_ifname_empty_payload() {
+        assert_eq!(decode_ifname(b""), Some(String::new()));
+    }
+
+    #[test]
+    fn decode_ifname_only_nul() {
+        // Payload is a single NUL byte — should yield empty string.
+        assert_eq!(decode_ifname(b"\0"), Some(String::new()));
+    }
+
+    #[test]
+    fn decode_ifname_invalid_utf8_returns_none() {
+        // 0xFF is not valid UTF-8.
+        let payload: &[u8] = &[0xFF, 0xFE];
+        assert_eq!(decode_ifname(payload), None);
     }
 }

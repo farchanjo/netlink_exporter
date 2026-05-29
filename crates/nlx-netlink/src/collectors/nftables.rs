@@ -52,8 +52,21 @@
 //! | 12 | `"bridge"` |
 //! | 5  | `"netdev"` |
 //!
-//! All nftables-specific nlattr payloads are **native-endian** (LE on x86-64).
-//! Big-endian reads are NOT required for nftables (unlike ctnetlink).
+//! ## Byte-order of integer nftables NLAs
+//!
+//! Several nftables integer attributes are serialised big-endian by the kernel
+//! via `nla_put_be32` / `htonl`, **not** native-endian.  Use `read_u32_be` for:
+//!
+//! | Attribute | Kernel call | Source |
+//! |---|---|---|
+//! | `NFTA_HOOK_HOOKNUM`  | `nla_put_be32(skb, NFTA_HOOK_HOOKNUM, htonl(ops->hooknum))` | `nf_tables_api.c:1982` |
+//! | `NFTA_HOOK_PRIORITY` | `nla_put_be32(skb, NFTA_HOOK_PRIORITY, htonl(ops->priority))` | `nf_tables_api.c:1984` |
+//! | `NFTA_CHAIN_POLICY`  | `nla_put_be32(skb, NFTA_CHAIN_POLICY, ...)` | `nf_tables_api.c:2052` |
+//! | `NFTA_OBJ_TYPE`      | `nla_put_be32(skb, NFTA_OBJ_TYPE, htonl(obj->ops->type->type))` | `nf_tables_api.c:8384` |
+//!
+//! Counter bytes/packets (already big-endian via `nla_put_be64`) remain
+//! unchanged — they already use `read_u64_be`.  All other string/nested attrs
+//! are unaffected.
 //!
 //! ## ADR references
 //!
@@ -77,7 +90,7 @@ use nlx_ports::{
 
 use crate::{
     transport::{MAX_DUMP_RESTARTS, NetlinkError, NetlinkSocket},
-    wire::{nested_attrs, parse_attrs, read_u32, read_u64_be},
+    wire::{nested_attrs, parse_attrs, read_u32_be, read_u64_be},
 };
 
 // ---------------------------------------------------------------------------
@@ -286,7 +299,8 @@ fn parse_chain_frame(frame: &[u8]) -> Option<NftChain> {
             NFTA_CHAIN_NAME => chain = cstr_to_string(attr.payload),
             NFTA_CHAIN_TYPE => chain_type = cstr_to_string(attr.payload),
             NFTA_CHAIN_POLICY => {
-                if let Some(p) = read_u32(attr.payload) {
+                // Big-endian u32: kernel uses nla_put_be32 (nf_tables_api.c:2052).
+                if let Some(p) = read_u32_be(attr.payload) {
                     policy = policy_label(p).to_owned();
                 }
             }
@@ -294,16 +308,19 @@ fn parse_chain_frame(frame: &[u8]) -> Option<NftChain> {
                 for hook_attr in nested_attrs(attr.payload) {
                     match hook_attr.ty {
                         NFTA_HOOK_HOOKNUM => {
-                            if let Some(h) = read_u32(hook_attr.payload) {
+                            // Big-endian u32: kernel uses nla_put_be32 (nf_tables_api.c:1982).
+                            if let Some(h) = read_u32_be(hook_attr.payload) {
                                 hook = hook_label(h).to_owned();
                             }
                         }
                         NFTA_HOOK_PRIORITY => {
-                            if let Some(p) = read_u32(hook_attr.payload) {
-                                // Priority is a signed i32 in the kernel; cast is safe.
+                            // Big-endian u32: kernel uses nla_put_be32 (nf_tables_api.c:1984).
+                            // The priority field is a signed s32 in the kernel; reinterpret
+                            // the big-endian bytes as i32 directly.
+                            if let Some(p) = read_u32_be(hook_attr.payload) {
                                 #[expect(
                                     clippy::cast_possible_wrap,
-                                    reason = "nft hook priority is signed s32 in uapi"
+                                    reason = "nft hook priority is signed s32 in uapi; bit pattern preserved"
                                 )]
                                 {
                                     priority = p as i32;
@@ -357,7 +374,8 @@ fn parse_obj_frame(frame: &[u8]) -> Option<NftCounter> {
             NFTA_OBJ_TABLE => table = cstr_to_string(attr.payload),
             NFTA_OBJ_NAME => name = cstr_to_string(attr.payload),
             NFTA_OBJ_TYPE => {
-                obj_type = read_u32(attr.payload).unwrap_or(0);
+                // Big-endian u32: kernel uses nla_put_be32 (nf_tables_api.c:8384).
+                obj_type = read_u32_be(attr.payload).unwrap_or(0);
             }
             NFTA_OBJ_DATA => {
                 for data_attr in nested_attrs(attr.payload) {
@@ -679,7 +697,8 @@ mod tests {
     fn parse_obj_frame_non_counter_returns_none() {
         // Build a frame with NFTA_OBJ_TYPE = 2 (not NFT_OBJECT_COUNTER=1).
         let mut frame = vec![0u8; 4]; // nfgenmsg
-        frame.extend_from_slice(&make_nla(NFTA_OBJ_TYPE, &2u32.to_ne_bytes()));
+        // NFTA_OBJ_TYPE is big-endian (nla_put_be32 in kernel).
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_TYPE, &2u32.to_be_bytes()));
         frame.extend_from_slice(&make_nla(NFTA_OBJ_NAME, b"x\0"));
         assert!(parse_obj_frame(&frame).is_none());
     }
@@ -751,7 +770,8 @@ mod tests {
         let mut frame = vec![0u8; 4]; // nfgenmsg AF_UNSPEC
         frame.extend_from_slice(&make_nla(NFTA_OBJ_TABLE, b"filter\0"));
         frame.extend_from_slice(&make_nla(NFTA_OBJ_NAME, b"my_counter\0"));
-        frame.extend_from_slice(&make_nla(NFTA_OBJ_TYPE, &1u32.to_ne_bytes())); // NFT_OBJECT_COUNTER
+        // NFTA_OBJ_TYPE is big-endian (nla_put_be32 in kernel).
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_TYPE, &1u32.to_be_bytes())); // NFT_OBJECT_COUNTER
         frame.extend_from_slice(&obj_data_nla);
 
         let counter = parse_obj_frame(&frame).expect("should parse counter frame");
@@ -765,5 +785,122 @@ mod tests {
             counter.packets, pkts_be,
             "packets must be decoded as big-endian u64"
         );
+    }
+    // ------------------------------------------------------------------
+    // WC-001/002/003: NFTA_CHAIN_POLICY, NFTA_HOOK_HOOKNUM, NFTA_HOOK_PRIORITY
+    // are big-endian (nla_put_be32 in kernel).  Verify parse_chain_frame
+    // decodes them correctly from BE wire bytes.
+    // ------------------------------------------------------------------
+
+    /// Build a chain frame with `NFTA_CHAIN_HOOK` nested containing HOOKNUM +
+    /// PRIORITY, plus `NFTA_CHAIN_POLICY` — all encoded big-endian.
+    fn make_chain_frame_be(hooknum: u32, priority: i32, policy: u32) -> Vec<u8> {
+        let mut frame = vec![2u8, 0u8, 0u8, 0u8]; // nfgenmsg AF_INET(2)
+
+        // NFTA_CHAIN_TABLE
+        frame.extend_from_slice(&make_nla(NFTA_CHAIN_TABLE, b"filter "));
+        // NFTA_CHAIN_NAME
+        frame.extend_from_slice(&make_nla(NFTA_CHAIN_NAME, b"input "));
+        // NFTA_CHAIN_TYPE
+        frame.extend_from_slice(&make_nla(NFTA_CHAIN_TYPE, b"filter "));
+
+        // NFTA_CHAIN_HOOK (nested): HOOKNUM + PRIORITY — both big-endian u32
+        let mut hook_inner = make_nla(NFTA_HOOK_HOOKNUM, &hooknum.to_be_bytes());
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "reinterpret signed priority bits as u32 for big-endian wire encoding"
+        )]
+        hook_inner.extend_from_slice(&make_nla(
+            NFTA_HOOK_PRIORITY,
+            &(priority as u32).to_be_bytes(),
+        ));
+        frame.extend_from_slice(&make_nested_nla(NFTA_CHAIN_HOOK, &hook_inner));
+
+        // NFTA_CHAIN_POLICY — big-endian u32
+        frame.extend_from_slice(&make_nla(NFTA_CHAIN_POLICY, &policy.to_be_bytes()));
+
+        frame
+    }
+
+    #[test]
+    fn parse_chain_frame_policy_accept_big_endian() {
+        // NF_ACCEPT = 1; kernel serialises as big-endian 0x00_00_00_01.
+        // If read as native-endian on LE, this reads as 0x01_00_00_00 = 16777216 → "other".
+        // After fix (read_u32_be) it reads as 1 → "accept".
+        let frame = make_chain_frame_be(1 /* NF_INET_LOCAL_IN */, 0, 1 /* NF_ACCEPT */);
+        let chain = parse_chain_frame(&frame).expect("should parse chain frame");
+        assert_eq!(
+            chain.policy, "accept",
+            "NF_ACCEPT=1 encoded BE must decode to \"accept\""
+        );
+    }
+
+    #[test]
+    fn parse_chain_frame_policy_drop_big_endian() {
+        // NF_DROP = 0; big-endian and native-endian are identical for zero,
+        // but this guards that the path is exercised.
+        let frame = make_chain_frame_be(3 /* NF_INET_LOCAL_OUT */, 0, 0 /* NF_DROP */);
+        let chain = parse_chain_frame(&frame).expect("should parse chain frame");
+        assert_eq!(chain.policy, "drop");
+    }
+
+    #[test]
+    fn parse_chain_frame_hooknum_prerouting_big_endian() {
+        // hooknum=0 → "prerouting"; 0 is the same in both endiannesses,
+        // but this exercises the read_u32_be path.
+        let frame = make_chain_frame_be(0, 0, 1);
+        let chain = parse_chain_frame(&frame).expect("should parse");
+        assert_eq!(chain.hook, "prerouting");
+    }
+
+    #[test]
+    fn parse_chain_frame_hooknum_input_big_endian() {
+        // hooknum=1 → "input".  On LE, native-endian 1u32 = [01 00 00 00].
+        // big-endian 1u32 = [00 00 00 01].  The fix ensures we read the BE form.
+        let frame = make_chain_frame_be(1, 0, 1);
+        let chain = parse_chain_frame(&frame).expect("should parse");
+        assert_eq!(chain.hook, "input");
+    }
+
+    #[test]
+    fn parse_chain_frame_hooknum_forward_big_endian() {
+        let frame = make_chain_frame_be(2, 0, 1);
+        let chain = parse_chain_frame(&frame).expect("should parse");
+        assert_eq!(chain.hook, "forward");
+    }
+
+    #[test]
+    fn parse_chain_frame_priority_negative_big_endian() {
+        // Standard nftables filter priority = -100 (0xFFFF_FF9C in two's complement).
+        // Encoded BE: [FF FF FF 9C].  After read_u32_be + cast_possible_wrap: -100i32.
+        let frame = make_chain_frame_be(1, -100, 1);
+        let chain = parse_chain_frame(&frame).expect("should parse");
+        assert_eq!(
+            chain.priority, -100,
+            "negative priority must survive BE round-trip"
+        );
+    }
+
+    #[test]
+    fn parse_obj_frame_obj_type_big_endian() {
+        // NFTA_OBJ_TYPE=1 (NFT_OBJECT_COUNTER) encoded big-endian.
+        // On LE, native-endian [01 00 00 00] != big-endian [00 00 00 01].
+        // After fix (read_u32_be) both must decode to 1.
+        let bytes_nla = make_nla(NFTA_COUNTER_BYTES, &0u64.to_be_bytes());
+        let pkts_nla = make_nla(NFTA_COUNTER_PACKETS, &0u64.to_be_bytes());
+        let mut data_inner = bytes_nla;
+        data_inner.extend_from_slice(&pkts_nla);
+        let obj_data_nla = make_nested_nla(NFTA_OBJ_DATA, &data_inner);
+
+        let mut frame = vec![0u8; 4];
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_TABLE, b"filter "));
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_NAME, b"be_counter "));
+        // Type = 1 encoded big-endian (was to_ne_bytes, now to_be_bytes)
+        frame.extend_from_slice(&make_nla(NFTA_OBJ_TYPE, &1u32.to_be_bytes()));
+        frame.extend_from_slice(&obj_data_nla);
+
+        let counter =
+            parse_obj_frame(&frame).expect("should recognise NFT_OBJECT_COUNTER from BE type");
+        assert_eq!(counter.name, "be_counter");
     }
 }
