@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: ["main", "master"]
 
+# DSC-004: top-level read-only default; per-job overrides grant write only where needed.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -103,7 +107,88 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Job 2: Rust fmt + clippy + build (matrix: x86_64 and aarch64 musl)
+  # Job 1b: OPA / conftest — hexagonal architecture policy (M-12)
+  # ---------------------------------------------------------------------------
+  opa-hexagonal:
+    name: OPA hexagonal policy (conftest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install conftest
+        run: |
+          VERSION=0.57.0
+          curl -sSfL \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${VERSION}/conftest_${VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz conftest
+          sudo mv conftest /usr/local/bin/conftest
+
+      - name: Generate Cargo manifest JSON for conftest
+        run: |
+          python3 - << 'PYEOF'
+          import json, tomllib, pathlib, sys
+
+          # Crates whose names match this pattern are classified as domain-core.
+          DOMAIN_SUFFIXES = ("_domain", "_ports", "_core")
+          # Crates classified as adapter (may reference infra).
+          ADAPTER_SUFFIXES = ("_netlink", "_metrics", "_http", "_config", "_infra", "_adapter")
+
+          crates = []
+          for cargo_toml in sorted(pathlib.Path("crates").rglob("Cargo.toml")):
+              with open(cargo_toml, "rb") as f:
+                  manifest = tomllib.load(f)
+              pkg = manifest.get("package", {})
+              name = pkg.get("name", cargo_toml.parent.name)
+              deps = list(manifest.get("dependencies", {}).keys())
+              is_domain = any(name.endswith(s) for s in DOMAIN_SUFFIXES)
+              is_adapter = any(name.endswith(s) for s in ADAPTER_SUFFIXES)
+              crates.append({
+                  "name": name,
+                  "is_domain_core": is_domain,
+                  "is_adapter": is_adapter,
+                  "dependencies": deps,
+              })
+
+          print(json.dumps({"crates": crates}, indent=2))
+          PYEOF
+          python3 - << 'PYEOF' > cargo_manifest.json
+          import json, tomllib, pathlib
+
+          DOMAIN_SUFFIXES = ("_domain", "_ports", "_core")
+          ADAPTER_SUFFIXES = ("_netlink", "_metrics", "_http", "_config", "_infra", "_adapter")
+
+          crates = []
+          for cargo_toml in sorted(pathlib.Path("crates").rglob("Cargo.toml")):
+              with open(cargo_toml, "rb") as f:
+                  manifest = tomllib.load(f)
+              pkg = manifest.get("package", {})
+              name = pkg.get("name", cargo_toml.parent.name)
+              deps = list(manifest.get("dependencies", {}).keys())
+              is_domain = any(name.endswith(s) for s in DOMAIN_SUFFIXES)
+              is_adapter = any(name.endswith(s) for s in ADAPTER_SUFFIXES)
+              crates.append({
+                  "name": name,
+                  "is_domain_core": is_domain,
+                  "is_adapter": is_adapter,
+                  "dependencies": deps,
+              })
+
+          print(json.dumps({"crates": crates}, indent=2))
+          PYEOF
+
+      - name: Run conftest — hexagonal.rego
+        run: |
+          conftest test \
+            --policy docs/arch/policies/hexagonal.rego \
+            --namespace nft_exporter.architecture.hexagonal \
+            --input cargo_manifest.json \
+            --output stdout
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Rust fmt + clippy + build + test (matrix: x86_64 and aarch64 musl)
+  # DSC-001: --locked on every cargo build/clippy/test invocation.
+  # DSC-006/H-25: cargo test --locked --all-features (x86_64 only, pure-compute tests).
   # ---------------------------------------------------------------------------
   rust:
     name: Rust (${{ matrix.target }})
@@ -156,7 +241,7 @@ jobs:
       - name: Clippy (host target)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          cargo clippy --all-targets --all-features -- \
+          cargo clippy --locked --all-targets --all-features -- \
             -D warnings \
             -D clippy::all \
             -D clippy::pedantic \
@@ -164,6 +249,12 @@ jobs:
             -A clippy::must_use_candidate \
             -A clippy::indexing_slicing \
             -A clippy::arithmetic_side_effects
+
+      # DSC-006/H-25: run pure-computation unit tests (no kernel / io_uring needed).
+      # Only on x86_64 musl (native runner); aarch64 cross cannot execute tests.
+      - name: Test (pure-computation unit tests)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --locked --all-features
 
       - name: Install cross (aarch64 only)
         if: matrix.use_cross
@@ -176,7 +267,7 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build release binary — ${{ matrix.target }} (cross)
         if: matrix.use_cross
@@ -255,3 +346,45 @@ jobs:
           build-args: |
             BUILDPLATFORM=$BUILDPLATFORM
             TARGETPLATFORM=$TARGETPLATFORM
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Supply-chain — cargo audit + cargo deny (DSC-002)
+  # ---------------------------------------------------------------------------
+  supply-chain:
+    name: Supply-chain (audit + deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.87"
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo audit — deny advisories
+        run: cargo audit --deny warnings
+
+      - name: cargo deny check
+        run: cargo deny check

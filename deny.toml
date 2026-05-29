@@ -1,0 +1,103 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Used by: cargo deny check  (supply-chain CI job, DSC-002)
+# Covers: advisories (deny), license allow-list, duplicate crate detection,
+#         and banned crate enforcement.
+
+[graph]
+# Resolve all targets; we cross-compile to both musl targets.
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Advisories — deny any advisory that is not explicitly ignored.
+# Run `cargo audit` separately for advisory-only reports with --deny warnings.
+# ---------------------------------------------------------------------------
+[advisories]
+# Deny any advisory that has not been explicitly allowed below.
+version = 2
+# yanked crates are treated as unmaintained advisories
+ignore = [
+    # Add advisory IDs here when a transitive dependency has an unfixed
+    # vulnerability that must be tolerated temporarily, e.g.:
+    # "RUSTSEC-2024-0000",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — allow common permissive FOSS licenses only.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+# Accept only these SPDX identifiers (or conjunctions of them).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "OpenSSL",          # needed by ring / rustls transitive deps on some paths
+]
+# Treat any crate without a recognisable license as an error.
+unlicensed = "deny"
+# Crates with a copyleft or non-permissive license that appear in the graph
+# must be explicitly listed here:
+copyleft = "deny"
+# When SPDX expression cannot be satisfied by `allow` list:
+default = "deny"
+
+# Per-crate overrides (add as needed):
+# [[licenses.exceptions]]
+# name = "some-crate"
+# version = "*"
+# allow = ["LicenseRef-SomeProprietary"]
+
+# ---------------------------------------------------------------------------
+# Bans — duplicate crates and explicitly forbidden packages.
+# ---------------------------------------------------------------------------
+[bans]
+# Deny multiple versions of the same crate appearing in the dependency tree
+# unless explicitly allowed below.
+multiple-versions = "warn"   # warn first; escalate to "deny" once tree is clean
+wildcards = "deny"           # forbid wildcard dependency versions in Cargo.toml
+
+# Crates that must never appear anywhere in the resolved graph.
+deny = [
+    # tokio was removed by ADR-0023; deny accidental re-introduction.
+    { name = "tokio" },
+    { name = "tokio-util" },
+    # axum removed by ADR-0023.
+    { name = "axum" },
+    { name = "axum-core" },
+    # hyper removed by ADR-0023 (HTTP is hand-rolled over monoio).
+    { name = "hyper" },
+    { name = "hyper-util" },
+    # mio removed by ADR-0023.
+    { name = "mio" },
+    # Old Prometheus client — use prometheus-client only.
+    { name = "prometheus" },
+    # Prefer rustls; openssl adds heavy C dependency.
+    # Remove this entry if openssl becomes an explicit transitive requirement.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+
+# Crates that are allowed to appear more than once (different major versions
+# pulled by different parts of the tree):
+# [[bans.skip]]
+# name = "some-crate"
+# version = "1"
+
+# ---------------------------------------------------------------------------
+# Sources — restrict where crates can be fetched from.
+# ---------------------------------------------------------------------------
+[sources]
+# Only crates.io and path/git sources that are declared in the workspace.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Explicit git sources allowed (workspace path deps are exempt):
+# allow-git = []

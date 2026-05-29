@@ -6,6 +6,10 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
 
+# DSC-004: top-level read-only default; per-job overrides grant write only where needed.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -75,7 +79,7 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build release binary — ${{ matrix.target }} (cross)
         if: matrix.use_cross
@@ -203,8 +207,12 @@ jobs:
           cosign sign --yes \
             "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-push.outputs.digest }}"
 
+      # DSC-003: anchore/sbom-action/download-syft pinned to a specific commit SHA.
+      # TODO: replace the placeholder SHA below with the verified commit SHA for the
+      # desired release of anchore/sbom-action (https://github.com/anchore/sbom-action/releases).
+      # Example: anchore/sbom-action/download-syft@e5d6eb3f0fba07f5b12195a5f2b2a3c8db50e29e
       - name: Install syft (SBOM generator)
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@e5d6eb3f0fba07f5b12195a5f2b2a3c8db50e29e  # TODO: verify SHA for anchore/sbom-action v0.x
 
       - name: Generate SPDX-JSON SBOM and attach as OCI referrer
         run: |
@@ -218,6 +226,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Scan container image for CVEs (Trivy)
+  # DSC-003: aquasecurity/trivy-action pinned to a specific commit SHA.
   # ---------------------------------------------------------------------------
   scan-image:
     name: CVE scan (Trivy)
@@ -228,8 +237,12 @@ jobs:
       security-events: write
 
     steps:
+      # DSC-003: trivy-action pinned to commit SHA instead of @master.
+      # TODO: replace the placeholder SHA below with the verified commit SHA for the
+      # desired release of aquasecurity/trivy-action (https://github.com/aquasecurity/trivy-action/releases).
+      # Example: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37  # TODO: verify SHA for trivy-action v0.31.0+
         with:
           image-ref: >-
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-push-container.outputs.image_digest }}
