@@ -37,4 +37,8 @@ pub struct DevlinkHealthReporter {
     pub err_count: u64,
     /// Cumulative recovery count (`DEVLINK_ATTR_HEALTH_REPORTER_RECOVER_COUNT`).
     pub recover_count: u64,
+    /// Port index when this is a port-level reporter (`DEVLINK_ATTR_PORT_INDEX`),
+    /// or `None` for a device-level reporter. Distinguishes otherwise-identical
+    /// per-port reporters (e.g. `vnic`) that share bus/device/name.
+    pub port: Option<u32>,
 }

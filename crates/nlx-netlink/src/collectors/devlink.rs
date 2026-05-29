@@ -2,7 +2,7 @@
 //!
 //! Netlink family: `NETLINK_GENERIC` (16), family name `"devlink"`.
 //! Messages used: `DEVLINK_CMD_GET` (1), `DEVLINK_CMD_PORT_GET` (5),
-//!   `DEVLINK_CMD_HEALTH_REPORTER_GET` (54).
+//!   `DEVLINK_CMD_HEALTH_REPORTER_GET` (52).
 //! ADR refs: ADR-0011, ADR-0014, netlink-protocol.md §15.
 //!
 //! ## Runtime gate
@@ -41,10 +41,13 @@ const NETLINK_GENERIC: i32 = 16;
 // include/uapi/linux/devlink.h (linux-6.17.13):
 //   DEVLINK_CMD_GET                 = 1  (line 26)
 //   DEVLINK_CMD_PORT_GET            = 5  (line 31 — 5th non-UNSPEC member)
-//   DEVLINK_CMD_HEALTH_REPORTER_GET = 54 (counted from UNSPEC=0)
+//   DEVLINK_CMD_HEALTH_REPORTER_GET = 52 (verified via the running kernel's
+//     own <linux/devlink.h> preprocessor expansion AND a live `devlink health
+//     show` strace, which sends genl cmd 0x34 = 52. An earlier "fix" to 54 was
+//     a miscount that produced EOPNOTSUPP (errno 95) on every health dump.)
 const DEVLINK_CMD_GET: u8 = 1;
 const DEVLINK_CMD_PORT_GET: u8 = 5;
-const DEVLINK_CMD_HEALTH_REPORTER_GET: u8 = 54;
+const DEVLINK_CMD_HEALTH_REPORTER_GET: u8 = 52;
 const DEVLINK_GENL_VERSION: u8 = 1;
 
 // devlink attribute types (§15.3).
@@ -180,6 +183,12 @@ impl Collector for DevlinkCollector {
                     labels.insert("bus".to_owned(), r.bus_name.clone());
                     labels.insert("device".to_owned(), r.dev_name.clone());
                     labels.insert("reporter".to_owned(), r.name.clone());
+                    // Consistent label keys across every series of these metrics:
+                    // port="" for device-level reporters, the index for port-level.
+                    labels.insert(
+                        "port".to_owned(),
+                        r.port.map_or_else(String::new, |p| p.to_string()),
+                    );
 
                     out.push(MetricSample::gauge(
                         "nft_devlink_health_reporter_state",
@@ -421,6 +430,10 @@ fn parse_health_reporter(attrs_buf: &[u8], dev: &DevlinkDevice) -> Option<Devlin
     let mut state: u8 = 0;
     let mut err_count: u64 = 0;
     let mut recover_count: u64 = 0;
+    // Port-level reporters (e.g. `vnic` on each port) carry DEVLINK_ATTR_PORT_INDEX
+    // at the top level; absent for device-level reporters. Without this the
+    // per-port reporters would all collapse to one duplicate series.
+    let mut port: Option<u32> = None;
 
     let parse_inner = |attrs: &[u8],
                        name: &mut String,
@@ -445,7 +458,9 @@ fn parse_health_reporter(attrs_buf: &[u8], dev: &DevlinkDevice) -> Option<Devlin
     };
 
     for attr in parse_attrs(attrs_buf) {
-        if attr.ty == DEVLINK_ATTR_HEALTH_REPORTER {
+        if attr.ty == DEVLINK_ATTR_PORT_INDEX {
+            port = read_u32(attr.payload);
+        } else if attr.ty == DEVLINK_ATTR_HEALTH_REPORTER {
             // Nested container (G-31: bit 15 already stripped by NlaIter).
             parse_inner(
                 attr.payload,
@@ -482,6 +497,7 @@ fn parse_health_reporter(attrs_buf: &[u8], dev: &DevlinkDevice) -> Option<Devlin
         state,
         err_count,
         recover_count,
+        port,
     })
 }
 
@@ -668,6 +684,42 @@ mod tests {
         assert_eq!(r.recover_count, 0);
     }
 
+    /// Device-level reporter (no `PORT_INDEX`) parses with `port == None`.
+    #[test]
+    fn parse_health_reporter_device_level_has_no_port() {
+        let dev = DevlinkDevice {
+            bus_name: "pci".to_owned(),
+            dev_name: "0000:01:00.0".to_owned(),
+        };
+        let mut buf = Vec::new();
+        buf.extend(nla_str(DEVLINK_ATTR_HEALTH_REPORTER_NAME, "fw"));
+        buf.extend(nla_u8(DEVLINK_ATTR_HEALTH_REPORTER_STATE, 0));
+        let r = parse_health_reporter(&buf, &dev).unwrap();
+        assert_eq!(r.port, None, "device-level reporter must have no port");
+    }
+
+    /// Port-level reporter carries `DEVLINK_ATTR_PORT_INDEX` (3) → `port == Some(n)`.
+    /// This is what keeps per-port `vnic` reporters from collapsing into one
+    /// duplicate time series.
+    #[test]
+    fn parse_health_reporter_port_level_keeps_port_index() {
+        let dev = DevlinkDevice {
+            bus_name: "pci".to_owned(),
+            dev_name: "0000:01:00.0".to_owned(),
+        };
+        let mut buf = Vec::new();
+        buf.extend(nla_u32_ne(DEVLINK_ATTR_PORT_INDEX, 5)); // type 3
+        buf.extend(nla_str(DEVLINK_ATTR_HEALTH_REPORTER_NAME, "vnic"));
+        buf.extend(nla_u8(DEVLINK_ATTR_HEALTH_REPORTER_STATE, 0));
+        let r = parse_health_reporter(&buf, &dev).unwrap();
+        assert_eq!(r.name, "vnic");
+        assert_eq!(
+            r.port,
+            Some(5),
+            "port-level reporter must keep port index 5"
+        );
+    }
+
     /// Missing name attribute must yield None (name is required sentinel).
     #[test]
     fn parse_health_reporter_no_name_returns_none() {
@@ -695,10 +747,11 @@ mod tests {
             DEVLINK_CMD_PORT_GET, 5u8,
             "DEVLINK_CMD_PORT_GET must be 5 (line 31)"
         );
-        // WC-009: HEALTH_REPORTER_GET is the 54th member (counted from UNSPEC=0).
+        // WC-009: HEALTH_REPORTER_GET = 52 (kernel <linux/devlink.h> + live
+        // `devlink health show` strace both confirm genl cmd 0x34 = 52).
         assert_eq!(
-            DEVLINK_CMD_HEALTH_REPORTER_GET, 54u8,
-            "DEVLINK_CMD_HEALTH_REPORTER_GET must be 54"
+            DEVLINK_CMD_HEALTH_REPORTER_GET, 52u8,
+            "DEVLINK_CMD_HEALTH_REPORTER_GET must be 52"
         );
 
         // enum devlink_attr — linux-6.17.13 include/uapi/linux/devlink.h
