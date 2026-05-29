@@ -22,8 +22,8 @@
 //! `NET_DM_CMD_STATS_GET` (unicast, no `NLM_F_DUMP`) replies with
 //! `NET_DM_CMD_STATS_NEW` containing:
 //!
-//! - `NET_DM_ATTR_STATS`    (type=12, nested) → `NET_DM_ATTR_STATS_DROPPED` (type=1, u64) SW total
-//! - `NET_DM_ATTR_HW_STATS` (type=13, nested) → `NET_DM_ATTR_STATS_DROPPED` (type=1, u64) HW total
+//! - `NET_DM_ATTR_STATS`    (type=12, nested) → `NET_DM_ATTR_STATS_DROPPED` (type=0, u64) SW total
+//! - `NET_DM_ATTR_HW_STATS` (type=13, nested) → `NET_DM_ATTR_STATS_DROPPED` (type=0, u64) HW total
 //!
 //! **No per-reason breakdown from STATS_GET.** Per-reason data lives only in
 //! the `NET_DM_GRP_ALERT` multicast stream (PACKET-mode alerts). STATS_GET
