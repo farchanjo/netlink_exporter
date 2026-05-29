@@ -54,9 +54,9 @@ All adapter crates read this document:
 
 ### One file descriptor per netlink family
 
-The shared `nft_exporter_netlink_socket` crate owns one `AsyncFd<OwnedFd>` per
-protocol constant. Sockets are never shared across concurrent scrapes and are
-never reused across distinct netlink families.
+The shared `nft_exporter_netlink_socket` crate owns one io_uring-driven
+`OwnedFd` per protocol constant (ADR-0023). Sockets are never shared across
+concurrent scrapes and are never reused across distinct netlink families.
 
 | Collector | `protocol` constant | Value |
 |---|---|---|
@@ -88,38 +88,84 @@ open --> bind --> setsockopt* --> [dump loop]* --> close
 5. **close** — `rustix::io::close` after all collectors finish. Capabilities
    are dropped before the first dump (ADR-0009).
 
-### AsyncFd wrapper pattern
+### io_uring SQ/CQ submit and complete model (ADR-0023)
+
+The transport uses monoio 0.2 with io_uring as the kernel I/O interface
+(ADR-0023). The `AF_NETLINK` fd is registered with the io_uring instance at
+open time via `IORING_REGISTER_FILES` (fixed-file index). Two receive buffers of
+4 MiB each are registered at open time via `IORING_REGISTER_BUFFERS` (fixed
+lifetime, `Pin<Box<[u8]>>`). The `monoio::io::PollFd` wrapper (from the
+`poll-io` feature) provides `readable().await` driven by `IORING_OP_POLL_ADD`
+on the SQ rather than epoll.
+
+Each dump request submits one `IORING_OP_SENDMSG` SQE followed by a receive
+loop of `IORING_OP_RECVMSG` SQEs with `IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT`.
+The kernel writes received bytes directly into the registered buffer and posts a
+CQE with the byte count in `cqe.res`. No intermediate epoll wakeup and no
+separate data syscall are interleaved.
+
+Minimum kernel for `IOSQE_BUFFER_SELECT`: **5.7**. On kernel 5.1–5.6 the driver
+falls back to `IORING_OP_POLL_ADD` + standard `sendmsg`/`recvmsg` syscalls. On
+kernel < 5.1 the monoio `legacy` feature activates the epoll path transparently.
 
 ```rust
-// Pseudocode — actual impl in nft_exporter_netlink_socket
+// Pseudocode — actual impl in nft_exporter_netlink_socket (ADR-0023)
 let fd = socket_with(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, protocol)?;
 bind(&fd, &sockaddr_nl { nl_family: AF_NETLINK, nl_pid: 0, nl_groups: 0 })?;
 set_socket_recv_buffer_size(&fd, 4_194_304)?;
-let async_fd = AsyncFd::new(fd)?;
+// Register fd and pre-pinned recv_buf with the io_uring instance.
+// PollFd drives fd readiness via IORING_OP_POLL_ADD on the SQ.
+let poll_fd = monoio::io::PollFd::new(fd);
 
-// Non-blocking send:
+// Send: IORING_OP_SENDMSG SQE with IOSQE_FIXED_FILE
+let _guard = poll_fd.writable().await?;
+ring.submit_sendmsg_sqe(&request_bytes)?;
+ring.reap_cqe_and_check()?;
+
+// Receive loop: IORING_OP_RECVMSG SQE with IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT
 loop {
-    let mut guard = async_fd.writable().await?;
-    match guard.try_io(|fd| sendmsg(fd, &request_bytes)) {
-        Ok(Ok(_)) => break,
-        Ok(Err(e)) if e == Errno::AGAIN => continue,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => continue,   // WouldBlock from AsyncFd
+    let _guard = poll_fd.readable().await?;
+    ring.submit_recvmsg_sqe(fixed_buf_index)?;
+    let n = ring.reap_cqe_byte_count()?;  // cqe.res = bytes written to registered buf
+    match process_nlmsgs(&registered_buf[..n]) {
+        ParseResult::Done(frames)   => return Ok(frames),
+        ParseResult::Continue       => continue,
+        ParseResult::DumpIntr       => return Err(NetlinkError::DumpIntr),
+        ParseResult::Enobufs        => { grow_rcvbuf_and_reregister(); continue; }
     }
 }
+```
 
-// Non-blocking recv:
-let mut buf = vec![0u8; recv_buf_size];
-loop {
-    let mut guard = async_fd.readable().await?;
-    match guard.try_io(|fd| recvmsg(fd, &mut buf, RecvFlags::TRUNC)) {
-        Ok(Ok(n)) => { process(&buf[..n]); break; }
-        Ok(Err(e)) if e == Errno::AGAIN => continue,
-        Ok(Err(e)) if e == Errno::NOBUFS => { handle_enobufs(); break; }
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => continue,
-    }
-}
+#### io_uring dump loop — sequence diagram
+
+```mermaid
+sequenceDiagram
+    participant U as NetlinkSocket<br/>(blocking thread)
+    participant SQ as io_uring SQ
+    participant K as Linux Kernel
+    participant CQ as io_uring CQ
+
+    Note over U,CQ: Socket open, fd registered via IORING_REGISTER_FILES<br/>recv buf registered via IORING_REGISTER_BUFFERS
+
+    U->>SQ: push IORING_OP_SENDMSG SQE (fixed-file, request bytes)
+    SQ->>K: io_uring_enter, IORING_ENTER_GETEVENTS
+    K->>CQ: post sendmsg CQE (res = bytes sent)
+    CQ->>U: reap CQE, check res >= 0
+
+    loop until NLMSG_DONE or error
+        U->>SQ: push IORING_OP_RECVMSG SQE (IOSQE_FIXED_FILE, IOSQE_BUFFER_SELECT, buf_id=0)
+        SQ->>K: io_uring_enter, IORING_ENTER_GETEVENTS
+        K-->>CQ: post recvmsg CQE (res = byte count, flags carry IORING_CQE_F_BUFFER)
+        CQ->>U: reap CQE, read res bytes from registered buffer
+        U->>U: parse_nlmsgs(registered_buf[0..res])
+        alt NLMSG_DONE
+            U->>U: return Ok(accumulated frames)
+        else NLM_F_DUMP_INTR on any frame
+            U->>U: return Err(DumpIntr)
+        else ENOBUFS (cqe.res == -105)
+            U->>U: grow_rcvbuf, IORING_REGISTER_BUFFERS_UPDATE
+        end
+    end
 ```
 
 ---

@@ -24,8 +24,8 @@ graph TD
         NL_XFRM["NETLINK_XFRM (family=6)\n+ /proc/net/xfrm_stat"]
     end
 
-    subgraph adapters["Adapter Layer — tokio + mio AsyncFd"]
-        TOKIO["tokio AsyncFd\nmio readiness\n(shared across all GenL families)"]
+    subgraph adapters["Adapter Layer — monoio io_uring (ADR-0023)"]
+        MONOIO["monoio PollFd\nio_uring POLL_ADD readiness\n(shared across all GenL families)"]
     end
 
     subgraph domain["Domain Core — nft_exporter"]
@@ -42,7 +42,7 @@ graph TD
         DM["DropMonitor\n─────────────\nRM: DropMonitorSnapshot\n(opt-in runtime-gated)"]
         RTEX["RtnetlinkExtended\n─────────────\nRM: RtnetlinkExtendedSnapshot\n(opt-in)"]
         ORCH["CollectionOrchestration\n─────────────\nTM: ScrapeLifecycle\nAF: CollectorRegistry\nRM: MetricSnapshot"]
-        EXP["Exposition\n─────────────\nAxumHttpAdapter\nPrometheusRegistryAdapter"]
+        EXP["Exposition\n─────────────\nMonoioHttpAdapter\nPrometheusRegistryAdapter"]
     end
 
     subgraph external["External Systems"]
@@ -65,12 +65,12 @@ graph TD
     NL_GEN -->|NET_DM_CMD_CONFIG\nNET_DM_CMD_START\nNET_DM_GRP_ALERT multicast| DM
     NL_XFRM -->|XFRM_MSG_GETSA\nXFRM_MSG_GETPOLICY\nXFRM_MSG_GETSADINFO/SPDINFO| XFRM
 
-    NL_GEN --> TOKIO
-    TOKIO -->|AsyncFd readiness| ETH
-    TOKIO -->|AsyncFd readiness| IPVS
-    TOKIO -->|AsyncFd readiness| WG
-    TOKIO -->|AsyncFd readiness| DL
-    TOKIO -->|AsyncFd readiness| DM
+    NL_GEN --> MONOIO
+    MONOIO -->|PollFd io_uring readiness| ETH
+    MONOIO -->|PollFd io_uring readiness| IPVS
+    MONOIO -->|PollFd io_uring readiness| WG
+    MONOIO -->|PollFd io_uring readiness| DL
+    MONOIO -->|PollFd io_uring readiness| DM
 
     RT -->|LinkSnapshot\nAddressSnapshot\nRouteTableSnapshot\nNeighborSnapshot| ORCH
     TC -->|TcTreeSnapshot| ORCH
@@ -182,7 +182,7 @@ graph LR
     end
 
     subgraph adapters["Adapter Crates (infra — left side driving, right side driven)"]
-        AXM["AxumHttpAdapter\nnft_exporter_adapter_http"]
+        AXM["MonoioHttpAdapter\nnft_exporter_adapter_http"]
         RTA["RtnetlinkAdapter\nnft_exporter_adapter_rt"]
         TCA["TcNetlinkAdapter\nnft_exporter_adapter_tc"]
         CTA["ConntrackAdapter\nnft_exporter_adapter_ct"]
@@ -236,10 +236,10 @@ graph LR
 
 | Port | Implemented by | Called when |
 |---|---|---|
-| `ScrapeTriggerPort` — `async fn trigger_scrape() -> Result<MetricSnapshot, ScrapeError>` | AxumHttpAdapter | Prometheus pulls GET /metrics |
-| `HealthPort` — `async fn health() -> HealthStatus` | AxumHttpAdapter | k8s liveness probe GET /healthz |
-| `ReadinessPort` — `async fn readiness() -> ReadinessStatus` | AxumHttpAdapter | k8s readiness probe GET /ready; returns ready only after first successful scrape |
-| `CliConfigPort` — `fn configure(config: ExporterConfig) -> Result<(), ConfigError>` | AxumHttpAdapter | Once at startup; injects ExporterConfig without importing clap into domain-core |
+| `ScrapeTriggerPort` — `async fn trigger_scrape() -> Result<MetricSnapshot, ScrapeError>` | MonoioHttpAdapter | Prometheus pulls GET /metrics |
+| `HealthPort` — `async fn health() -> HealthStatus` | MonoioHttpAdapter | k8s liveness probe GET /healthz |
+| `ReadinessPort` — `async fn readiness() -> ReadinessStatus` | MonoioHttpAdapter | k8s readiness probe GET /ready; returns ready only after first successful scrape |
+| `CliConfigPort` — `fn configure(config: ExporterConfig) -> Result<(), ConfigError>` | MonoioHttpAdapter | Once at startup; injects ExporterConfig without importing clap into domain-core |
 
 ### Driven Ports
 

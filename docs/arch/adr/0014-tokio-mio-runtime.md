@@ -1,13 +1,16 @@
 ---
-status: accepted
+status: superseded
 date: 2026-05-28
 deciders: [eonf]
 consulted: []
 informed: []
 supersedes: ADR-0007
+superseded-by: ADR-0023
 ---
 
 # Confine tokio 1.52 and mio to driven adapters only; use AsyncFd for AF_NETLINK fd readiness
+
+Superseded by ADR-0023.
 
 Supersedes ADR-0007.
 
