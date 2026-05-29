@@ -1,0 +1,91 @@
+# deploy/k8s/rbac.yaml
+#
+# RBAC resources for nft_exporter (ADR-0008, ADR-0009).
+#
+# The exporter reads kernel state exclusively via AF_NETLINK sockets; it does
+# not use the Kubernetes API server at runtime.  The ServiceAccount exists so
+# that the pod's identity is explicit and auditable.  The ClusterRole grants
+# only the minimum Kubernetes API permissions required (none, today) and serves
+# as a named subject for future OPA Gatekeeper or Kyverno policies.
+#
+# If the cluster uses Pod Security Admission, apply the "privileged" policy to
+# the monitoring namespace or create an exemption for the nft-exporter
+# ServiceAccount to allow capabilities.add: [NET_ADMIN].
+---
+# ServiceAccount: explicit pod identity for the DaemonSet.
+# No API server token is mounted unless explicitly requested.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nft-exporter
+  namespace: monitoring
+  labels:
+    app: nft-exporter
+    app.kubernetes.io/name: nft-exporter
+# Prevent the default token projection from being mounted.
+# nft_exporter does not call the Kubernetes API server.
+automountServiceAccountToken: false
+---
+# ClusterRole: no Kubernetes API permissions are required today.
+# This resource is declared explicitly so that:
+#   1. The ServiceAccount has a named subject in audit logs.
+#   2. Future additions (e.g. reading Node labels for metric enrichment) can be
+#      added here without touching the DaemonSet manifest.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nft-exporter
+  labels:
+    app: nft-exporter
+    app.kubernetes.io/name: nft-exporter
+rules:
+  # No Kubernetes API permissions are required.
+  # The exporter uses AF_NETLINK sockets, not the Kubernetes API.
+  []
+---
+# ClusterRoleBinding: bind the ClusterRole to the ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nft-exporter
+  labels:
+    app: nft-exporter
+    app.kubernetes.io/name: nft-exporter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nft-exporter
+subjects:
+  - kind: ServiceAccount
+    name: nft-exporter
+    namespace: monitoring
+---
+# NetworkPolicy: allow ingress to port 9456 from Prometheus pods only.
+# Deny all other ingress.  Egress is not restricted (netlink sockets are
+# in-kernel; outbound DNS and health checks are permitted).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nft-exporter-ingress
+  namespace: monitoring
+  labels:
+    app: nft-exporter
+spec:
+  podSelector:
+    matchLabels:
+      app: nft-exporter
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Allow scrape traffic from Prometheus pods in the same namespace.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+        # Also allow from kube-prometheus-stack operator pods.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus-operator
+      ports:
+        - port: 9456
+          protocol: TCP

@@ -1,0 +1,124 @@
+# /etc/systemd/system/nft-exporter.service
+#
+# Hardened systemd unit for nft_exporter (ADR-0008, ADR-0009).
+#
+# Install:
+#   install -o root -g root -m 0644 nft-exporter.service \
+#       /etc/systemd/system/nft-exporter.service
+#   systemctl daemon-reload
+#   systemctl enable --now nft-exporter
+#
+# Prerequisites:
+#   useradd -r -s /sbin/nologin -M nft-exporter
+#   install -o root -g root -m 0755 nft_exporter /usr/local/bin/nft_exporter
+
+[Unit]
+Description=nft_exporter — Linux netlink Prometheus exporter
+Documentation=https://example.com/docs/arch/operations/runbook.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+
+# Run as a dedicated unprivileged system account (uid allocated by distro)
+User=nft-exporter
+Group=nft-exporter
+
+ExecStart=/usr/local/bin/nft_exporter \
+    --listen 0.0.0.0:9456 \
+    --scrape-timeout-ms 9800 \
+    --log-format json \
+    --log-level info
+
+# ---------------------------------------------------------------------------
+# Capability model (ADR-0009)
+#
+# AmbientCapabilities: granted to the process across execve; allows the
+#   unprivileged user to hold CAP_NET_ADMIN.
+# CapabilityBoundingSet: hard ceiling — no capability outside this set can
+#   ever be acquired by the process or any child, even via setuid binaries.
+# NoNewPrivileges: prevents execve-based privilege escalation (setuid/setgid).
+#
+# The binary calls caps::clear() on all sets immediately after opening all
+# netlink sockets (ADR-0009), so the process holds zero ambient capabilities
+# during HTTP exposition.
+# ---------------------------------------------------------------------------
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# ---------------------------------------------------------------------------
+# Filesystem hardening (ADR-0009)
+#
+# ProtectSystem=strict: mounts /, /usr, /boot read-only; /etc read-only.
+# PrivateTmp: the process gets an isolated /tmp and /var/tmp namespace.
+# PrivateDevices: no access to real /dev devices (only null/urandom/etc).
+# ProtectKernelTunables: /proc/sys and /sys paths are read-only.
+# ProtectControlGroups: /sys/fs/cgroup is read-only.
+# ProtectHome: /home, /root, /run/user are invisible.
+# ---------------------------------------------------------------------------
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectHome=true
+
+# ---------------------------------------------------------------------------
+# Network address-family restriction (ADR-0009)
+#
+# RestrictAddressFamilies: only AF_INET (IPv4), AF_INET6 (IPv6 for the HTTP
+#   listener), and AF_NETLINK (kernel netlink sockets) are permitted.
+#   All other socket families (AF_UNIX, AF_PACKET, AF_BLUETOOTH, etc.) are
+#   rejected with EPERM.
+# ---------------------------------------------------------------------------
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+
+# ---------------------------------------------------------------------------
+# Syscall hardening (ADR-0009)
+#
+# SystemCallFilter: the @system-service group permits the baseline set needed
+#   by a long-running daemon (futex, mmap, read/write, epoll, etc.).
+#   The @network-io group adds send/recv family calls required for netlink and
+#   HTTP.  Calls outside these sets return EPERM (not SIGSYS) to avoid killing
+#   the process on unexpected kernel shims.
+# MemoryDenyWriteExecute: blocks mprotect(PROT_EXEC) and similar calls that
+#   would allow JIT-style exploitation.
+# LockPersonality: prevents changing the process execution domain (e.g. via
+#   personality(2)).
+# ---------------------------------------------------------------------------
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# ---------------------------------------------------------------------------
+# Resource limits
+#
+# MemoryMax: hard ceiling; typical RSS is 15–40 MiB; 128 MiB gives headroom
+#   for nodes with large conntrack tables or many ethtool NICs.
+# CPUQuota: limits CPU burst to 50% of one logical core; scrapes are
+#   latency-sensitive but the exporter should not monopolise node CPU.
+# ---------------------------------------------------------------------------
+MemoryMax=128M
+CPUQuota=50%
+
+# ---------------------------------------------------------------------------
+# Watchdog and restart policy
+#
+# WatchdogSec: the binary sends sd_notify WATCHDOG=1 at each scrape cycle.
+#   If no heartbeat is received within 30 s, systemd restarts the unit.
+# Restart=on-failure: restarts on non-zero exit, signal, or watchdog timeout.
+# RestartSec: back-off between restarts.
+# StartLimitIntervalSec/Burst: if the unit crashes 5 times in 60 s, systemd
+#   stops retrying and marks the unit as failed.
+# ---------------------------------------------------------------------------
+WatchdogSec=30s
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

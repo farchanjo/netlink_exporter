@@ -1,0 +1,150 @@
+# deploy/k8s/daemonset.yaml
+#
+# DaemonSet for nft_exporter on Kubernetes (ADR-0008, ADR-0009).
+#
+# Security model (ADR-0009):
+#   capabilities.drop: [ALL]         — drop the full Linux capability set first
+#   capabilities.add: [NET_ADMIN]    — re-add only CAP_NET_ADMIN
+#   allowPrivilegeEscalation: false  — no setuid/setgid escalation
+#   runAsNonRoot: true               — uid 65532 (distroless nonroot)
+#   readOnlyRootFilesystem: true     — immutable container root
+#   seccompProfile.type: RuntimeDefault — default container runtime seccomp
+#
+# hostNetwork: true is required so netlink sockets bind to the node's network
+# namespace rather than the pod network namespace.  The exporter cannot observe
+# host-level conntrack, nftables, and TC stats without access to the host netns.
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nft-exporter
+  namespace: monitoring
+  labels:
+    app: nft-exporter
+    app.kubernetes.io/name: nft-exporter
+    app.kubernetes.io/component: exporter
+    app.kubernetes.io/part-of: observability
+spec:
+  selector:
+    matchLabels:
+      app: nft-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Allow one node to be unavailable at a time during rolling upgrades.
+      # The PodDisruptionBudget (pdb.yaml) enforces >=90% node coverage.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: nft-exporter
+        app.kubernetes.io/name: nft-exporter
+      annotations:
+        # AppArmor: default runtime profile restricts file and network operations
+        # beyond what the securityContext alone enforces.
+        container.apparmor.security.beta.kubernetes.io/nft-exporter: runtime/default
+        # Prometheus scrape annotation for cluster-level auto-discovery
+        # (ServiceMonitor is preferred; this is a fallback for non-Operator setups).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9456"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Bind to the host network namespace so that AF_NETLINK sockets observe
+      # the node's routing table, conntrack table, and nftables ruleset.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      serviceAccountName: nft-exporter
+
+      # Pod-level security context (ADR-0009)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532      # distroless nonroot uid
+        runAsGroup: 65532     # distroless nonroot gid
+        fsGroup: 65532
+        seccompProfile:
+          # Use the custom profile (deploy/seccomp/nft-exporter.json) when
+          # placed at /var/lib/kubelet/seccomp/nft-exporter.json on each node.
+          # Fall back to RuntimeDefault if the file is absent.
+          type: RuntimeDefault
+
+      containers:
+        - name: nft-exporter
+          # Pin by digest in production.  Renovate Bot manages digest updates.
+          # Example: ghcr.io/example/nft_exporter:v0.1.0@sha256:<digest>
+          image: ghcr.io/example/nft_exporter:latest
+
+          imagePullPolicy: Always
+
+          # Container-level security context (ADR-0009)
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              # Drop all capabilities first, then re-add NET_ADMIN only.
+              # CAP_NET_ADMIN is the sole capability required by the six
+              # netlink families (ADR-0009).  CAP_NET_RAW and CAP_SYS_ADMIN
+              # are explicitly not required and must not be added.
+              drop:
+                - ALL
+              add:
+                - NET_ADMIN
+
+          ports:
+            - name: metrics
+              # Port 9456 is the registered Prometheus exposition port (ADR-0010)
+              containerPort: 9456
+              protocol: TCP
+
+          env:
+            - name: NFT_EXPORTER_LISTEN
+              value: "0.0.0.0:9456"
+            - name: NFT_EXPORTER_SCRAPE_TIMEOUT_MS
+              value: "9800"
+            - name: NFT_EXPORTER_LOG_FORMAT
+              value: "json"
+            - name: NFT_EXPORTER_LOG_LEVEL
+              value: "info"
+
+          resources:
+            requests:
+              # Baseline: 10m CPU and 32Mi RAM are sufficient for a quiet node.
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              # Limits: 500m CPU and 128Mi RAM handle nodes with large conntrack
+              # tables (~500k flows) or many ethtool NICs (ADR-0008).
+              cpu: 500m
+              memory: 128Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9456
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 9456
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+      # Schedule on every node regardless of taints (node-exporter pattern).
+      tolerations:
+        - operator: Exists
+
+      # Prefer to spread across failure domains; the DaemonSet already
+      # guarantees one pod per node so this is advisory for zone-aware scheduling.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: nft-exporter

@@ -1,0 +1,91 @@
+# deploy/k8s/servicemonitor.yaml
+#
+# Prometheus Operator ServiceMonitor for nft_exporter (ADR-0008).
+#
+# Prerequisites:
+#   - Prometheus Operator >= 0.65 installed in the cluster.
+#   - The Service defined below (nft-exporter) must exist in the same namespace.
+#   - The Prometheus CR must select the "monitoring" namespace via
+#     serviceMonitorNamespaceSelector.
+#
+# The Service must be created alongside this manifest; it is included here for
+# completeness.  Alternatively apply the standalone service.yaml.
+---
+# Service: exposes the DaemonSet pods on port 9456 within the cluster.
+# Prometheus Operator discovers this Service via the ServiceMonitor below.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nft-exporter
+  namespace: monitoring
+  labels:
+    app: nft-exporter
+    app.kubernetes.io/name: nft-exporter
+    app.kubernetes.io/component: exporter
+spec:
+  # ClusterIP None makes this a headless Service, returning one A record per
+  # pod.  This is correct for a DaemonSet exporter where each pod must be
+  # scraped individually (node-level metrics are not aggregable at the Service
+  # level).
+  clusterIP: None
+  selector:
+    app: nft-exporter
+  ports:
+    - name: metrics
+      port: 9456
+      targetPort: metrics
+      protocol: TCP
+---
+# ServiceMonitor: instructs Prometheus Operator to scrape nft-exporter pods.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nft-exporter
+  namespace: monitoring
+  labels:
+    app: nft-exporter
+    app.kubernetes.io/name: nft-exporter
+    # release label must match the Prometheus CR's serviceMonitorSelector.
+    # Adjust to match the label key/value used in your Prometheus installation.
+    release: kube-prometheus-stack
+spec:
+  # Restrict discovery to the monitoring namespace.
+  namespaceSelector:
+    matchNames:
+      - monitoring
+
+  # Select the Service created above.
+  selector:
+    matchLabels:
+      app: nft-exporter
+
+  endpoints:
+    - port: metrics
+      path: /metrics
+      # 15-second scrape interval aligns with the ADR-0007 async collection
+      # model where the exporter caches a ReadModel snapshot every scrape cycle.
+      interval: 15s
+      # 10-second scrape timeout leaves 5 s margin before the NFT_EXPORTER_
+      # SCRAPE_TIMEOUT_MS=9800 ms internal deadline fires.
+      scrapeTimeout: 10s
+      scheme: http
+
+      # Relabel rules: attach the Kubernetes node name to every time series.
+      # This allows Grafana to filter per node without relying on instance labels.
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_node_name
+          targetLabel: node
+          action: replace
+        - sourceLabels:
+            - __meta_kubernetes_namespace
+          targetLabel: namespace
+          action: replace
+        - sourceLabels:
+            - __meta_kubernetes_pod_name
+          targetLabel: pod
+          action: replace
+
+      # Honor labels emitted by the exporter itself (nft_build_info carries
+      # version/revision labels).
+      honorLabels: false
