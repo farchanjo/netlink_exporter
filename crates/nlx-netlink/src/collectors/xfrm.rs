@@ -190,10 +190,12 @@ fn mode_label(mode: u8) -> &'static str {
 }
 
 fn dir_label(dir: u8) -> &'static str {
+    // XFRM_POLICY_IN=0, XFRM_POLICY_OUT=1, XFRM_POLICY_FWD=2
+    // (include/uapi/linux/xfrm.h:137-139). Note FWD=2, not OUT=2.
     match dir {
         0 => "in",
-        1 => "fwd",
-        2 => "out",
+        1 => "out",
+        2 => "fwd",
         _ => "other",
     }
 }

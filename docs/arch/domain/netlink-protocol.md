@@ -1424,7 +1424,7 @@ nlmsghdr {
 **xfrm_userpolicy_info fields used for metric labels:**
 
 ```
-u8  dir     @ 160  // XFRM_POLICY_IN=0, XFRM_POLICY_FWD=1, XFRM_POLICY_OUT=2
+u8  dir     @ 160  // XFRM_POLICY_IN=0, XFRM_POLICY_OUT=1, XFRM_POLICY_FWD=2
 u8  action  @ 161  // XFRM_POLICY_ALLOW=0, XFRM_POLICY_BLOCK=1
 ```
 
@@ -1432,7 +1432,7 @@ u8  action  @ 161  // XFRM_POLICY_ALLOW=0, XFRM_POLICY_BLOCK=1
 
 ```rust
 fn dir_label(dir: u8) -> &'static str {
-    match dir { 0 => "in", 1 => "fwd", 2 => "out", _ => "other" }
+    match dir { 0 => "in", 1 => "out", 2 => "fwd", _ => "other" }
 }
 
 fn action_label(action: u8) -> &'static str {
