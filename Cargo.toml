@@ -37,6 +37,7 @@ byteorder       = { version = "1.5" }
 # monoio: io_uring-first thread-per-core runtime; legacy feature = epoll fallback.
 # tokio/mio/axum/tower REMOVED per ADR-0023.
 monoio          = { version = "0.2", features = ["iouring", "legacy", "macros", "poll-io", "sync"] }
+io-uring        = { version = "0.7", default-features = false }
 
 # --- lock-free RCU cross-thread snapshot sharing (ADR-0023) ---
 arc-swap        = { version = "1.7" }

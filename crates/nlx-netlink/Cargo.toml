@@ -15,6 +15,7 @@ nlx-domain   = { workspace = true }
 nlx-ports    = { workspace = true }
 libc         = { workspace = true }
 monoio       = { workspace = true, features = ["sync"] }
+io-uring     = { workspace = true }
 rustix       = { workspace = true }
 linux-raw-sys = { workspace = true }
 zerocopy     = { workspace = true }
