@@ -17,19 +17,30 @@ Linux kernel to the Prometheus server.
 ```mermaid
 graph TD
     subgraph kernel["Linux Kernel"]
-        NL_ROUTE["NETLINK_ROUTE\n(rtnetlink + tc)"]
-        NL_NF["NETLINK_NETFILTER\n(ctnetlink + nfnetlink)"]
+        NL_ROUTE["NETLINK_ROUTE\n(rtnetlink + tc + extended)"]
+        NL_NF["NETLINK_NETFILTER\n(ctnetlink + nfnetlink + ct-exp)"]
         NL_SD["NETLINK_SOCK_DIAG"]
-        NL_GEN["NETLINK_GENERIC\n(ethtool genetlink)"]
+        NL_GEN["NETLINK_GENERIC\n(ethtool / IPVS / wireguard\ndevlink / NET_DM)"]
+        NL_XFRM["NETLINK_XFRM (family=6)\n+ /proc/net/xfrm_stat"]
+    end
+
+    subgraph adapters["Adapter Layer — tokio + mio AsyncFd"]
+        TOKIO["tokio AsyncFd\nmio readiness\n(shared across all GenL families)"]
     end
 
     subgraph domain["Domain Core — nft_exporter"]
         RT["Rtnetlink\n─────────────\nAR: Link\nRM: LinkSnapshot\nRM: AddressSnapshot\nRM: RouteTableSnapshot\nRM: NeighborSnapshot"]
         TC["TrafficControl\n─────────────\nEntity: QdiscNode\nRM: TcTreeSnapshot"]
-        CT["Conntrack\n─────────────\nAR: ConntrackFlow\nDS: ConntrackAggregator\nRM: ConntrackSummary"]
+        CT["Conntrack\n─────────────\nAR: ConntrackFlow\nDS: ConntrackAggregator\nRM: ConntrackSummary\nRM: ConntrackExpectationSummary"]
         NFT["Nftables\n─────────────\nAR: NftChain\nRM: NftCounterSnapshot"]
         SD["SockDiag\n─────────────\nRM: SocketStateHistogram"]
         ETH["Ethtool\n─────────────\nRM: NicStatSnapshot"]
+        XFRM["XfrmIpsec\n─────────────\nRM: XfrmSnapshot\n(runtime-gated)"]
+        IPVS["Ipvs\n─────────────\nRM: IpvsSnapshot\n(runtime-gated)"]
+        WG["Wireguard\n─────────────\nRM: WireguardSnapshot\n(runtime-gated)"]
+        DL["Devlink\n─────────────\nRM: DevlinkSnapshot\n(runtime-gated)"]
+        DM["DropMonitor\n─────────────\nRM: DropMonitorSnapshot\n(opt-in runtime-gated)"]
+        RTEX["RtnetlinkExtended\n─────────────\nRM: RtnetlinkExtendedSnapshot\n(opt-in)"]
         ORCH["CollectionOrchestration\n─────────────\nTM: ScrapeLifecycle\nAF: CollectorRegistry\nRM: MetricSnapshot"]
         EXP["Exposition\n─────────────\nAxumHttpAdapter\nPrometheusRegistryAdapter"]
     end
@@ -42,17 +53,37 @@ graph TD
 
     NL_ROUTE -->|RTM_GETLINK RTM_GETADDR\nRTM_GETROUTE RTM_GETNEIGH| RT
     NL_ROUTE -->|RTM_GETQDISC RTM_GETTCLASS\nRTM_GETTFILTER TCA_STATS2| TC
+    NL_ROUTE -->|RTM_GETSTATS RTM_GETNEIGH/AF_BRIDGE\nRTM_GETRULE RTM_GETNEXTHOP| RTEX
     NL_NF -->|IPCTNL_MSG_CT_GET\nIPCTNL_MSG_CT_GET_STATS_CPU| CT
+    NL_NF -->|IPCTNL_MSG_EXP_GET\nIPCTNL_MSG_EXP_GET_STATS_CPU| CT
     NL_NF -->|NFT_MSG_GETRULE\nNFT_MSG_GETCOUNTER\nNFT_MSG_GETSET NFT_MSG_GETCHAIN| NFT
     NL_SD -->|SOCK_DIAG_BY_FAMILY\nAF_INET AF_INET6| SD
     NL_GEN -->|ETHTOOL_MSG_STATS_GET\nLINKSETTINGS_GET PAUSE_GET\nFEC_GET RSS_GET| ETH
+    NL_GEN -->|IPVS_CMD_GET_INFO\nIPVS_CMD_GET_SERVICE\nIPVS_CMD_GET_DEST| IPVS
+    NL_GEN -->|WG_CMD_GET_DEVICE\nNLM_F_DUMP| WG
+    NL_GEN -->|DEVLINK_CMD_GET\nDEVLINK_CMD_PORT_GET\nDEVLINK_CMD_HEALTH_REPORTER_GET| DL
+    NL_GEN -->|NET_DM_CMD_CONFIG\nNET_DM_CMD_START\nNET_DM_GRP_ALERT multicast| DM
+    NL_XFRM -->|XFRM_MSG_GETSA\nXFRM_MSG_GETPOLICY\nXFRM_MSG_GETSADINFO/SPDINFO| XFRM
+
+    NL_GEN --> TOKIO
+    TOKIO -->|AsyncFd readiness| ETH
+    TOKIO -->|AsyncFd readiness| IPVS
+    TOKIO -->|AsyncFd readiness| WG
+    TOKIO -->|AsyncFd readiness| DL
+    TOKIO -->|AsyncFd readiness| DM
 
     RT -->|LinkSnapshot\nAddressSnapshot\nRouteTableSnapshot\nNeighborSnapshot| ORCH
     TC -->|TcTreeSnapshot| ORCH
-    CT -->|ConntrackSummary| ORCH
+    CT -->|ConntrackSummary\nConntrackExpectationSummary| ORCH
     NFT -->|NftCounterSnapshot| ORCH
     SD -->|SocketStateHistogram| ORCH
     ETH -->|NicStatSnapshot| ORCH
+    XFRM -->|XfrmSnapshot| ORCH
+    IPVS -->|IpvsSnapshot| ORCH
+    WG -->|WireguardSnapshot| ORCH
+    DL -->|DevlinkSnapshot| ORCH
+    DM -->|DropMonitorSnapshot| ORCH
+    RTEX -->|RtnetlinkExtendedSnapshot| ORCH
 
     ORCH -->|MetricSnapshot| EXP
     EXP -->|OpenMetrics text\ntext/plain; version=0.0.4| PROM
@@ -67,10 +98,17 @@ graph TD
 | Rtnetlink | core subsystem | NETLINK_ROUTE | CollectionOrchestration |
 | TrafficControl | core subsystem | NETLINK_ROUTE | CollectionOrchestration |
 | Conntrack | core subsystem | NETLINK_NETFILTER (ctnetlink) | CollectionOrchestration |
+| ConntrackExpectations | core subsystem | NETLINK_NETFILTER (NFNL_SUBSYS_CTNETLINK_EXP=2) | CollectionOrchestration |
 | Nftables | core subsystem | NETLINK_NETFILTER (nfnetlink) | CollectionOrchestration |
 | SockDiag | core subsystem | NETLINK_SOCK_DIAG | CollectionOrchestration |
 | Ethtool | core subsystem | NETLINK_GENERIC | CollectionOrchestration |
-| CollectionOrchestration | cross-cutting | all six subsystems | Exposition |
+| XfrmIpsec | runtime-gated subsystem | NETLINK_XFRM (family=6) + /proc/net/xfrm_stat | CollectionOrchestration |
+| Ipvs | runtime-gated subsystem | NETLINK_GENERIC (IPVS family) | CollectionOrchestration |
+| Wireguard | runtime-gated subsystem | NETLINK_GENERIC (wireguard family) | CollectionOrchestration |
+| Devlink | runtime-gated subsystem | NETLINK_GENERIC (devlink family) | CollectionOrchestration |
+| DropMonitor | opt-in runtime-gated subsystem | NETLINK_GENERIC (NET_DM family) | CollectionOrchestration |
+| RtnetlinkExtended | opt-in subsystem | NETLINK_ROUTE (RTM_GETSTATS + RTM_GETRULE + RTM_GETNEXTHOP) | CollectionOrchestration |
+| CollectionOrchestration | cross-cutting | all subsystems | Exposition |
 | Exposition | cross-cutting | CollectionOrchestration | Prometheus Server |
 
 ---

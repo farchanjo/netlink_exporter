@@ -12,11 +12,14 @@
 #     rtnetlink, netlink-packet-route, netlink-packet-netfilter, netlink-packet-sock-diag,
 #     netlink-proto, netlink-sys, netlink-packet-generic, genetlink, ethtool, rustables,
 #     axum, hyper, prometheus-client, prometheus, clap, config, serde_json, caps,
-#     tracing-subscriber, tokio (only the rt-multi-thread / macros features imply infra;
-#     the domain may use tokio traits only through its port definitions — runtime start is
-#     infra; however, because feature-level enforcement is outside Cargo.toml dependency
-#     graph inspection, we flag any direct tokio dependency in domain-core crates as a
-#     warning-level violation requiring review).
+#     tracing-subscriber, rustix, netlink (ADR-0011 low-level syscall layer).
+#
+#   Async runtime crates (ADR-0014 adapter-confinement invariant):
+#     tokio and mio are deny-level violations in domain-core crates. Port traits must
+#     use plain `async fn` (desugars to `impl Future`, executor-agnostic). tokio and
+#     mio may appear ONLY in driven adapter crates (nlx-netlink, nft_exporter_adapter_*)
+#     and the binary composition root (bin/). A direct dependency in domain-core implies
+#     the crate is wiring the runtime, which belongs exclusively to the composition root.
 #
 #   Input shape (produced by a companion script that reads Cargo.toml files):
 #   {
@@ -39,6 +42,16 @@ import future.keywords.if
 import future.keywords.in
 
 # Infrastructure crates that domain-core crates must never depend on.
+#
+# Tokio/mio adapter-confinement invariant (ADR-0014):
+#   tokio and mio are async-runtime infrastructure. Domain-core crates and
+#   port-trait definitions must remain runtime-agnostic — port traits use
+#   plain `async fn` syntax (desugars to `impl Future`, executor-agnostic).
+#   tokio and mio may appear ONLY in driven adapter crates (e.g., nlx-netlink,
+#   nft_exporter_adapter_*) and in the binary composition root (bin/).
+#   Any direct dependency on tokio or mio in a domain-core crate is a
+#   deny-level violation; it implies the crate is wiring the runtime, which
+#   is exclusively the composition root's responsibility.
 infra_crates := {
 	# Netlink transport and codec crates — adapter layer only
 	"rtnetlink",
@@ -72,6 +85,13 @@ infra_crates := {
 	# systemd notify — infra only
 	"sd-notify",
 	"libsystemd",
+	# Low-level syscall and UAPI crates — adapter layer only (ADR-0011)
+	"rustix",
+	"linux-raw-sys",
+	# Zero-copy wire codec crates — adapter layer only (ADR-0011/0014)
+	"zerocopy",
+	"bytemuck",
+	"byteorder",
 }
 
 # A crate is classified as domain-core if the manifest explicitly marks it.
@@ -91,16 +111,39 @@ deny contains msg if {
 	)
 }
 
-# Warn (expressed as deny with [WARN] prefix): domain-core crate imports tokio directly.
-# Tokio async traits (AsyncRead, AsyncWrite) are acceptable via indirect dependency through
-# port trait definitions, but a direct dependency suggests the crate may be wiring the runtime.
+# Deny: domain-core or ports crate imports tokio directly.
+#
+# ADR-0014 (tokio/mio adapter-confinement invariant): tokio is an async runtime
+# infrastructure crate. Domain-core crates and port-trait crates must not declare
+# a direct dependency on tokio. Port traits use plain `async fn` (impl Future),
+# which is executor-agnostic. tokio may only appear in driven adapter crates and
+# the binary composition root. A direct tokio dependency in domain-core implies
+# the crate is wiring the runtime — that responsibility belongs exclusively to
+# the composition root (bin/).
 deny contains msg if {
 	crate := input.crates[_]
 	is_domain_core(crate)
 	dep := crate.dependencies[_]
 	dep == "tokio"
 	msg := sprintf(
-		"[WARN] domain-core crate %q has a direct tokio dependency; verify only port trait bounds are used (no rt-multi-thread/macros features) — ADR-0002",
+		"domain-core crate %q must not depend on tokio; port traits use plain async fn (runtime-agnostic) — ADR-0014 adapter-confinement invariant",
+		[crate.name],
+	)
+}
+
+# Deny: domain-core or ports crate imports mio directly.
+#
+# ADR-0014: mio provides the epoll/kqueue readiness layer used by tokio's AsyncFd.
+# It is infrastructure confined to the nlx-netlink driven adapter and the binary
+# composition root. A direct mio dependency in domain-core crates is a violation
+# of the same adapter-confinement invariant as tokio.
+deny contains msg if {
+	crate := input.crates[_]
+	is_domain_core(crate)
+	dep := crate.dependencies[_]
+	dep == "mio"
+	msg := sprintf(
+		"domain-core crate %q must not depend on mio; mio is runtime infrastructure confined to driven adapters (nlx-netlink) and the composition root — ADR-0014",
 		[crate.name],
 	)
 }

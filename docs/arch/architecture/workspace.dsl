@@ -132,6 +132,94 @@ workspace "nft_exporter" "C4 architecture model for nft_exporter — a Rust 2024
                 }
             }
 
+            xfrmIpsecCollectorContainer = container "Xfrm IPsec Collector" "Runtime-gated IPsec observability collector. Issues XFRM_MSG_GETSA and XFRM_MSG_GETPOLICY dumps to count SAs and SPs by (proto,mode) and (dir,action). Queries XFRM_MSG_GETSADINFO and XFRM_MSG_GETSPDINFO for SAD/SPD hash watermarks. Parses /proc/net/xfrm_stat for 26 bounded XFRM error counters. Sets available=0 when xfrm_user is absent or EPERM at startup probe." "Rust / NETLINK_XFRM + procfs" {
+                tags "Container,Collector,runtime-gated"
+
+                xfrmIpsecCollector = component "XfrmIpsecCollector" "Concrete Strategy (GoF) in xfrm-ipsec bounded context. Issues XFRM_MSG_GETSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSADINFO, XFRM_MSG_GETSPDINFO via NetlinkXfrmIpsecPort. Parses /proc/net/xfrm_stat. Produces XfrmSnapshot ReadModel. Emits nft_scrape_collector_available{collector=xfrm-ipsec}." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                xfrmIpsecAdapter = component "XfrmIpsecAdapter" "Driven adapter implementing NetlinkXfrmIpsecPort. Opens NETLINK_XFRM (family=6) AF_NETLINK raw socket via rustix. Issues XFRM_MSG_GETSA and XFRM_MSG_GETPOLICY NLM_F_DUMP requests. Zero-copy parses xfrm_usersa_info and xfrm_userpolicy_info frames. Reads /proc/net/xfrm_stat." "Rust, nft_exporter_adapter_xfrm" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
+            ipvsCollectorContainer = container "IPVS Collector" "Resolves the IPVS generic-netlink family via CTRL_CMD_GETFAMILY; issues IPVS_CMD_GET_INFO, IPVS_CMD_GET_SERVICE dump, and per-service IPVS_CMD_GET_DEST requests; decodes IPVS_SVC_ATTR_STATS64 and IPVS_DEST_ATTR_STATS64 nested attributes into IpvsSnapshot ReadModel. Runtime-gated: ENOENT on family resolution sets available=false." "Rust / NETLINK_GENERIC" {
+                tags "Container,Collector,runtime-gated"
+
+                ipvsCollector = component "IpvsCollector" "Concrete Strategy (GoF) in ipvs bounded context. Translates IpvsSnapshot into nft_ipvs_* Prometheus metric families and emits nft_scrape_collector_available{collector=ipvs}. Enforces ipvs_max_services and ipvs_max_dests_per_service cardinality guards." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                ipvsAdapter = component "IpvsAdapter" "Driven adapter implementing NetlinkIpvsPort. Resolves IPVS genl family via CTRL_CMD_GETFAMILY; issues IPVS_CMD_GET_INFO, IPVS_CMD_GET_SERVICE, IPVS_CMD_GET_DEST over NETLINK_GENERIC." "Rust, nft_exporter_adapter_ipvs" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
+            wireguardCollectorContainer = container "WireGuard Collector" "Resolves the wireguard generic-netlink family via CTRL_CMD_GETFAMILY; runtime-gated on ENOENT. Issues WG_CMD_GET_DEVICE NLM_F_DUMP per scrape; parses WGDEVICE_A_* and WGPEER_A_* attributes into WireguardSnapshot ReadModel. Peer identity bounded by SHA-256 truncated hash or operator name map." "Rust / NETLINK_GENERIC / WireGuard uapi" {
+                tags "Container,Collector,runtime-gated"
+
+                wireguardCollector = component "WireguardCollector" "Concrete Strategy (GoF) in wireguard bounded context. Resolves 'wireguard' family ID at startup via CTRL_CMD_GETFAMILY; runtime-gated on ENOENT. Issues WG_CMD_GET_DEVICE dump; produces WireguardSnapshot ReadModel." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                netlinkWireguardAdapter = component "NetlinkWireguardAdapter" "Driven adapter implementing NetlinkWireguardPort. Shares the NETLINK_GENERIC socket family. Uses a separate OnceLock<Option<u16>> for the dynamically resolved 'wireguard' family ID. Implements WG_CMD_GET_DEVICE dump-and-parse with NLM_F_DUMP_INTR restart semantics." "Rust, nft_exporter_adapter_wg" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
+            devlinkCollectorContainer = container "Devlink Collector" "Collects devlink device, port, and health reporter metrics via the devlink genetlink family. Runtime-gated: CTRL_CMD_GETFAMILY returning ENOENT on hosts without CONFIG_NET_DEVLINK sets collector_available=false and emits no further requests. Produces DevlinkSnapshot ReadModel." "Rust, NETLINK_GENERIC (devlink)" {
+                tags "Container,Collector,runtime-gated"
+
+                devlinkCollector = component "DevlinkCollector" "Concrete Strategy (GoF) in Devlink bounded context. Issues DEVLINK_CMD_GET, DEVLINK_CMD_PORT_GET, DEVLINK_CMD_HEALTH_REPORTER_GET via NetlinkDevlinkPort. Runtime-gated on genl family resolution. Produces DevlinkSnapshot ReadModel." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                devlinkAdapter = component "DevlinkAdapter" "Driven adapter implementing NetlinkDevlinkPort. Resolves the devlink genl family id via CTRL_CMD_GETFAMILY (cached in OnceLock<u16>); issues NLM_F_DUMP requests for DEVLINK_CMD_GET and DEVLINK_CMD_PORT_GET; issues per-device DEVLINK_CMD_HEALTH_REPORTER_GET. ENOENT on family resolution sets collector_available=false." "Rust, nft_exporter_adapter_devlink" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
+            dropMonitorCollectorContainer = container "Drop-Monitor Collector" "Collects per-reason kernel packet-drop counters via the NET_DM generic-netlink family. Runtime-gated: emits nft_scrape_collector_available=0 when the drop_monitor module is absent (CTRL_CMD_GETFAMILY ENOENT). In summary mode only; per-packet event mode is unsupported. Produces DropMonitorSnapshot ReadModel." "Rust, NETLINK_GENERIC (NET_DM)" {
+                tags "Container,Collector,runtime-gated"
+
+                dropMonitorCollector = component "DropMonitorCollector" "Concrete Strategy (GoF) in DropMonitor bounded context. Issues NET_DM_CMD_CONFIG (summary mode) and NET_DM_CMD_START via NetlinkDropMonitorPort. Consumes NET_DM_CMD_ALERT multicast frames and accumulates DropReasonCounter entries by (reason, origin). Produces DropMonitorSnapshot ReadModel." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                dropMonitorAdapter = component "DropMonitorAdapter" "Driven adapter implementing NetlinkDropMonitorPort. Resolves NET_DM family via CTRL_CMD_GETFAMILY; subscribes to NET_DM_GRP_ALERT multicast group; decodes NET_DM_CMD_ALERT nlattr chains extracting NET_DM_ATTR_REASON and NET_DM_ATTR_HW_TRAP_NAME and NET_DM_ATTR_STATS_DROPPED u64 native-endian." "Rust, nft_exporter_adapter_dm" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
+            rtnetlinkExtendedCollectorContainer = container "Rtnetlink Extended Collector" "Collects extended per-interface link xstats (RTM_GETSTATS with IFLA_STATS_LINK_XSTATS and IFLA_STATS_LINK_OFFLOAD_XSTATS), bridge FDB entry counts (RTM_GETNEIGH AF_BRIDGE), fib policy-rule counts (RTM_GETRULE), and nexthop object counts (RTM_GETNEXTHOP) via NETLINK_ROUTE. Runtime-gated on kernel >= 4.20. Produces RtnetlinkExtendedSnapshot ReadModel." "Rust, NETLINK_ROUTE, nft_exporter_adapter_rt_extended" {
+                tags "Container,Collector,runtime-gated"
+
+                rtnetlinkExtendedCollector = component "RtnetlinkExtendedCollector" "Concrete Strategy (GoF) in rtnetlink-extended bounded context. Issues RTM_GETSTATS, RTM_GETNEIGH/AF_BRIDGE, RTM_GETRULE, and RTM_GETNEXTHOP via NetlinkRtnetlinkExtendedPort. Availability probe on startup. Produces RtnetlinkExtendedSnapshot ReadModel." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                rtnetlinkExtendedAdapter = component "RtnetlinkExtendedAdapter" "Driven adapter implementing NetlinkRtnetlinkExtendedPort. Opens NETLINK_ROUTE socket; issues RTM_GETSTATS (if_stats_msg body, filter_mask=0x0B), RTM_GETNEIGH (AF_BRIDGE), RTM_GETRULE (AF_INET/AF_INET6/AF_MPLS), and RTM_GETNEXTHOP (nhmsg body); decodes BRIDGE_XSTATS_MCAST, rtnl_hw_stats64, fib_rule_hdr, and nhmsg payloads." "Rust, nft_exporter_adapter_rt_extended" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
+            conntrackExpectationsCollectorContainer = container "Conntrack-Expectations Collector" "Collects Linux conntrack expectation-table state from ctnetlink NFNL_SUBSYS_CTNETLINK_EXP (subsystem id 2). Issues IPCTNL_MSG_EXP_GET dump (nlmsg_type=0x0200) and IPCTNL_MSG_EXP_GET_STATS_CPU (nlmsg_type=0x0203). Runtime-gated: sets nft_scrape_collector_available=0 and returns empty ReadModel when kernel returns ENOENT or EPERM. Produces ConntrackExpectationSummary ReadModel aggregated by (l4proto, helper)." "Rust, NETLINK_NETFILTER (NFNL_SUBSYS_CTNETLINK_EXP=2)" {
+                tags "Container,Collector"
+
+                conntrackExpectationsCollector = component "ConntrackExpectationsCollector" "Concrete Strategy (GoF) in conntrack-expectations bounded context. Issues IPCTNL_MSG_EXP_GET dump and IPCTNL_MSG_EXP_GET_STATS_CPU via NetlinkConntrackExpectationsPort. Runtime-gates on ENOENT/EPERM. Produces ConntrackExpectationSummary ReadModel." "Rust" {
+                    tags "Component,ConcreteStrategy"
+                }
+
+                conntrackExpectationsAggregator = component "ConntrackExpectationsAggregator" "Domain Service in conntrack-expectations bounded context. Groups raw expectation entries by (l4proto, helper) and counts them. Enforces the 256-key cardinality overflow guard. Pure domain logic with no kernel or infra dependency." "Rust" {
+                    tags "Component,DomainService"
+                }
+
+                conntrackExpectationsAdapter = component "ConntrackExpectationsAdapter" "Driven adapter implementing NetlinkConntrackExpectationsPort. Issues IPCTNL_MSG_EXP_GET and IPCTNL_MSG_EXP_GET_STATS_CPU over the shared NETLINK_NETFILTER socket (protocol=12, NFNL_SUBSYS_CTNETLINK_EXP=2). Maps ENOENT/EPERM to availability=false." "Rust, nft_exporter_adapter_ct_exp" {
+                    tags "Component,DrivenAdapter"
+                }
+            }
+
             metricRegistry = container "Metric Registry" "Accepts ReadModel samples from all collectors; encodes OpenMetrics text into Vec<u8>. Abstracts prometheus-client 0.24 from domain-core crates. Implements MetricRegistryPort driven port." "Rust, prometheus-client 0.24, OpenMetrics" {
                 tags "Container,DrivenAdapter"
 
@@ -158,6 +246,13 @@ workspace "nft_exporter" "C4 architecture model for nft_exporter — a Rust 2024
             collectionOrchestrator -> nftablesCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
             collectionOrchestrator -> sockDiagCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
             collectionOrchestrator -> ethtoolCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> xfrmIpsecCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> ipvsCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> wireguardCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> devlinkCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> dropMonitorCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> rtnetlinkExtendedCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
+            collectionOrchestrator -> conntrackExpectationsCollectorContainer "Fans out scrape via Collector trait (JoinSet, timeout 9800 ms)" "Collector Strategy"
 
             # Collectors publish ReadModels to metric registry
             collectionOrchestrator -> metricRegistry "Publishes MetricSnapshot via MetricRegistryPort" "MetricRegistryPort"
@@ -167,6 +262,13 @@ workspace "nft_exporter" "C4 architecture model for nft_exporter — a Rust 2024
             nftablesCollectorContainer -> metricRegistry "Returns NftCounterSnapshot" "ReadModel"
             sockDiagCollectorContainer -> metricRegistry "Returns SocketStateHistogram" "ReadModel"
             ethtoolCollectorContainer -> metricRegistry "Returns NicStatSnapshot" "ReadModel"
+            xfrmIpsecCollectorContainer -> metricRegistry "Returns XfrmSnapshot" "ReadModel"
+            ipvsCollectorContainer -> metricRegistry "Returns IpvsSnapshot" "ReadModel"
+            wireguardCollectorContainer -> metricRegistry "Returns WireguardSnapshot" "ReadModel"
+            devlinkCollectorContainer -> metricRegistry "Returns DevlinkSnapshot" "ReadModel"
+            dropMonitorCollectorContainer -> metricRegistry "Returns DropMonitorSnapshot" "ReadModel"
+            rtnetlinkExtendedCollectorContainer -> metricRegistry "Returns RtnetlinkExtendedSnapshot" "ReadModel"
+            conntrackExpectationsCollectorContainer -> metricRegistry "Returns ConntrackExpectationSummary" "ReadModel"
 
             # HTTP exposition reads encoded OpenMetrics text from registry
             httpExposition -> metricRegistry "Reads OpenMetrics text response body" "Vec<u8>"
@@ -178,6 +280,13 @@ workspace "nft_exporter" "C4 architecture model for nft_exporter — a Rust 2024
             nftablesCollectorContainer -> linuxKernel "NFT_MSG_GETRULE, NFT_MSG_GETCOUNTER, NFT_MSG_GETSET, NFT_MSG_GETCHAIN, NFT_MSG_GETTABLE via NETLINK_NETFILTER" "NETLINK_NETFILTER (nfnetlink)"
             sockDiagCollectorContainer -> linuxKernel "SOCK_DIAG_BY_FAMILY AF_INET/AF_INET6 via NETLINK_SOCK_DIAG" "NETLINK_SOCK_DIAG"
             ethtoolCollectorContainer -> linuxKernel "ETHTOOL_MSG_STATS_GET, LINKSETTINGS_GET, PAUSE_GET, FEC_GET, RSS_GET via NETLINK_GENERIC" "NETLINK_GENERIC (ethtool)"
+            xfrmIpsecCollectorContainer -> linuxKernel "XFRM_MSG_GETSA, XFRM_MSG_GETPOLICY, XFRM_MSG_GETSADINFO, XFRM_MSG_GETSPDINFO via NETLINK_XFRM; /proc/net/xfrm_stat" "NETLINK_XFRM (family=6)"
+            ipvsCollectorContainer -> linuxKernel "IPVS_CMD_GET_INFO, IPVS_CMD_GET_SERVICE, IPVS_CMD_GET_DEST via NETLINK_GENERIC" "NETLINK_GENERIC (IPVS)"
+            wireguardCollectorContainer -> linuxKernel "WG_CMD_GET_DEVICE via NETLINK_GENERIC (wireguard family)" "NETLINK_GENERIC (wireguard)"
+            devlinkCollectorContainer -> linuxKernel "DEVLINK_CMD_GET, DEVLINK_CMD_PORT_GET, DEVLINK_CMD_HEALTH_REPORTER_GET via NETLINK_GENERIC" "NETLINK_GENERIC (devlink)"
+            dropMonitorCollectorContainer -> linuxKernel "NET_DM_CMD_CONFIG, NET_DM_CMD_START, NET_DM_GRP_ALERT multicast via NETLINK_GENERIC" "NETLINK_GENERIC (NET_DM)"
+            rtnetlinkExtendedCollectorContainer -> linuxKernel "RTM_GETSTATS, RTM_GETNEIGH/AF_BRIDGE, RTM_GETRULE, RTM_GETNEXTHOP via NETLINK_ROUTE" "NETLINK_ROUTE"
+            conntrackExpectationsCollectorContainer -> linuxKernel "IPCTNL_MSG_EXP_GET, IPCTNL_MSG_EXP_GET_STATS_CPU via NETLINK_NETFILTER (NFNL_SUBSYS_CTNETLINK_EXP=2)" "NETLINK_NETFILTER (ctnetlink-exp)"
         }
 
         # ── System-level relationships ───────────────────────────────────────
@@ -186,7 +295,7 @@ workspace "nft_exporter" "C4 architecture model for nft_exporter — a Rust 2024
         grafana -> prometheusServer "Queries metric time series" "PromQL/HTTP"
 
         # Prometheus calls the HTTP exposition directly (container level)
-        prometheusServer -> nftExporter.httpExposition "GET /metrics port 9456" "HTTP/OpenMetrics"
+        prometheusServer -> httpExposition "GET /metrics port 9456" "HTTP/OpenMetrics"
     }
 
     views {

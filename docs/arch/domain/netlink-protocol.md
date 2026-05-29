@@ -30,7 +30,7 @@ ADR-0011 replaces ADR-0004 and mandates direct wire implementation via
 This document is the single authoritative source for every byte offset, field
 type, attribute constant, and endianness decision in that implementation.
 
-All six adapter crates read this document:
+All adapter crates read this document:
 
 | Adapter crate | Netlink family | Sections |
 |---|---|---|
@@ -40,6 +40,13 @@ All six adapter crates read this document:
 | `nft_exporter_adapter_nft` | NETLINK_NETFILTER (12) | 3, 10, 11 |
 | `nft_exporter_adapter_sockdiag` | NETLINK_SOCK_DIAG (4) | 6, 10, 11 |
 | `nft_exporter_adapter_ethtool` | NETLINK_GENERIC (16) | 8, 10, 11 |
+| `nft_exporter_adapter_xfrm` | NETLINK_XFRM (6) | 12 |
+| `nft_exporter_adapter_ipvs` | NETLINK_GENERIC (16) | 13 |
+| `nft_exporter_adapter_wg` | NETLINK_GENERIC (16) | 14 |
+| `nft_exporter_adapter_devlink` | NETLINK_GENERIC (16) | 15 |
+| `nft_exporter_adapter_dm` | NETLINK_GENERIC (16) | 16 |
+| `nft_exporter_adapter_rt_extended` | NETLINK_ROUTE (0) | 17 |
+| `nft_exporter_adapter_ct_exp` | NETLINK_NETFILTER (12) | 18 |
 
 ---
 
@@ -1188,3 +1195,1038 @@ always positive. Cast to `u32` for use as interface identity.
 On older kernels, `nlmsg_seq` in `NLMSG_DONE` frames does not always match the
 request seq. Detect end-of-dump by `nlmsg_type == NLMSG_DONE`, not by seq
 equality.
+
+---
+
+## 12  NETLINK_XFRM (family=6) — IPsec SA/SP/SAD/SPD/xfrm_stat
+
+**Adapter crate:** `nft_exporter_adapter_xfrm`
+**Socket:** `NETLINK_XFRM = 6`
+**ADR reference:** ADR-0016
+
+| Adapter crate | Netlink family | Sections |
+|---|---|---|
+| `nft_exporter_adapter_xfrm` | NETLINK_XFRM (6) | 12 |
+
+### 12.1  Message Type Constants
+
+`NETLINK_XFRM` does not use a subsystem header (no `nfgenmsg`). The body follows
+the `nlmsghdr` directly.
+
+| Symbolic name | Value | Purpose |
+|---|---|---|
+| `XFRM_MSG_GETSA` | `0x0007` | Full SAD dump; one `xfrm_usersa_info` per reply frame |
+| `XFRM_MSG_GETPOLICY` | `0x0009` | Full SPD dump; one `xfrm_userpolicy_info` per reply frame |
+| `XFRM_MSG_GETSADINFO` | `0x0011` | Single-frame reply with `xfrm_sadinfo` |
+| `XFRM_MSG_GETSPDINFO` | `0x0012` | Single-frame reply with `xfrm_spdinfo` |
+
+### 12.2  Runtime Availability Probe
+
+Open `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 6)`. If this
+returns `EPROTONOSUPPORT`, `xfrm_user` is absent; set `available=false` and skip
+all subsequent I/O. Otherwise issue `XFRM_MSG_GETSADINFO` with a 500 ms timeout.
+`EPERM` or `ENOENT` replies also set `available=false`. Log the probe result at
+`INFO` level on startup; do not log on every scrape cycle when `available=false`.
+
+### 12.3  XFRM_MSG_GETSA Dump
+
+**Request (16 bytes — nlmsghdr only, no body):**
+
+```
+nlmsghdr {
+    nlmsg_len   = 16,
+    nlmsg_type  = 0x0007,       // XFRM_MSG_GETSA
+    nlmsg_flags = 0x0301,       // NLM_F_REQUEST | NLM_F_DUMP
+    nlmsg_seq   = N,
+    nlmsg_pid   = 0
+}
+```
+
+**Reply:** One frame per SA. Body is `xfrm_usersa_info` (220 bytes, native-endian
+unless noted). `NLMSG_DONE` terminates the dump. Apply `NLM_F_DUMP_INTR` restart
+logic (section 3.3, cap at `netlink_dump_max_restarts`).
+
+**xfrm_usersa_info fields used for metric labels:**
+
+```
+// offsets within body (after nlmsghdr)
+u8  id.proto    @ 40   // IPPROTO_ESP=50, IPPROTO_AH=51, IPPROTO_COMP=108
+u8  mode        @ 184  // XFRM_MODE_TUNNEL=0, XFRM_MODE_TRANSPORT=1, XFRM_MODE_BEET=4
+```
+
+**Metric accumulation:** For each reply frame, increment the counter for the
+`(proto_label(id.proto), mode_label(mode))` bucket in a `BTreeMap`. After
+`NLMSG_DONE`, emit one `nft_xfrm_sa_count` gauge per non-zero bucket.
+
+```rust
+fn proto_label(proto: u8) -> &'static str {
+    match proto {
+        50  => "esp",
+        51  => "ah",
+        108 => "comp",
+        _   => "other",
+    }
+}
+
+fn mode_label(mode: u8) -> &'static str {
+    match mode {
+        0 => "tunnel",
+        1 => "transport",
+        4 => "beet",
+        _ => "other",
+    }
+}
+```
+
+### 12.4  XFRM_MSG_GETPOLICY Dump
+
+**Request (16 bytes):**
+
+```
+nlmsghdr {
+    nlmsg_len   = 16,
+    nlmsg_type  = 0x0009,       // XFRM_MSG_GETPOLICY
+    nlmsg_flags = 0x0301,       // NLM_F_REQUEST | NLM_F_DUMP
+    nlmsg_seq   = N,
+    nlmsg_pid   = 0
+}
+```
+
+**Reply:** One frame per policy. Body is `xfrm_userpolicy_info` (164 bytes).
+
+**xfrm_userpolicy_info fields used for metric labels:**
+
+```
+u8  dir     @ 160  // XFRM_POLICY_IN=0, XFRM_POLICY_FWD=1, XFRM_POLICY_OUT=2
+u8  action  @ 161  // XFRM_POLICY_ALLOW=0, XFRM_POLICY_BLOCK=1
+```
+
+**Metric accumulation:** Same pattern as SA dump; bucket by `(dir_label, action_label)`.
+
+```rust
+fn dir_label(dir: u8) -> &'static str {
+    match dir { 0 => "in", 1 => "fwd", 2 => "out", _ => "other" }
+}
+
+fn action_label(action: u8) -> &'static str {
+    match action { 0 => "allow", _ => "block" }
+}
+```
+
+### 12.5  XFRM_MSG_GETSADINFO
+
+**Request (16 bytes):**
+
+```
+nlmsghdr { nlmsg_len=16, nlmsg_type=0x0011, nlmsg_flags=0x0001, ... }
+```
+
+**Reply:** Single frame. Body is `xfrm_sadinfo` (8 bytes, native-endian):
+
+```
+u32 sadhcnt  @ 0   // current SAD hash entry count → nft_xfrm_sad_hash_count
+u32 sadhmcnt @ 4   // SAD hash bucket count        → nft_xfrm_sad_hash_max
+```
+
+### 12.6  XFRM_MSG_GETSPDINFO
+
+**Request (16 bytes):**
+
+```
+nlmsghdr { nlmsg_len=16, nlmsg_type=0x0012, nlmsg_flags=0x0001, ... }
+```
+
+**Reply:** Single frame. Body is `xfrm_spdinfo` (28 bytes, native-endian):
+
+```
+u32 spdhcnt  @ 0   // current SPD hash entry count → nft_xfrm_spd_hash_count
+u32 spdhmcnt @ 4   // SPD hash bucket count        → nft_xfrm_spd_hash_max
+// remaining 20 bytes (spdbtree policy counts) not exported
+```
+
+### 12.7  /proc/net/xfrm_stat Error Counters
+
+`/proc/net/xfrm_stat` is a plain text file with one `key value` pair per line.
+The kernel already aggregates per-CPU counters before exposing them here; no
+further summation is needed.
+
+**Parsing pseudocode (inside `spawn_blocking`):**
+
+```rust
+let text = std::fs::read_to_string("/proc/net/xfrm_stat")?;
+for line in text.lines() {
+    let mut parts = line.split_whitespace();
+    let key = parts.next().unwrap_or("");
+    let val: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if XFRM_STAT_KEYS.contains(key) {
+        stat_map.insert(key, val);
+    }
+    // unknown keys silently ignored — forward-compat with future kernel counters
+}
+```
+
+`XFRM_STAT_KEYS` is a `&[&str; 26]` constant containing the fixed kernel ABI key
+set.
+
+**Metric mapping:** Each key emits one `nft_xfrm_stat_total{counter=<key>}` series.
+
+### 12.8  Metric Field-to-Wire Table
+
+| Metric | Source | Wire field | Notes |
+|---|---|---|---|
+| `nft_xfrm_sa_count{proto,mode}` | `XFRM_MSG_GETSA` dump | frame count by `(id.proto, mode)` | Counters, not gauge from a struct field |
+| `nft_xfrm_sp_count{dir,action}` | `XFRM_MSG_GETPOLICY` dump | frame count by `(dir, action)` | Counters, not gauge from a struct field |
+| `nft_xfrm_sad_hash_count` | `XFRM_MSG_GETSADINFO` | `xfrm_sadinfo.sadhcnt` u32 LE | |
+| `nft_xfrm_sad_hash_max` | `XFRM_MSG_GETSADINFO` | `xfrm_sadinfo.sadhmcnt` u32 LE | |
+| `nft_xfrm_spd_hash_count` | `XFRM_MSG_GETSPDINFO` | `xfrm_spdinfo.spdhcnt` u32 LE | |
+| `nft_xfrm_spd_hash_max` | `XFRM_MSG_GETSPDINFO` | `xfrm_spdinfo.spdhmcnt` u32 LE | |
+| `nft_xfrm_stat_total{counter}` | `/proc/net/xfrm_stat` | text key-value, pre-aggregated | 26 bounded counter names |
+| `nft_scrape_collector_available{collector="xfrm-ipsec"}` | startup probe | `XFRM_MSG_GETSADINFO` result | 1=available, 0=absent/EPERM |
+
+### 12.9  Endianness
+
+All `xfrm_usersa_info`, `xfrm_userpolicy_info`, `xfrm_sadinfo`, and `xfrm_spdinfo`
+fields are **native-endian** (same as all other `NETLINK_XFRM` payloads; no
+`byteorder::NetworkEndian` reads required). The IP address fields within
+`xfrm_address_t` (used in `xfrm_selector` and `xfrm_id`) are network-byte-order
+but are not read by this collector (no per-SA address labels — ADR-0005 cardinality
+forbids them).
+
+### 12.10  Gotchas
+
+- `XFRM_MSG_GETSA` and `XFRM_MSG_GETPOLICY` dumps can interleave with kernel SA
+  expiry events; `NLM_F_DUMP_INTR` (bit 4 of `nlmsg_flags`) signals concurrent
+  modification. Apply the standard restart logic capped at
+  `ExporterConfig.netlink_dump_max_restarts` (default 8).
+- The body length of `xfrm_usersa_info` is 220 bytes on all supported kernel
+  versions (>= 4.14). Unlike `nf_conntrack_stat` or `rtnl_link_stats64`, there
+  are no known kernel-version size variants. Validate with
+  `payload.len() >= 220` and return `CollectorError::ParseError` if violated.
+- `xfrm_userpolicy_info` is followed by optional `xfrma_*` nlattr chain (e.g.
+  `XFRMA_TMPL`). The adapter reads only the fixed struct body and ignores the
+  trailing nlattr chain — consistent with the count-only metric strategy.
+- `/proc/net/xfrm_stat` requires only read access (no `CAP_NET_ADMIN`). The
+  socket operations require `CAP_NET_ADMIN` (or `CAP_NET_RAW` on some kernels).
+  The runtime availability probe will distinguish permission failures from module
+  absence via the returned errno.
+
+---
+
+## 13  NETLINK_GENERIC — IPVS Generic-Netlink Family
+
+**Genl family name resolution note:** The IPVS family name `"IPVS\0"` must be
+resolved at startup via `CTRL_CMD_GETFAMILY` (section 8.1 pattern) and cached
+in a separate `OnceLock<u16>` from the ethtool and wireguard families.
+
+### 13.1  Three-Phase Collection Sequence
+
+The IPVS collector uses the same `NETLINK_GENERIC` (protocol 16) socket and
+`CTRL_CMD_GETFAMILY` resolution path as the ethtool collector (section 8.1).
+
+```mermaid
+sequenceDiagram
+    participant U as nft_exporter
+    participant K as Linux Kernel
+
+    Note over U,K: Phase 1 — Family resolution (OnceLock; ENOENT = runtime-gated)
+    U->>K: nlmsghdr{type=16, flags=NLM_F_REQUEST|NLM_F_ACK}<br/>genlmsghdr{cmd=CTRL_CMD_GETFAMILY=3, version=2}<br/>CTRL_ATTR_FAMILY_NAME="IPVS\0"
+    K-->>U: CTRL_ATTR_FAMILY_ID (u16 LE) -> cached ipvs_family_id
+    Note over U: ENOENT -> available=false; emit nft_scrape_collector_available=0; stop
+
+    Note over U,K: Phase 2 — Info (one unicast; NLM_F_REQUEST|NLM_F_ACK)
+    U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0005}<br/>genlmsghdr{cmd=IPVS_CMD_GET_INFO=15, version=1}
+    K-->>U: IPVS_INFO_ATTR_CONN_TAB_SIZE u32
+
+    Note over U,K: Phase 3 — Service dump (NLM_F_REQUEST|NLM_F_DUMP)
+    U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0301}<br/>genlmsghdr{cmd=IPVS_CMD_GET_SERVICE=4, version=1}
+    K-->>U: [NLM_F_MULTI] IPVS_SVC_ATTR_* + IPVS_SVC_ATTR_STATS64 [svc 1]
+    K-->>U: [NLM_F_MULTI] IPVS_SVC_ATTR_* + IPVS_SVC_ATTR_STATS64 [svc 2]
+    K-->>U: NLMSG_DONE
+
+    Note over U,K: Phase 4 — Destination query per service (unicast, sequential)
+    U->>K: nlmsghdr{type=ipvs_family_id, flags=0x0005}<br/>genlmsghdr{cmd=IPVS_CMD_GET_DEST=8, version=1}<br/>+ service key attrs
+    K-->>U: [NLM_F_MULTI] IPVS_DEST_ATTR_* + IPVS_DEST_ATTR_STATS64 [dest 1]
+    K-->>U: NLMSG_DONE
+```
+
+### 13.2  genlmsghdr for IPVS
+
+The `genlmsghdr` (4 bytes at offset 16 following `nlmsghdr`) for all IPVS
+messages uses `version=1` (`IPVS_GENL_VERSION`). Sending `version=0` causes
+`EINVAL` on some kernel versions (same rule as for ethtool, see gotcha G-18).
+
+```
+u8  cmd      @ 0   (IPVS_CMD_GET_INFO=15, IPVS_CMD_GET_SERVICE=4, IPVS_CMD_GET_DEST=8)
+u8  version  @ 1   (always 1 — IPVS_GENL_VERSION)
+u16 reserved @ 2   (always 0)
+```
+
+nlattr chain starts at byte offset 20 (`NLMSG_HDRLEN + sizeof(genlmsghdr)`).
+
+### 13.3  IPVS_CMD_GET_INFO Reply Attributes
+
+| Effective attr type | Constant | Payload | Metric |
+|---|---|---|---|
+| 1 | `IPVS_INFO_ATTR_VERSION` | `u32` native-endian kernel IPVS version | not emitted |
+| 2 | `IPVS_INFO_ATTR_CONN_TAB_SIZE` | `u32` native-endian table capacity | `nft_ipvs_connection_table_size` gauge |
+
+### 13.4  IPVS_CMD_GET_SERVICE Reply — Service Key Attributes
+
+Each reply frame carries one virtual service. Attribute types from
+`include/uapi/linux/ip_vs.h` `enum ipvs_svc_attrs`:
+
+| Effective attr type | Constant | Payload | Notes |
+|---|---|---|---|
+| 1 | `IPVS_SVC_ATTR_AF` | `u16` native-endian | `AF_INET=2`, `AF_INET6=10` |
+| 2 | `IPVS_SVC_ATTR_PROTOCOL` | `u16` native-endian | `IPPROTO_TCP=6`, `IPPROTO_UDP=17`, `IPPROTO_SCTP=132` |
+| 3 | `IPVS_SVC_ATTR_ADDR` | 4 bytes (AF_INET) or 16 bytes (AF_INET6); network byte order | VIP address |
+| 4 | `IPVS_SVC_ATTR_PORT` | `u16` **big-endian** (network byte order) | Virtual port |
+| 5 | `IPVS_SVC_ATTR_FWMARK` | `u32` native-endian | Mutually exclusive with ADDR+PORT |
+| 6 | `IPVS_SVC_ATTR_SCHED_NAME` | NUL-terminated ASCII | `sched` label in `nft_ipvs_service_info` |
+| 10 | `IPVS_SVC_ATTR_STATS` | nested; 32-bit counters | Fallback when STATS64 absent (kernel < 3.15) |
+| 11 | `IPVS_SVC_ATTR_STATS64` | nested; 64-bit counters | **Preferred**; always check for this first |
+
+**IPVS_SVC_ATTR_PORT endianness:** `u16` in network byte order. Use
+`u16::from_be_bytes`. This is identical to other UAPI port fields.
+
+**Fwmark service label convention:** When `IPVS_SVC_ATTR_FWMARK` is present
+(and `IPVS_SVC_ATTR_ADDR`/`IPVS_SVC_ATTR_PORT` are absent or zero), emit
+`vip=""` and `port="0x<fwmark_hex>"` as Prometheus labels.
+
+### 13.5  IPVS_CMD_GET_DEST Reply — Destination Attributes
+
+| Effective attr type | Constant | Payload | Notes |
+|---|---|---|---|
+| 1 | `IPVS_DEST_ATTR_ADDR` | 4 or 16 bytes; network byte order | Real-server address |
+| 2 | `IPVS_DEST_ATTR_PORT` | `u16` **big-endian** | Real-server port |
+| 7 | `IPVS_DEST_ATTR_ACTIVE_CONNS` | `u32` native-endian | `nft_ipvs_dest_active_connections` gauge |
+| 8 | `IPVS_DEST_ATTR_INACT_CONNS` | `u32` native-endian | `nft_ipvs_dest_inactive_connections` gauge |
+| 10 | `IPVS_DEST_ATTR_STATS` | nested; 32-bit | Fallback (kernel < 3.15) |
+| 12 | `IPVS_DEST_ATTR_STATS64` | nested; 64-bit | **Preferred** |
+
+### 13.6  IPVS_SVC_ATTR_STATS64 / IPVS_DEST_ATTR_STATS64 Nested Attributes
+
+Both carry inner attribute type numbering from `enum ipvs_stats_attrs`. All
+values are `u64` native-endian:
+
+| Inner attr type | Constant | Payload | Metric (service-level) |
+|---|---|---|---|
+| 1 | `IPVS_STATS_ATTR_CONNS` | `u64` native | `nft_ipvs_connections_total` / `nft_ipvs_dest_connections_total` |
+| 2 | `IPVS_STATS_ATTR_INPKTS` | `u64` native | `nft_ipvs_incoming_packets_total` |
+| 3 | `IPVS_STATS_ATTR_OUTPKTS` | `u64` native | `nft_ipvs_outgoing_packets_total` |
+| 4 | `IPVS_STATS_ATTR_INBYTES` | `u64` native | `nft_ipvs_incoming_bytes_total` / `nft_ipvs_dest_incoming_bytes_total` |
+| 5 | `IPVS_STATS_ATTR_OUTBYTES` | `u64` native | `nft_ipvs_outgoing_bytes_total` / `nft_ipvs_dest_outgoing_bytes_total` |
+| 6 | `IPVS_STATS_ATTR_CPS` | `u64` native | `nft_ipvs_connections_per_second` gauge (EMA) |
+| 7 | `IPVS_STATS_ATTR_INPPS` | `u64` native | `nft_ipvs_incoming_packets_per_second` gauge |
+| 8 | `IPVS_STATS_ATTR_OUTPPS` | `u64` native | `nft_ipvs_outgoing_packets_per_second` gauge |
+| 9 | `IPVS_STATS_ATTR_INBPS` | `u64` native | `nft_ipvs_incoming_bytes_per_second` gauge |
+| 10 | `IPVS_STATS_ATTR_OUTBPS` | `u64` native | `nft_ipvs_outgoing_bytes_per_second` gauge |
+
+**STATS64 precedence rule:** Search for `IPVS_SVC_ATTR_STATS64` (type 11) or
+`IPVS_DEST_ATTR_STATS64` (type 12) first. If absent (kernel < 3.15), fall back
+to the 32-bit variants and widen u32 fields to u64 at parse time.
+
+### 13.7  Runtime Gating Protocol
+
+When `CTRL_CMD_GETFAMILY("IPVS\0")` returns `NLMSG_ERROR` with `error=-ENOENT`:
+
+1. Set `IpvsSnapshot.available = false`.
+2. Emit `nft_scrape_collector_available{collector="ipvs"} 0`.
+3. Emit `nft_scrape_collector_success{collector="ipvs"} 1` — detecting absence
+   is a successful outcome, not a failure.
+4. Do **not** emit any `nft_ipvs_*` series.
+5. Do **not** increment `nft_scrape_collector_error_total`.
+
+### 13.8  Cardinality Guards
+
+| Config key | Default | Effect |
+|---|---|---|
+| `ipvs_max_services` | 512 | Abort service dump after this many services |
+| `ipvs_max_dests_per_service` | 256 | Abort dest query for a service after this many destinations |
+
+### 13.9  Parsing Gotchas
+
+**[G-29] IPVS_SVC_ATTR_PORT and IPVS_DEST_ATTR_PORT are network byte order.**
+Both port fields are `u16` big-endian despite appearing in a `NETLINK_GENERIC`
+message. Use `u16::from_be_bytes`.
+
+**[G-30] IPVS_SVC_ATTR_ADDR and IPVS_DEST_ATTR_ADDR are network byte order.**
+The 4-byte (AF_INET) or 16-byte (AF_INET6) address payloads are in network
+byte order.
+
+**[G-31] IPVS_SVC_ATTR_FWMARK and IPVS_SVC_ATTR_ADDR are mutually exclusive.**
+Check for `IPVS_SVC_ATTR_FWMARK` first; if non-zero treat the service as a
+fwmark service.
+
+**[G-32] IPVS STATS64 inner attrs share numbering with 32-bit STATS.**
+The inner attribute type values (1 through 10) are identical for both variants.
+The only difference is the payload width: 4 bytes (u32) vs 8 bytes (u64).
+
+**[G-33] NLA_F_NESTED on IPVS stats nests.**
+`IPVS_SVC_ATTR_STATS64` (type 11) and `IPVS_DEST_ATTR_STATS64` (type 12) have
+`NLA_F_NESTED (0x8000)` set in their `nla_type` on the wire. Strip bit 15
+before comparing: `effective_type = nla_type & 0x1FFF`.
+
+---
+
+## 14  NETLINK_GENERIC — WireGuard Family (WG_CMD_GET_DEVICE)
+
+**Genl family name resolution note:** The WireGuard family name `"wireguard\0"`
+must be resolved at startup via `CTRL_CMD_GETFAMILY` and cached in a
+`OnceLock<Option<u16>>` separate from the ethtool and IPVS family caches.
+
+**Socket Model note (tokio + mio readiness):** The WireGuard adapter reuses the
+shared `AsyncFd<OwnedFd>` wrapper described in section 2. For WG_CMD_GET_DEVICE
+dumps, the tokio readiness model via `AsyncFd::readable()` is used for all
+non-blocking `recvmsg` calls. No separate mio `Poll` instance is created; the
+tokio runtime's internal epoll reactor provides the readiness notification
+channel.
+
+### 14.1  Three-Phase Sequence
+
+```mermaid
+sequenceDiagram
+    participant U as nft_exporter
+    participant K as Linux Kernel
+
+    Note over U,K: Phase 1 — Family resolution (once per process, OnceLock<Option<u16>>)
+    U->>K: nlmsghdr{type=16, flags=NLM_F_REQUEST|NLM_F_ACK}<br/>genlmsghdr{cmd=CTRL_CMD_GETFAMILY=3, version=2}<br/>CTRL_ATTR_FAMILY_NAME="wireguard\0"
+    K-->>U: CTRL_ATTR_FAMILY_ID u16 LE -> cached as Some(family_id)
+    Note over U,K: ENOENT -> cache None; emit available=0; skip phases 2-3 on every scrape
+
+    Note over U,K: Phase 2 — Device dump (NLM_F_DUMP, one reply per WireGuard interface)
+    U->>K: nlmsghdr{type=family_id, flags=NLM_F_REQUEST|NLM_F_DUMP}<br/>genlmsghdr{cmd=WG_CMD_GET_DEVICE=0, version=1, reserved=0}<br/>(no body attributes — dump all interfaces)
+    K-->>U: genlmsghdr{cmd=0} + WGDEVICE_A_* attrs [NLM_F_MULTI] per interface
+    K-->>U: NLMSG_DONE
+```
+
+`ENOENT` on `CTRL_CMD_GETFAMILY` means the WireGuard module is not loaded.
+Cache `None` in the `OnceLock`, emit
+`nft_scrape_collector_available{collector="wireguard"}=0`, and return an empty
+`WireguardSnapshot` on every subsequent scrape without any netlink I/O.
+
+### 14.2  genlmsghdr for WG_CMD_GET_DEVICE
+
+```
+u8  cmd      @ 0   WG_CMD_GET_DEVICE = 0
+u8  version  @ 1   WG_GENL_VERSION   = 1  (MUST be 1; EINVAL otherwise)
+u16 reserved @ 2   always 0
+```
+
+The nlattr chain starts at byte offset 20.
+
+### 14.3  Top-Level WGDEVICE_A_* Attribute Catalogue
+
+All values are native-endian unless noted. Apply `NLA_F_NESTED` masking
+(`nla_type & 0x1FFF`) before comparing against type constants ([G-02]).
+
+| Attribute | Type | Payload | Action |
+|---|---|---|---|
+| `WGDEVICE_A_UNSPEC` | 0 | — | Skip |
+| `WGDEVICE_A_IFINDEX` | 1 | `u32` LE ifindex | Not a label; internal use |
+| `WGDEVICE_A_IFNAME` | 2 | NUL-terminated ASCII | Strip NUL; `interface` label |
+| `WGDEVICE_A_PRIVATE_KEY` | 3 | 32 bytes curve25519 | **DISCARD immediately** — never store or log |
+| `WGDEVICE_A_PUBLIC_KEY` | 4 | 32 bytes curve25519 | Used only for peer-name-map lookup (not the device key) |
+| `WGDEVICE_A_FLAGS` | 5 | `u32` LE | Not emitted |
+| `WGDEVICE_A_LISTEN_PORT` | 6 | `u16` LE | `listen_port` label in `nft_wireguard_device_info` |
+| `WGDEVICE_A_FWMARK` | 7 | `u32` LE | `fwmark` label in `nft_wireguard_device_info` |
+| `WGDEVICE_A_PEERS` | 8 | Nested nlattr chain | Iterate sub-attributes; each is one peer nest |
+
+### 14.4  Per-Peer WGPEER_A_* Attribute Catalogue
+
+Each sub-attribute within `WGDEVICE_A_PEERS` is itself a nested container whose
+payload is a `WGPEER_A_*` nlattr chain (apply NLA_F_NESTED mask again).
+
+| Attribute | Type | Payload | Action |
+|---|---|---|---|
+| `WGPEER_A_UNSPEC` | 0 | — | Skip |
+| `WGPEER_A_PUBLIC_KEY` | 1 | 32 bytes | Hash -> peer identity label; discard bytes after |
+| `WGPEER_A_PRESHARED_KEY` | 2 | 32 bytes | **DISCARD immediately** — never store or log |
+| `WGPEER_A_FLAGS` | 3 | `u32` LE | Not emitted |
+| `WGPEER_A_ENDPOINT` | 4 | `sockaddr_in` (16 B) or `sockaddr_in6` (28 B) | Detect presence only; address **DISCARDED** (ADR-0005) |
+| `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL` | 5 | `u16` LE seconds | `nft_wireguard_peer_persistent_keepalive_seconds` |
+| `WGPEER_A_LAST_HANDSHAKE_TIME` | 6 | `timespec64` (16 B) | Age computation (section 14.5) |
+| `WGPEER_A_RX_BYTES` | 7 | `u64` LE | `nft_wireguard_peer_receive_bytes_total` |
+| `WGPEER_A_TX_BYTES` | 8 | `u64` LE | `nft_wireguard_peer_transmit_bytes_total` |
+| `WGPEER_A_ALLOWEDIPS` | 9 | Nested IP prefix list | **DISCARDED** — prefix addresses are unbounded (ADR-0005) |
+
+### 14.5  Last Handshake Age Computation
+
+`WGPEER_A_LAST_HANDSHAKE_TIME` payload is a `timespec64` struct (16 bytes,
+both fields `u64` native-endian):
+
+```
+u64 tv_sec  @ 0   Unix seconds of last completed Noise handshake; 0 = never
+u64 tv_nsec @ 8   nanoseconds component; 0 when tv_sec=0
+```
+
+Age computation (Rust pseudocode):
+
+```rust
+let tv_sec = u64::from_ne_bytes(payload[0..8].try_into()?);
+let age_seconds = if tv_sec == 0 {
+    f64::INFINITY   // never handshaked — emit +Inf gauge
+} else {
+    (clock_port.now_unix_seconds() as i64 - tv_sec as i64).max(0) as f64
+};
+// emit nft_wireguard_peer_last_handshake_seconds{interface, peer} = age_seconds
+```
+
+**[G-29] WireGuard timespec64 all-zero means never:** When both `tv_sec` and
+`tv_nsec` are zero the kernel is reporting that no Noise handshake has ever
+completed for this peer. Emit `+Inf` rather than `0` to distinguish
+"never handshaked" from "handshaked at the Unix epoch".
+
+### 14.6  Peer Identity Hash Derivation
+
+```rust
+// WGPEER_A_PUBLIC_KEY payload: &[u8; 32]
+let digest = sha2::Sha256::digest(public_key_bytes);
+let label = hex::encode(&digest[..8]);  // 16 lowercase hex chars
+// discard public_key_bytes and digest beyond this point
+```
+
+### 14.7  Forbidden Labels
+
+| Value | Reason |
+|---|---|
+| Raw curve25519 public key (64 hex chars or base64) | Per-peer identity; 32-byte opaque blob; use truncated hash |
+| Raw private key | Secret key material; must be discarded on parse |
+| Preshared key | Secret key material; must be discarded on parse |
+| Peer endpoint IP address or port | Per-peer network address; unbounded cardinality (ADR-0005) |
+| Allowed IP prefix | Per-peer routing prefix; unbounded cardinality (ADR-0005) |
+
+### 14.8  Endianness
+
+| Field | Endianness | Rust read |
+|---|---|---|
+| `WGDEVICE_A_LISTEN_PORT` | Native (LE) | `u16::from_ne_bytes` |
+| `WGDEVICE_A_FWMARK` | Native (LE) | `u32::from_ne_bytes` |
+| `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL` | Native (LE) | `u16::from_ne_bytes` |
+| `WGPEER_A_LAST_HANDSHAKE_TIME.tv_sec` | Native (LE) | `u64::from_ne_bytes` |
+| `WGPEER_A_LAST_HANDSHAKE_TIME.tv_nsec` | Native (LE) | `u64::from_ne_bytes` |
+| `WGPEER_A_RX_BYTES` | Native (LE) | `u64::from_ne_bytes` |
+| `WGPEER_A_TX_BYTES` | Native (LE) | `u64::from_ne_bytes` |
+
+---
+
+## 15  NETLINK_GENERIC (family=dynamic) — devlink Subsystem
+
+**Genl family name resolution note:** The devlink family name `"devlink\0"` must
+be resolved at startup via `CTRL_CMD_GETFAMILY` and cached in its own
+`OnceLock<u16>`, independent of the ethtool, IPVS, and wireguard caches.
+
+### 15.1  Three-Phase Sequence
+
+```
++---------------------+        +---------------------------+
+| nft_exporter        |        | Linux Kernel              |
+| (userspace)         |        |                           |
++---------------------+        +---------------------------+
+         |                                |
+         | Phase 1: Family resolution     |
+         |   (once per process, OnceLock) |
+         |-------------------------------->
+         |  genlmsghdr{cmd=3,ver=2}       |
+         |  CTRL_ATTR_FAMILY_NAME=        |
+         |    "devlink\0"                 |
+         |                                |
+         |<--------------------------------
+         |  CTRL_ATTR_FAMILY_ID (u16 LE)  |
+         |  -> cached family_id           |
+         |                                |
+         | Phase 2: Device dump           |
+         |  DEVLINK_CMD_GET, NLM_F_DUMP   |
+         |-------------------------------->
+         |<--------------------------------
+         |  One frame per device          |
+         |  (bus_name, dev_name attrs)    |
+         |<--------------------------------
+         |  NLMSG_DONE                    |
+         |                                |
+         | Phase 3: Port + Reporter dump  |
+         |  DEVLINK_CMD_PORT_GET,         |
+         |    NLM_F_DUMP                  |
+         |-------------------------------->
+         |<--------------------------------
+         |  One frame per port            |
+         |<--------------------------------
+         |  NLMSG_DONE                    |
+         |                                |
+         |  Per device: HEALTH_RPT_GET   |
+         |  (bus_name + dev_name filter)  |
+         |-------------------------------->
+         |<--------------------------------
+         |  One frame per reporter        |
+         |<--------------------------------
+         |  NLMSG_DONE                    |
+```
+
+ENOENT on Phase 1 means `CONFIG_NET_DEVLINK` is not loaded.
+Set `nft_scrape_collector_available{collector="devlink"}=0`.
+Do not issue Phase 2 or Phase 3 requests.
+
+### 15.2  genlmsghdr for devlink
+
+Follows `nlmsghdr` at byte offset 16. Same 4-byte layout as ethtool (section 8.2):
+
+```
+u8  cmd      @ 0   (DEVLINK_CMD_GET=1, DEVLINK_CMD_PORT_GET=7,
+                     DEVLINK_CMD_HEALTH_REPORTER_GET=66)
+u8  version  @ 1   (always 1 for devlink messages)
+u16 reserved @ 2   (always 0)
+```
+
+nlattr chain starts at byte offset 20.
+
+### 15.3  Top-Level Attribute Catalogue
+
+| Attr type | Constant | Payload | Use |
+|---|---|---|---|
+| 1 | `DEVLINK_ATTR_BUS_NAME` | NUL-terminated string | `bus_name` label; strip trailing NUL |
+| 2 | `DEVLINK_ATTR_DEV_NAME` | NUL-terminated string | `dev_name` label; strip trailing NUL |
+| 3 | `DEVLINK_ATTR_PORT_INDEX` | `u32` LE | `port` label (stringified) |
+| 4 | `DEVLINK_ATTR_PORT_TYPE` | `u16` LE | mapped to port type name |
+| 7 | `DEVLINK_ATTR_PORT_NETDEV_NAME` | NUL-terminated string | informational; not a label |
+| 57 | `DEVLINK_ATTR_HEALTH_REPORTER` | nested nlattr chain | contains attrs 58-61 |
+| 58 | `DEVLINK_ATTR_HEALTH_REPORTER_NAME` | NUL-terminated string | `reporter` label |
+| 59 | `DEVLINK_ATTR_HEALTH_REPORTER_STATE` | `u8` | mapped to health state name |
+| 60 | `DEVLINK_ATTR_HEALTH_REPORTER_ERR_COUNT` | `u64` LE | `nft_devlink_health_reporter_error_total` |
+| 61 | `DEVLINK_ATTR_HEALTH_REPORTER_RECOVER_COUNT` | `u64` LE | `nft_devlink_health_reporter_recover_total` |
+
+All devlink attribute payloads are native-endian. Strip `NLA_F_NESTED (bit 15)`
+before matching any attribute type constant.
+
+### 15.4  DEVLINK_CMD_HEALTH_REPORTER_GET — Per-Device Request
+
+A global NLM_F_DUMP without device filter attributes returns `EINVAL` on
+kernels before 5.18. Issue one unicast or filtered dump per device:
+
+```
+nlmsghdr { nlmsg_type=family_id, nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP }
+genlmsghdr { cmd=66, version=1, reserved=0 }
+nlattr { DEVLINK_ATTR_BUS_NAME="pci\0" }
+nlattr { DEVLINK_ATTR_DEV_NAME="0000:03:00.0\0" }
+```
+
+### 15.5  Runtime Gate
+
+```
+CTRL_CMD_GETFAMILY("devlink\0")
+    -> CTRL_ATTR_FAMILY_ID   : cache in OnceLock<u16>; set available=true
+    -> ENOENT                 : set available=false; emit no further requests
+```
+
+The `OnceLock<u16>` is reset on exporter restart. Dynamic module loading after
+startup is not detected; restart the exporter.
+
+### 15.6  Endianness
+
+All devlink payload fields are native-endian. No devlink attribute uses network
+byte order.
+
+### 15.7  Parsing Gotchas
+
+**[G-29] DEVLINK_CMD_HEALTH_REPORTER_GET global dump returns EINVAL** (devlink)
+On kernels before 5.18, issuing `NLM_F_DUMP` without `DEVLINK_ATTR_BUS_NAME`
+and `DEVLINK_ATTR_DEV_NAME` filter attributes returns `EINVAL`. Always issue
+one filtered dump per device obtained from Phase 2.
+
+**[G-30] devlink health reporter state unknown values** (devlink)
+Future kernel versions may add reporter state values beyond 5. Map any value
+not in the known set to label string `"unknown"` rather than a raw integer.
+
+**[G-31] NLA_F_NESTED on DEVLINK_ATTR_HEALTH_REPORTER** (devlink)
+`DEVLINK_ATTR_HEALTH_REPORTER (type=57)` has `NLA_F_NESTED (bit 15)` set in
+the wire encoding. The effective type after masking is `57 & 0x1FFF = 57`.
+Nested sub-attributes at types 58-61 may also have bit 15 set; always mask
+before matching inner attribute types.
+
+---
+
+## 16  NETLINK_GENERIC (family=16) — NET_DM drop_monitor Subsystem
+
+**Genl family name resolution note:** The NET_DM family name `"NET_DM\0"` must
+be resolved at startup via `CTRL_CMD_GETFAMILY` and cached in its own
+`OnceLock<u16>`, independent of the ethtool, IPVS, wireguard, and devlink
+caches.
+
+**Socket Model note (tokio + mio readiness):** The drop-monitor adapter
+subscribes to the `NET_DM_GRP_ALERT` multicast group using `bind()` with a
+computed `nl_groups` bitmask. Incoming alert frames are drained asynchronously
+on `collect()` calls using the same `AsyncFd<OwnedFd>` pattern from section 2.
+The tokio reactor provides edge-triggered readiness; `recvmsg` is called
+non-blocking until `EAGAIN`.
+
+### 16.1  Three-Phase Sequence
+
+```
++-------------------+          +------------------+
+| nft_exporter      |          | Linux Kernel      |
++-------------------+          +------------------+
+        |                              |
+        | CTRL_CMD_GETFAMILY           |
+        |  family_name="NET_DM\0"      |
+        |----------------------------->|
+        |<-- CTRL_ATTR_FAMILY_ID u16 --|  (cache in OnceLock<u16>)
+        |    or ENOENT -> gate off     |
+        |                              |
+        | NET_DM_CMD_CONFIG            |
+        |  NET_DM_ATTR_ALERT_MODE=1    |  (summary mode)
+        |----------------------------->|
+        |<-- ACK ----------------------|
+        |                              |
+        | NET_DM_CMD_START             |
+        |----------------------------->|
+        |<-- ACK ----------------------|
+        |                              |
+        | bind(nl_groups = grp_mask)   |  (subscribe NET_DM_GRP_ALERT)
+        |                              |
+        |<-- NET_DM_CMD_ALERT ---------| (kernel sends asynchronously)
+        |    NET_DM_ATTR_STATS nest    |
+        |    NET_DM_ATTR_REASON str    |
+        |    NET_DM_ATTR_ORIGIN u16    |
+        |                              |
+        |   (accumulate per interval)  |
+        |   drain on collect()         |
+```
+
+**ENOENT from CTRL_CMD_GETFAMILY** means the `drop_monitor` module is absent.
+Set `nft_scrape_collector_available{collector="drop-monitor"}=0` and return an
+empty snapshot. Do not increment `nft_scrape_collector_error_total`.
+
+### 16.2  genlmsghdr for NET_DM
+
+Follows `nlmsghdr` at byte offset 16. For all NET_DM commands send `version=1`;
+the kernel rejects `version=0` with `EINVAL`.
+
+| Field | NET_DM_CMD_CONFIG | NET_DM_CMD_START | NET_DM_CMD_ALERT (recv) |
+|---|---|---|---|
+| `cmd` | 2 | 3 | 1 |
+| `version` | 1 | 1 | 1 |
+| `reserved` | 0 | 0 | 0 |
+
+nlattr chain starts at byte offset 20.
+
+### 16.3  NET_DM Attribute Catalogue
+
+| Attribute | Type constant | Payload | Use |
+|---|---|---|---|
+| `NET_DM_ATTR_ALERT_MODE` | 1 | `u8`: 0=per-packet, 1=summary | Sent in NET_DM_CMD_CONFIG |
+| `NET_DM_ATTR_STATS` | 12 | nested: per-reason aggregate counters | Received in NET_DM_CMD_ALERT |
+| `NET_DM_ATTR_ORIGIN` | 14 | `u16` native-endian: 0=sw, 1=hw | Received in NET_DM_CMD_ALERT |
+| `NET_DM_ATTR_HW_TRAP_NAME` | 16 | NUL-terminated string | hw drop trap name; strip trailing NUL |
+| `NET_DM_ATTR_REASON` | 22 | NUL-terminated string | sw drop reason (kernel >= 5.17) |
+
+Inside `NET_DM_ATTR_STATS` nested container:
+
+| Inner attribute | Type | Payload | Use |
+|---|---|---|---|
+| `NET_DM_ATTR_STATS_DROPPED` | 1 | `u64` native-endian | packets dropped count |
+
+**Critical:** always strip `NLA_F_NESTED (bit 15)` before matching nla_type values.
+
+### 16.4  Summary Mode Aggregation Logic
+
+```rust
+// On each received NET_DM_CMD_ALERT frame:
+let origin = parse_origin(attrs)?;     // NET_DM_ATTR_ORIGIN u16::from_ne_bytes
+let reason = match origin {
+    Sw => parse_reason(attrs)?,        // NET_DM_ATTR_REASON, strip NUL
+    Hw => parse_hw_trap_name(attrs)?,  // NET_DM_ATTR_HW_TRAP_NAME, strip NUL
+};
+let dropped = parse_stats_dropped(attrs)?; // NET_DM_ATTR_STATS -> DROPPED u64::from_ne_bytes
+*acc.entry(DropReasonKey { reason, origin }).or_insert(0) += dropped;
+```
+
+**Kernel < 5.17:** `NET_DM_ATTR_REASON (type=22)` is absent. Log one
+`tracing::warn` per missing frame, emit no counter for that frame, and set
+`DropMonitorSnapshot.reason_attr_supported = false`.
+
+### 16.5  Multicast Group Subscription
+
+After `NET_DM_CMD_START` ACK:
+
+1. Look up group ID in `CTRL_ATTR_MCAST_GROUPS` response from the earlier
+   `CTRL_CMD_GETFAMILY` call. Find the entry with name `"NET_DM_GRP_ALERT"`.
+2. Set `nl_groups = 1u32 << (group_id - 1)` in the `sockaddr_nl` passed to
+   `bind()`.
+3. Receive frames via non-blocking `recvmsg` in the existing `AsyncFd` wrapper.
+
+**No `NLM_F_DUMP` is issued.** The kernel pushes `NET_DM_CMD_ALERT` frames
+asynchronously; the adapter drains them on each `collect()` call.
+
+### 16.6  Endianness
+
+All NET_DM attribute payload values are native-endian.
+
+| Struct / field | Endianness | Rust read |
+|---|---|---|
+| `NET_DM_ATTR_ALERT_MODE` | Native (u8) | direct index |
+| `NET_DM_ATTR_ORIGIN` | Native | `u16::from_ne_bytes` |
+| `NET_DM_ATTR_STATS_DROPPED` | Native | `u64::from_ne_bytes` |
+| `NET_DM_ATTR_REASON` | UTF-8 string | strip trailing NUL |
+| `NET_DM_ATTR_HW_TRAP_NAME` | UTF-8 string | strip trailing NUL |
+
+### 16.7  Parsing Gotchas
+
+**[G-29] NET_DM_ATTR_REASON absent on kernel < 5.17** (drop_monitor)
+The drop-reason enum was introduced in kernel 5.17. Do not treat the missing
+attribute as a parse error; set `reason_attr_supported = false` on the snapshot
+and emit no nft_drop_packets_total series.
+
+**[G-30] NLA_F_NESTED on NET_DM_ATTR_STATS inner attributes** (drop_monitor)
+Always strip before matching: `nla_type & 0x1FFF`.
+
+**[G-31] NET_DM multicast group ID is dynamic** (drop_monitor)
+The group ID for `NET_DM_GRP_ALERT` is not a fixed constant. It is returned in
+the `CTRL_ATTR_MCAST_GROUPS` nested attr of the `CTRL_CMD_GETFAMILY` reply.
+
+**[G-32] NET_DM_CMD_START side effect** (drop_monitor)
+Issuing `NET_DM_CMD_START` activates the kernel's drop accounting path. On hosts
+under severe packet-drop load this introduces measurable per-drop CPU overhead.
+The collector is opt-in by design (not in the default enabled list).
+
+---
+
+## 17  NETLINK_ROUTE Extended Stats — RTM_GETSTATS / RTM_GETRULE / RTM_GETNEXTHOP
+
+> This section documents the four additional NETLINK_ROUTE dump paths
+> implemented by the `rtnetlink-extended` bounded context (ADR-0021). All
+> wire conventions from sections 3 and 4 apply: native-endian scalar fields,
+> NLM_F_DUMP (0x0301) flags, NLM_F_DUMP_INTR restart semantics, ENOBUFS
+> circuit-breaker, and NETLINK_GET_STRICT_CHK.
+
+### 17.1  RTM_GETSTATS — if_stats_msg fixed header
+
+`RTM_GETSTATS = 94` (kernel >= 4.20). Response frames carry `RTM_NEWSTATS = 93`.
+
+**if_stats_msg (16 bytes) — body of RTM_GETSTATS / RTM_NEWSTATS:**
+
+```
+u8  ifi_family  @ 0   (AF_UNSPEC=0 in dump requests)
+u8  pad1        @ 1   (ignore)
+u16 pad2        @ 2   (ignore)
+u32 ifindex     @ 4   (0 in dump requests; ifindex in replies)
+u32 filter_mask @ 8   (bitmask of IFLA_STATS_* groups to request/return)
+```
+
+RTattrs start at `NLMSG_HDRLEN + NLMSG_ALIGN(16) = 32` bytes from the start
+of the netlink datagram.
+
+**filter_mask values:**
+
+| Bit | Constant | Value | Payload |
+|---|---|---|---|
+| 0 | `IFLA_STATS_LINK_64` | 1 | `rtnl_link_stats64` (192 or 200 bytes) |
+| 1 | `IFLA_STATS_LINK_XSTATS` | 2 | Nested driver-specific xstats |
+| 2 | `IFLA_STATS_LINK_XSTATS_SLAVE` | 4 | Nested xstats for slave interfaces |
+| 3 | `IFLA_STATS_LINK_OFFLOAD_XSTATS` | 8 | Nested hw-offload stats (`rtnl_hw_stats64`) |
+| 4 | `IFLA_STATS_AF_SPEC` | 16 | Nested per-address-family stats (skip) |
+
+The `RtnetlinkExtendedAdapter` requests `filter_mask = 0x0B` (bits 0, 1, 3).
+
+**Availability probe:** Before the first scrape, the adapter sends a
+`RTM_GETSTATS` with `ifindex=1` (loopback) and `filter_mask=1`. If the response
+is `NLMSG_ERROR` with `error=-EINVAL` or `error=-ENOTSUP`, the collector is
+marked unavailable.
+
+### 17.2  IFLA_STATS_LINK_XSTATS — Bridge xstats
+
+When `nla_type & 0x1FFF == 2` (IFLA_STATS_LINK_XSTATS) in a RTM_NEWSTATS reply
+for a bridge interface, the nested payload begins with a `link_xstats_type`
+discriminator attribute:
+
+| Effective nla_type | Content |
+|---|---|
+| 2 (`BRIDGE_XSTATS_MCAST`) | `br_mcast_stats` blob (variable, >= 16 bytes) |
+| 1 (`BRIDGE_XSTATS_VLAN`) | `br_vlan_stats` (8 bytes) — not exported |
+| 3 (`BRIDGE_XSTATS_PAD`) | Skip |
+
+**br_mcast_stats rx_bytes / tx_bytes (offsets 0 and 8, u64 native-endian):**
+
+```rust
+let rx_bytes = u64::from_ne_bytes(payload[0..8].try_into()?);
+let tx_bytes = u64::from_ne_bytes(payload[8..16].try_into()?);
+// emit nft_link_xstats_bridge_rx_multicast_bytes_total{interface}
+// emit nft_link_xstats_bridge_tx_multicast_bytes_total{interface}
+```
+
+**[G-29] IFLA_STATS_LINK_XSTATS absent for non-bridge interfaces** (rtnetlink-extended)
+Absence is not an error; emit no xstats series for that interface.
+
+### 17.3  IFLA_STATS_LINK_OFFLOAD_XSTATS — Hardware-offload stats
+
+When `nla_type & 0x1FFF == 4` (IFLA_STATS_LINK_OFFLOAD_XSTATS) is present, the
+nested payload contains sub-attributes keyed by `ifla_offload_xstats_type`:
+
+| Effective inner nla_type | Struct | Fields exported |
+|---|---|---|
+| 1 (`IFLA_OFFLOAD_XSTATS_CPU_HIT`) | `rtnl_hw_stats64` (64 bytes) | rx_bytes @ 16, tx_bytes @ 24 |
+| 3 (`IFLA_OFFLOAD_XSTATS_L3_STATS`) | `rtnl_hw_stats64` (64 bytes) | rx_bytes @ 16, tx_bytes @ 24 |
+| 2 (`IFLA_OFFLOAD_XSTATS_HW_S_INFO`) | Nested availability info | Skip |
+
+**rtnl_hw_stats64 byte layout (64 bytes, all u64 native-endian):**
+
+```
+u64 rx_packets @ 0   (not exported)
+u64 tx_packets @ 8   (not exported)
+u64 rx_bytes   @ 16  -> nft_link_xstats_offload_rx_bytes_total{interface}
+u64 tx_bytes   @ 24  -> nft_link_xstats_offload_tx_bytes_total{interface}
+u64 rx_errors  @ 32  (not exported)
+u64 tx_errors  @ 40  (not exported)
+u64 rx_dropped @ 48  (not exported)
+u64 tx_dropped @ 56  (not exported)
+```
+
+**[G-30] IFLA_OFFLOAD_XSTATS absent for most interfaces** (rtnetlink-extended)
+Only switchdev-capable or tc-offload drivers include this attribute. Absence is
+not an error.
+
+### 17.4  RTM_GETNEIGH AF_BRIDGE — FDB entry counting
+
+`RTM_GETNEIGH = 30` with `ndmsg.ndm_family = AF_BRIDGE (7)` returns bridge
+forwarding-database entries.
+
+**Aggregation:**
+
+For each RTM_NEWNEIGH frame with `ndm_family=7`:
+
+1. Read `ndm_ifindex` (bytes 4-7, s32 native-endian; cast to u32).
+2. Resolve to interface name via the link name table.
+3. Increment count for that interface name.
+4. Discard all RTattr payloads (NDA_LLADDR, NDA_DST, NDA_VLAN — all discarded
+   per ADR-0005 cardinality enforcement).
+
+**[G-31] AF_BRIDGE ndmsg entries must not be confused with AF_INET/AF_INET6** (rtnetlink-extended)
+The existing neighbor collector in `RtnetlinkAdapter` skips `ndm_family=7`
+(gotcha G-21). The two adapters use separate sequence numbers and separate sockets.
+
+### 17.5  RTM_GETRULE — FIB policy-rule counting
+
+`RTM_GETRULE = 82`. Three dumps are issued per scrape:
+
+| Request | nlmsg_type | body.family | Label |
+|---|---|---|---|
+| AF_INET rules | RTM_GETRULE (82) | 2 | `family="inet"` |
+| AF_INET6 rules | RTM_GETRULE (82) | 10 | `family="inet6"` |
+| AF_MPLS rules | RTM_GETRULE (82) | 28 | `family="mpls"` |
+
+**[G-32] AF_MPLS RTM_GETRULE EINVAL on kernel < 4.3** (rtnetlink-extended)
+Treat this as `count=0` for `family="mpls"` and do not increment error counters.
+
+### 17.6  RTM_GETNEXTHOP — nexthop-object counting
+
+`RTM_GETNEXTHOP = 118` (kernel >= 5.3). The body is `nhmsg` (8 bytes):
+
+```
+u8  nh_family   @ 0  (AF_UNSPEC=0 for all-object dump)
+u8  nh_scope    @ 1  (0)
+u8  nh_protocol @ 2  (0)
+u8  resvd       @ 3  (0)
+u32 nh_flags    @ 4  (0)
+```
+
+**[G-33] RTM_GETNEXTHOP EINVAL on kernel < 5.3** (rtnetlink-extended)
+Detect at startup probe time; set availability to unavailable_kernel_too_old and
+emit `nft_nexthop_objects = 0` for all subsequent scrapes without incrementing
+`nft_scrape_collector_error_total`.
+
+### 17.7  Endianness additions
+
+| Struct / field | Endianness | Rust read |
+|---|---|---|
+| `if_stats_msg.ifi_family` | Native (u8) | direct index |
+| `if_stats_msg.ifindex` | Native | `u32::from_ne_bytes` |
+| `if_stats_msg.filter_mask` | Native | `u32::from_ne_bytes` |
+| `br_mcast_stats.rx_bytes` | Native | `u64::from_ne_bytes` |
+| `br_mcast_stats.tx_bytes` | Native | `u64::from_ne_bytes` |
+| `rtnl_hw_stats64.rx_bytes` | Native | `u64::from_ne_bytes` |
+| `rtnl_hw_stats64.tx_bytes` | Native | `u64::from_ne_bytes` |
+| `fib_rule_hdr.family` | Native (u8) | direct index |
+| `nhmsg.nh_family` | Native (u8) | direct index |
+| `nhmsg.nh_flags` | Native | `u32::from_ne_bytes` |
+
+---
+
+## 18  NETLINK_NETFILTER — ctnetlink Expectations Subsystem (NFNL_SUBSYS_CTNETLINK_EXP)
+
+### 18.1  Subsystem Encoding
+
+The conntrack expectations table is accessed via the same `NETLINK_NETFILTER`
+socket (protocol `12`) used by the main conntrack and nftables collectors.
+The subsystem identifier is `NFNL_SUBSYS_CTNETLINK_EXP = 2`, encoded in the
+high byte of `nlmsg_type`.
+
+| Symbolic name | nlmsg_type | Purpose |
+|---|---|---|
+| `IPCTNL_MSG_EXP_GET` | `0x0200` | Full expectations table dump |
+| `IPCTNL_MSG_EXP_GET_STATS_CPU` | `0x0203` | Per-CPU expectation counters |
+
+Both requests use the standard 20-byte layout: `nlmsghdr` (16 bytes) +
+`nfgenmsg` (4 bytes), with `nfgen_family = AF_UNSPEC (0)` and `res_id = 0x0000`.
+
+### 18.2  IPCTNL_MSG_EXP_GET Dump
+
+`nlmsg_flags = NLM_F_REQUEST (0x0001) | NLM_F_DUMP (0x0300) = 0x0301`.
+
+Each reply frame carries one expectation entry. The nlattr chain starts at
+offset 20 (`NLMSG_HDRLEN + 4`).
+
+**CTA_EXPECT_* attribute parsing (strip NLA_F_NESTED before matching):**
+
+| Effective attr type | Name | Payload | Adapter action |
+|---|---|---|---|
+| `1` | `CTA_EXPECT_MASTER` | Nested tuple (IP + L4) | Discard — per-connection cardinality |
+| `2` | `CTA_EXPECT_TUPLE` | Nested tuple | Extract `CTA_PROTO_NUM u8` -> `l4proto` label |
+| `3` | `CTA_EXPECT_MASK` | Nested tuple | Discard — per-connection cardinality |
+| `4` | `CTA_EXPECT_TIMEOUT` | `u32` big-endian seconds | Discard — continuous value |
+| `5` | `CTA_EXPECT_ID` | `u32` big-endian | **Never stored** — internal kernel ID, unbounded |
+| `6` | `CTA_EXPECT_HELPER_NAME` | NUL-terminated ASCII | Strip NUL; truncate to 64 bytes; use as `helper` label |
+| `7` | `CTA_EXPECT_ZONE` | `u16` big-endian | Discard — multiplies cardinality |
+| `8` | `CTA_EXPECT_FLAGS` | `u32` big-endian bitmask | Discard — not exported |
+| `9` | `CTA_EXPECT_CLASS` | `u32` big-endian | Discard — sparse, unbounded |
+
+**Runtime gate:** Issue one `IPCTNL_MSG_EXP_GET` request at first scrape.
+If the kernel returns `NLMSG_ERROR` with `errno = ENOENT` or `EPERM`, set
+`available = false` and skip further dumps for this scrape.
+
+**Cardinality guard:** If the number of distinct `(l4proto, helper)` keys
+exceeds 256 during one dump, stop iteration immediately and return
+`CollectorError::CardinalityOverflow`.
+
+### 18.3  IPCTNL_MSG_EXP_GET_STATS_CPU
+
+`nlmsg_flags = NLM_F_REQUEST = 0x0001`. One reply frame per CPU.
+
+The reply body is a raw `nf_ct_exp_stat` struct. CPU index is in
+`nfgenmsg.res_id` (big-endian u16).
+
+**`nf_ct_exp_stat` layout:**
+
+| Offset | Field | Type | Metric |
+|---|---|---|---|
+| 0 | `new` | `u32` native-endian | `nft_conntrack_expectation_new_total` |
+| 4 | `delete` | `u32` native-endian | `nft_conntrack_expectation_delete_total` |
+| 8 | `new_failed` | `u32` native-endian | `nft_conntrack_expectation_new_failed_total` |
+
+**Accumulation:**
+
+```rust
+let payload = &buf[NLMSG_HDRLEN + 4 .. nlmsg_len];
+if payload.len() >= 4  { sum.new        += u32::from_ne_bytes(payload[0..4].try_into()?) as u64; }
+if payload.len() >= 8  { sum.delete     += u32::from_ne_bytes(payload[4..8].try_into()?) as u64; }
+if payload.len() >= 12 { sum.new_failed += u32::from_ne_bytes(payload[8..12].try_into()?) as u64; }
+```
+
+### 18.4  Forbidden Attributes
+
+| Attribute | Reason |
+|---|---|
+| `CTA_EXPECT_ID` | Internal kernel ID; changes across scrapes; unbounded |
+| `CTA_EXPECT_TIMEOUT` | Remaining seconds; continuous value; unbounded |
+| `CTA_EXPECT_ZONE` | Zone ID; multiplies cardinality |
+| `CTA_EXPECT_CLASS` | Expectation class; sparse enum; unbounded in practice |
+| `CTA_EXPECT_MASTER` | Master flow 5-tuple (IPs + ports); per-connection |
+| `CTA_EXPECT_TUPLE` | Expected flow 5-tuple after l4proto extraction; per-connection |
+| `CTA_EXPECT_MASK` | Mask tuple; per-connection |

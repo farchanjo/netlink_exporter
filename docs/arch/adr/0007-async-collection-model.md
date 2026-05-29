@@ -1,12 +1,15 @@
 ---
-status: accepted
+status: superseded
 date: 2026-05-28
 deciders: [eonf]
 consulted: []
 informed: []
+superseded_by: ADR-0014
 ---
 
 # Use tokio 1.52 as the single async runtime with per-scrape JoinSet fan-out and per-collector timeout
+
+Superseded by ADR-0014.
 
 ## Context and Problem Statement
 
