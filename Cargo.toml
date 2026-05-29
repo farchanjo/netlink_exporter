@@ -70,7 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- parsing ---
 regex           = { version = "1.11" }
-toml            = { version = "0.8" }
+toml            = { version = "1.1" }
 
 # --- workspace-internal ---
 nlx-domain      = { path = "crates/nlx-domain" }
