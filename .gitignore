@@ -23,6 +23,7 @@ Cargo.lock.orig
 .vscode/
 *.swp
 *~
+*.bak
 
 # Local env
 .env

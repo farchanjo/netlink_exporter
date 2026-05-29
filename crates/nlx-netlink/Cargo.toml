@@ -12,6 +12,7 @@ description = "Driven infrastructure adapters: AF_NETLINK socket transport + per
 [dependencies]
 nlx-domain   = { workspace = true }
 nlx-ports    = { workspace = true }
+libc         = { workspace = true }
 tokio        = { workspace = true, features = ["rt", "net", "time", "macros", "sync", "io-util"] }
 mio          = { workspace = true }
 rustix       = { workspace = true }

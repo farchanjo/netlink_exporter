@@ -28,6 +28,7 @@ license = "MIT OR Apache-2.0"
 # --- wire protocol (ADR-0011) ---
 rustix          = { version = "1.1", features = ["net", "process"] }
 linux-raw-sys   = { version = "0.12", features = ["general", "net", "netlink"] }
+libc            = { version = "0.2" }
 zerocopy        = { version = "0.8", features = ["derive"] }
 bytemuck        = { version = "1.25", features = ["derive"] }
 byteorder       = { version = "1.5" }
