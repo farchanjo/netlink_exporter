@@ -4,6 +4,7 @@ members = [
     "crates/nlx-domain",
     "crates/nlx-ports",
     "crates/nlx-netlink",
+    "crates/nlx-procfs",
     "crates/nlx-metrics",
     "crates/nlx-http",
     "crates/nlx-config",
@@ -76,6 +77,7 @@ toml            = { version = "0.8" }
 nlx-domain      = { path = "crates/nlx-domain" }
 nlx-ports       = { path = "crates/nlx-ports" }
 nlx-netlink     = { path = "crates/nlx-netlink" }
+nlx-procfs      = { path = "crates/nlx-procfs" }
 nlx-metrics     = { path = "crates/nlx-metrics" }
 nlx-http        = { path = "crates/nlx-http" }
 nlx-config      = { path = "crates/nlx-config" }

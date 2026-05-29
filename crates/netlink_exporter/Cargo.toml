@@ -16,6 +16,7 @@ path = "src/main.rs"
 nlx-domain   = { workspace = true }
 nlx-ports    = { workspace = true }
 nlx-netlink  = { workspace = true }
+nlx-procfs   = { workspace = true }
 nlx-metrics  = { workspace = true }
 nlx-http     = { workspace = true }
 nlx-config   = { workspace = true }

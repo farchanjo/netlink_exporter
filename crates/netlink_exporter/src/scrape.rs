@@ -46,6 +46,7 @@ use nlx_ports::{
     driving::ScrapeTriggerPort,
     error::CollectError,
 };
+use nlx_procfs::softnet::SoftnetCollector;
 use tracing::error;
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,9 @@ impl CollectorRegistry {
             collectors.push(Box::new(DropMonitorCollector::with_counters(drop_counters)));
         }
         push_if_enabled!("xfrm", XfrmCollector);
+
+        // procfs/sysfs collectors (ADR-0027) — opt-in, default off.
+        push_if_enabled!("softnet", SoftnetCollector);
 
         Self {
             inner: Arc::new(collectors),

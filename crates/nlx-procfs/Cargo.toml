@@ -1,0 +1,18 @@
+[package]
+name        = "nlx-procfs"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+license.workspace      = true
+description = "Driven adapter: opt-in procfs/sysfs collectors for netlink-absent stack/IRQ/hardware metrics (ADR-0027). Isolated, allowlisted, read-only."
+
+# ADR-0027: this is the ONLY crate permitted to read /proc and /sys. All reads
+# go through `safe_read`, which enforces a fixed path-prefix allowlist.
+[dependencies]
+nlx-domain = { workspace = true }
+nlx-ports  = { workspace = true }
+tracing    = { workspace = true }
+
+[lints]
+workspace = true

@@ -508,6 +508,7 @@ dependencies = [
  "nlx-metrics",
  "nlx-netlink",
  "nlx-ports",
+ "nlx-procfs",
  "tracing",
  "tracing-subscriber",
 ]
@@ -592,6 +593,15 @@ version = "0.1.0"
 dependencies = [
  "nlx-domain",
  "thiserror",
+]
+
+[[package]]
+name = "nlx-procfs"
+version = "0.1.0"
+dependencies = [
+ "nlx-domain",
+ "nlx-ports",
+ "tracing",
 ]
 
 [[package]]

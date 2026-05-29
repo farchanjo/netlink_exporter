@@ -38,6 +38,11 @@ pub struct CollectorFlags {
     pub drop_monitor: bool,
     /// Enable the `xfrm` collector.
     pub xfrm: bool,
+
+    // --- procfs/sysfs collectors (ADR-0027) — default OFF, opt-in ---
+    /// Enable the `softnet` collector (`/proc/net/softnet_stat`; per-CPU softirq
+    /// backlog drops + `time_squeeze`). Reads procfs — **default off** (ADR-0027).
+    pub softnet: bool,
 }
 
 impl Default for CollectorFlags {
@@ -66,6 +71,9 @@ impl Default for CollectorFlags {
             devlink: true,
             drop_monitor: true,
             xfrm: true,
+            // ADR-0027: procfs/sysfs collectors are opt-in — default off so the
+            // exporter stays native-API-only unless the operator relaxes it.
+            softnet: false,
         }
     }
 }
@@ -104,6 +112,17 @@ mod tests {
         assert!(flags.devlink, "devlink must default to true");
         assert!(flags.drop_monitor, "drop_monitor must default to true");
         assert!(flags.xfrm, "xfrm must default to true");
+    }
+
+    /// ADR-0027: procfs/sysfs collectors break the native-API-only default, so
+    /// they must ship **disabled** — the operator opts in explicitly.
+    #[test]
+    fn procfs_collectors_default_to_false() {
+        let flags = CollectorFlags::default();
+        assert!(
+            !flags.softnet,
+            "softnet (procfs) must default to false (opt-in)"
+        );
     }
 }
 
@@ -179,6 +198,7 @@ impl nlx_ports::driven::ConfigPort for ExporterConfig {
             "devlink" => self.collectors.devlink,
             "drop_monitor" => self.collectors.drop_monitor,
             "xfrm" => self.collectors.xfrm,
+            "softnet" => self.collectors.softnet,
             _ => false,
         }
     }
