@@ -40,6 +40,15 @@ pub struct CollectorFlags {
 }
 
 impl Default for CollectorFlags {
+    /// All 13 collectors are **default-enabled**.
+    ///
+    /// Runtime availability for the kernel-subsystem-gated collectors (ethtool,
+    /// ipvs, wireguard, devlink, drop_monitor, xfrm) is decided by
+    /// `probe_available()` at scrape time, not by these flags.  Setting a flag
+    /// to `false` here is an **operator opt-out**, not a signal that the
+    /// subsystem is absent.  Shipping with these flags as `false` would hide
+    /// collectors on hosts that never customise config, defeating the
+    /// `nft_scrape_collector_available` availability probe (ADR-0015).
     fn default() -> Self {
         Self {
             rtnetlink: true,
@@ -49,13 +58,45 @@ impl Default for CollectorFlags {
             conntrack_expect: true,
             nftables: true,
             sock_diag: true,
-            ethtool: false, // runtime-gated: probe required
-            ipvs: false,
-            wireguard: false,
-            devlink: false,
-            drop_monitor: false,
-            xfrm: false,
+            // default-enabled; probe gates availability at runtime (ADR-0015)
+            ethtool: true,
+            ipvs: true,
+            wireguard: true,
+            devlink: true,
+            drop_monitor: true,
+            xfrm: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CollectorFlags;
+
+    /// Regression test for the bug where runtime-gated collectors were
+    /// incorrectly set to `false` in `CollectorFlags::default()`, causing IPVS
+    /// and other subsystems to never run even when the kernel module was loaded.
+    /// All 13 fields must be `true` in the default; opt-out is the operator's
+    /// responsibility via config, not the library's.
+    #[test]
+    fn all_collector_flags_default_to_true() {
+        let flags = CollectorFlags::default();
+        assert!(flags.rtnetlink, "rtnetlink must default to true");
+        assert!(
+            flags.rtnetlink_extended,
+            "rtnetlink_extended must default to true"
+        );
+        assert!(flags.traffic_control, "traffic_control must default to true");
+        assert!(flags.conntrack, "conntrack must default to true");
+        assert!(flags.conntrack_expect, "conntrack_expect must default to true");
+        assert!(flags.nftables, "nftables must default to true");
+        assert!(flags.sock_diag, "sock_diag must default to true");
+        assert!(flags.ethtool, "ethtool must default to true");
+        assert!(flags.ipvs, "ipvs must default to true");
+        assert!(flags.wireguard, "wireguard must default to true");
+        assert!(flags.devlink, "devlink must default to true");
+        assert!(flags.drop_monitor, "drop_monitor must default to true");
+        assert!(flags.xfrm, "xfrm must default to true");
     }
 }
 

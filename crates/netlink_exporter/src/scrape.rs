@@ -169,6 +169,23 @@ impl<M: MetricRegistryPort + Send + Sync> ScrapeTriggerPort for ScrapeService<M>
 
         for collector in self.collectors.iter() {
             let name = collector.name().to_owned();
+
+            // ADR-0015: skip collect() for collectors whose subsystem was
+            // unavailable at startup.  Calling collect() on an unavailable
+            // collector (e.g. XFRM when ip_xfrm is not loaded) can block
+            // indefinitely on the kernel netlink recv, hanging the entire
+            // sequential scrape fan-out.  The availability metric is still
+            // emitted (available=0) below in the telemetry section.
+            let available = self.availability.get(&name).copied().unwrap_or(false);
+            if !available {
+                results.push(CollectorResult {
+                    name,
+                    success: true, // not a failure — subsystem simply absent
+                    duration_secs: 0.0,
+                });
+                continue;
+            }
+
             let start = Instant::now();
 
             // monoio has no built-in per-future timeout; the blocking work

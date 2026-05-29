@@ -149,6 +149,18 @@ fail on the first real request and activate the stale-snapshot fallback. This
 distinguishes "the socket is temporarily unresponsive" from "the family is
 permanently absent".
 
+### Default-enabled policy
+
+All runtime-gated collectors (ethtool, ipvs, wireguard, devlink, drop_monitor,
+xfrm) are **default-enabled** in `CollectorFlags::default()`. Runtime
+availability is decided exclusively by `probe_available()` (genetlink family
+resolution or module presence check), not by config defaults. A config flag set
+to `false` means the operator has explicitly opted out of that collector; it does
+not mean the subsystem is absent. Shipping with these flags set to `false` in the
+default would hide collectors from operators who never customise config, defeating
+the purpose of the availability probe and the `nft_scrape_collector_available`
+metric.
+
 ### Consequences
 
 - Positive: The scrape always returns HTTP 200 on a host where optional
