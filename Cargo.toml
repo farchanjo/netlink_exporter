@@ -11,10 +11,10 @@ members = [
     "crates/netlink_exporter",
 ]
 
-# ADR-0003: edition 2024, MSRV 1.87
+# ADR-0003: edition 2024, MSRV 1.96
 [workspace.package]
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.96"
 authors = ["eonf"]
 license = "MIT OR Apache-2.0"
 

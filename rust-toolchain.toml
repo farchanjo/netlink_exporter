@@ -1,7 +1,9 @@
 [toolchain]
-channel = "1.87"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
+# glibc targets: monoio's io_uring data path links glibc and does not build
+# against musl (ADR-0008 superseded; release binaries are dynamic glibc).
 targets = [
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
 ]
