@@ -30,32 +30,48 @@ requires host network namespace access.
 
 ## CAP_NET_ADMIN Scope
 
-nft_exporter starts with `CAP_NET_ADMIN` to open AF_NETLINK sockets, then
-**immediately and irreversibly drops all capabilities** before the tokio
-runtime or the axum HTTP server accept any connections. The drop sequence
-is (see ADR-0009):
+nft_exporter starts with `CAP_NET_ADMIN` (and transiently `CAP_SYS_ADMIN`
+for the drop_monitor multicast group join — see ADR-0026 below) to open
+AF_NETLINK sockets, then **fatally aborts if capabilities cannot be
+dropped** after setup. The drop sequence is (see ADR-0009):
 
 1. Open all netlink socket file descriptors synchronously (no async tasks
    running yet).
-2. Call `caps::clear(None, CapSet::Permitted)`, `caps::clear(None, CapSet::Effective)`,
-   and `caps::clear(None, CapSet::Inheritable)` via the `caps 0.5.6` crate.
-3. Start the tokio runtime and axum server.
+2. Start the `drop_monitor` multicast listener setup on the main thread
+   (requires `CAP_NET_ADMIN` + transient `CAP_SYS_ADMIN` to join the
+   `GENL_MCAST_CAP_SYS_ADMIN`-gated `NET_DM_GRP_ALERT` group). The
+   background recv thread drops its own capability set to empty immediately
+   on entry before receiving any frames (SEC-PRIV-002).
+3. Call `caps::set(None, CapSet::Effective, &{CAP_NET_ADMIN})`,
+   `caps::set(None, CapSet::Inheritable, &{})`,
+   `caps::set(None, CapSet::Permitted, &{CAP_NET_ADMIN})` via the
+   `caps 0.5.6` crate. This is called with `.expect()` — not
+   `if let Err(…)`.
+4. Start the monoio runtime and HTTP server.
 
-Step 2 uses `expect()` on each caps call. The release profile sets
-`panic = "abort"`, so any failure in the capability drop sequence
-terminates the process immediately; there is no recovery path that leaves
-the process alive with capabilities retained.
+Step 3 uses `.expect()`. The release profile sets `panic = "abort"`, so
+any failure in the capability drop sequence terminates the process
+immediately with no unwinding; there is no recovery path that leaves the
+process alive with elevated capabilities retained. Unprivileged runs
+(permitted cap set empty) return `Ok` early and pass through harmlessly.
 
-After the drop, the process has **zero capabilities** in any set. It
-cannot modify network interfaces, routing tables, firewall rules, or
-connection-tracking state.
+After the drop, the main process has **only `CAP_NET_ADMIN`** in Permitted
+and Effective sets. It cannot modify user namespaces, mount filesystems,
+or perform other `CAP_SYS_ADMIN`-gated operations.
 
-**Why `CAP_NET_ADMIN` only:** All six netlink families
-(NETLINK_ROUTE, NETLINK_NETFILTER ctnetlink, NETLINK_NETFILTER nfnetlink,
-NETLINK_SOCK_DIAG, NETLINK_GENERIC, NETLINK_XFRM) are accessible with
-`CAP_NET_ADMIN` and nothing else. `CAP_NET_RAW` (raw packet injection)
-and `CAP_SYS_ADMIN` (setns) are explicitly not required and are never
-requested; this distinguishes nft_exporter from node_exporter.
+**Why `CAP_NET_ADMIN` only (main process after drop):** All six netlink
+families (NETLINK_ROUTE, NETLINK_NETFILTER ctnetlink, NETLINK_NETFILTER
+nfnetlink, NETLINK_SOCK_DIAG, NETLINK_GENERIC, NETLINK_XFRM) are
+accessible with `CAP_NET_ADMIN` and nothing else. `CAP_NET_RAW` (raw
+packet injection) is explicitly not required and never requested.
+
+**`CAP_SYS_ADMIN` — transient only (ADR-0026):** The `NET_DM_GRP_ALERT`
+generic-netlink multicast group is declared `GENL_MCAST_CAP_SYS_ADMIN`
+in `net/core/drop_monitor.c:187`. Joining it requires `CAP_SYS_ADMIN`.
+This join is performed on the main thread before the capability drop; the
+background recv thread drops all capabilities to empty immediately on
+entry. The process never holds `CAP_SYS_ADMIN` in the main thread after
+the `drop_caps_to_net_admin()` call completes.
 
 **Kubernetes pod security context:**
 
@@ -73,9 +89,11 @@ seccompProfile:
 ```
 
 **Custom seccomp profile** (`deploy/seccomp/nft-exporter.json`) allows
-only: `socket(AF_NETLINK)`, `bind`, `recvmsg`, `sendmsg`, `epoll_wait`,
-`futex`. It denies `execve`, `ptrace`, `mount`, `bpf`,
-`clone(CLONE_NEWUSER)`, and `perf_event_open`.
+only: `socket(AF_NETLINK)`, `bind`, `recvmsg`, `sendmsg`,
+`io_uring_setup`, `io_uring_enter`, `io_uring_register`, `futex`. It
+denies `execve`, `ptrace`, `mount`, `bpf`, `clone(CLONE_NEWUSER)`, and
+`perf_event_open`. The monoio FusionDriver is io_uring-first (ADR-0023);
+`epoll_wait` is not required on the primary I/O path.
 
 **systemd hardening:** `NoNewPrivileges=true`, `ProtectSystem=strict`,
 `PrivateTmp=true`, `PrivateDevices=true`, `ProtectKernelTunables=true`,

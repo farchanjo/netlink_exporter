@@ -89,6 +89,17 @@ fn main() -> Result<()> {
 }
 
 /// Main application logic extracted from `main` for testability.
+///
+/// # Panics
+///
+/// Panics (aborts with `panic = "abort"` in release) if the capability drop
+/// fails on a privileged process. This is intentional — see SEC-PRIV-001.
+#[expect(
+    clippy::expect_used,
+    reason = "SEC-PRIV-001: capability drop failure is unrecoverable; \
+              .expect() + panic=abort is the correct abort-on-failure pattern \
+              for the composition root bootstrap"
+)]
 async fn run(config: ExporterConfig) -> Result<()> {
     // --- shared lock-free drop-monitor counters (ADR-0020 hybrid model) ---
     // Filled by the background NET_DM_GRP_ALERT multicast listener and read by
@@ -127,9 +138,15 @@ async fn run(config: ExporterConfig) -> Result<()> {
     }
 
     // --- drop capabilities to CAP_NET_ADMIN only (ADR-0009) ---
-    if let Err(e) = drop_caps_to_net_admin() {
-        warn!(error = %e, "capability drop failed; continuing (hardening is best-effort)");
-    }
+    // drop_caps_to_net_admin returns Ok early when the permitted cap set is
+    // already empty (unprivileged dev/test runs pass through harmlessly).
+    // On a genuinely privileged process a capset(2) failure is unrecoverable;
+    // continuing over-privileged is worse than aborting (SEC-PRIV-001).
+    // The release profile sets panic = "abort", so on failure the process
+    // terminates immediately with no unwinding and the event is recorded in
+    // the systemd journal / k8s pod events (R-1 mitigation).
+    drop_caps_to_net_admin()
+        .expect("capability drop failed — aborting to avoid running over-privileged");
 
     // --- build metrics adapter (lock-free ArcSwap — ADR-0023) ---
     let metrics_adapter = Arc::new(PrometheusRegistryAdapter::new());

@@ -50,9 +50,6 @@ arc-swap        = { version = "1.7" }
 # monoio-http  = { version = "0.3", features = ["parsed"] }   # deferred
 # service-async = { version = "0.2" }                          # deferred
 
-# --- metrics (ADR-0006) ---
-prometheus-client = { version = "0.24" }
-
 # --- privilege (ADR-0009) ---
 caps            = { version = "0.5" }
 
@@ -106,3 +103,12 @@ expect_used            = "deny"
 panic                  = "deny"
 indexing_slicing       = "warn"
 arithmetic_side_effects = "warn"
+
+# ---------------------------------------------------------------------------
+# Release profile — abort on panic so a capability-drop failure or any other
+# unexpected panic terminates the process immediately without unwinding.
+# Unwinding is both slower and a source of subtle post-panic state bugs.
+# This does NOT affect test or dev profiles (SEC-PRIV-001, ADR-0009).
+# ---------------------------------------------------------------------------
+[profile.release]
+panic = "abort"

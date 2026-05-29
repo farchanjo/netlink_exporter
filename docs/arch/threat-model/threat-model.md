@@ -4,9 +4,11 @@
 
 nft_exporter is a single statically-linked musl binary running as a Kubernetes
 DaemonSet pod (hostNetwork:true, uid 65532) or as a systemd service (User=
-nft-exporter). It holds CAP_NET_ADMIN after startup, drops all other
-capabilities via the caps 0.5.6 crate immediately after all netlink socket file
-descriptors are opened, and exposes one HTTP endpoint on port 9456.
+nft-exporter). It holds `CAP_NET_ADMIN` and (transiently) `CAP_SYS_ADMIN`
+during startup for drop_monitor multicast group join (ADR-0026). After the
+privileged setup phase it drops capabilities: the main process retains only
+`CAP_NET_ADMIN`; the drop_monitor listener thread drops to zero. It exposes
+one HTTP endpoint on port 9456.
 
 The threat model uses the STRIDE framework. Assets are the netlink socket file
 descriptors, the kernel-level capabilities held by the process, and the
@@ -80,9 +82,10 @@ domain overview).
    no interior mutability. The Collector trait returns `Box<dyn ReadModel>` by
    value. There is no shared mutable state between concurrent scrapes.
 
-2. **Tokio task isolation.** Each scrape epoch spawns a new JoinSet of collector
-   futures. The completed MetricSnapshot from the previous epoch is not shared
-   with the new one; it is dropped after the response is written.
+2. **monoio task isolation.** Each scrape epoch spawns a new set of collector
+   futures on the monoio runtime. The completed MetricSnapshot from the previous
+   epoch is not shared with the new one; it is dropped after the response is
+   written.
 
 **Residual risk:** Negligible with current design.
 
@@ -129,23 +132,34 @@ but there is no record of the failure in the metrics or logs.
 **Impact:** M. Silent capability retention expands the blast radius of a
 process compromise.
 
-**Likelihood:** L. The caps crate panics on capability set failure in the
-current implementation; panic=abort causes immediate process termination.
+**Likelihood:** L (now lower than previous assessment). The call to
+`drop_caps_to_net_admin()` uses `.expect()` — not `if let Err(…) { warn! }`.
+With `panic = "abort"` in the release profile any failure terminates the
+process immediately; there is no code path that allows the process to
+continue over-privileged.
 
 **Mitigations:**
 
-1. **Capability drop is fatal.** The call to `caps::clear(None, CapSet::Inheritable)`
-   and `caps::set(None, CapSet::Permitted, &cap_set)` uses `expect()`. With
-   `panic=abort` in the release profile, any failure terminates the process
-   immediately and is recorded in the systemd journal or k8s pod events.
+1. **Capability drop is fatal (SEC-PRIV-001).** `drop_caps_to_net_admin()`
+   is called with `.expect("capability drop failed — aborting to avoid
+   running over-privileged")`. With `panic = "abort"` in the release
+   profile any `capset(2)` failure terminates the process immediately and
+   is recorded in the systemd journal or k8s pod events. Unprivileged
+   runs (permitted set empty) return `Ok` early and are unaffected.
 
-2. **Build info metric.** `nft_build_info{version, revision, rust_version, build_date}`
+2. **Listener thread drops to empty (SEC-PRIV-002 / ADR-0026).** The
+   drop_monitor background recv thread clears Effective, Inheritable, and
+   Permitted sets to empty at the very start of `recv_loop`, before any
+   receive operation. Failure to drop returns `Err` from `recv_loop`,
+   causing the outer restart-with-backoff loop to log the error and retry.
+
+3. **Build info metric.** `nft_build_info{version, revision, rust_version, build_date}`
    provides a permanent record of the binary identity in every metrics scrape,
    enabling correlating an anomalous binary with its build provenance.
 
-3. **Structured logging.** The tracing subscriber emits a JSON log line at INFO
-   level recording the capability set after the drop step. Operators can verify
-   this log line on startup.
+4. **Structured logging.** The tracing subscriber emits a log line at INFO
+   level recording the capability set after the drop step. Operators can
+   verify this log line on startup.
 
 **Residual risk:** Low.
 
@@ -292,48 +306,60 @@ send raw HTTP requests directly.
 
 #### E-1: Privilege escalation via CAP_NET_ADMIN after socket open
 
-**Description.** The exporter starts with CAP_NET_ADMIN to open netlink sockets.
-If capability drop fails or is bypassed (for example, by a Rust `unsafe` block
-that forks before drop), the process retains CAP_NET_ADMIN for its lifetime,
-enabling an attacker who exploits the process to modify network interfaces,
-routing tables, iptables rules, and nftables rules.
+**Description.** The exporter starts with `CAP_NET_ADMIN` (and transiently
+`CAP_SYS_ADMIN` for the drop_monitor multicast group join, ADR-0026) to open
+netlink sockets. If capability drop fails or is bypassed (for example, by a
+Rust `unsafe` block that forks before drop), the process retains elevated
+capabilities for its lifetime, enabling an attacker who exploits the process
+to modify network interfaces, routing tables, iptables rules, and nftables rules.
 
-**Impact:** H. CAP_NET_ADMIN allows an attacker to modify the node's network
+**Impact:** H. `CAP_NET_ADMIN` allows an attacker to modify the node's network
 configuration, potentially redirecting traffic or disabling firewall rules.
 
 **Likelihood:** L. The capability drop is performed synchronously before the
-tokio runtime and axum server start (no async tasks run before drop). The caps
-crate uses direct `prctl`/`cap_set` syscalls.
+monoio runtime and HTTP server start (no async tasks run before drop). The caps
+crate uses direct `capset(2)` syscalls.
 
 **Mitigations:**
 
-1. **Immediate post-socket-open capability drop.** All netlink socket file
-   descriptors are opened in a synchronous pre-runtime phase. Immediately after
-   the last socket is opened, `caps::clear` and `caps::set` remove all
-   capabilities from Permitted, Inheritable, and Ambient sets. This occurs
-   before the tokio runtime is created and before any async task can run.
+1. **Immediate post-setup capability drop, fatal on failure (SEC-PRIV-001).**
+   After all netlink socket file descriptors are opened and the drop_monitor
+   privileged setup completes, `drop_caps_to_net_admin()` is called with
+   `.expect()`. With `panic = "abort"` in the release profile any `capset(2)`
+   failure terminates the process immediately. There is no code path that
+   allows the process to continue over-privileged.
 
-2. **panic=abort on drop failure.** `expect()` on the caps calls combined with
-   the `panic=abort` build profile terminates the process immediately if capability
-   drop fails. There is no recovery path that leaves the process alive with
-   capabilities retained.
+2. **Listener thread drops to empty before first recv (SEC-PRIV-002 / ADR-0026).**
+   `CAP_SYS_ADMIN` is needed only for the multicast group join, which runs on
+   the main thread before `spawn()`. The background recv thread clears Effective,
+   Inheritable, and Permitted sets to empty at the very first line of
+   `recv_loop`, before any receive operation. Failure returns `Err` from the
+   function, causing the outer restart loop to log and retry.
 
 3. **allowPrivilegeEscalation: false.** The k8s security context sets
    `allowPrivilegeEscalation: false` via seccomp and no-setuid/no-setgid
    enforcement. Child processes (if any were created) cannot regain capabilities.
 
-4. **Custom seccomp profile.** The deploy/seccomp/nft-exporter.json profile
-   allows only socket(AF_NETLINK), bind, recvmsg, sendmsg, epoll_wait, and
-   futex. It denies execve, ptrace, mount, bpf, clone(CLONE_NEWUSER), and
-   perf_event_open. An attacker who gains code execution inside the process
-   cannot launch new executables or escalate further.
+4. **Custom seccomp profile.** The `deploy/seccomp/nft-exporter.json` profile
+   allows only `socket(AF_NETLINK)`, `bind`, `recvmsg`, `sendmsg`,
+   `io_uring_setup`, `io_uring_enter`, `io_uring_register`, and `futex`. It
+   denies `execve`, `ptrace`, `mount`, `bpf`, `clone(CLONE_NEWUSER)`, and
+   `perf_event_open`. The monoio FusionDriver is io_uring-first (ADR-0023);
+   `epoll_wait` is not on the allowlist. An attacker who gains code execution
+   inside the process cannot launch new executables or escalate further.
 
-5. **No CAP_NET_RAW, no CAP_SYS_ADMIN by design.** The netlink-only collection
-   path (ADR-0009) eliminates the need for raw packet sockets (CAP_NET_RAW) and
-   the setns(CLONE_NEWNET) path (which would require CAP_SYS_ADMIN). The attack
-   surface is strictly narrower than node_exporter.
+5. **`CAP_SYS_ADMIN` is transient only (ADR-0026).** The `NET_DM_GRP_ALERT`
+   group requires `CAP_SYS_ADMIN` to join (`GENL_MCAST_CAP_SYS_ADMIN`,
+   `net/core/drop_monitor.c:187`). The join runs on the main thread before the
+   capability drop; after `drop_caps_to_net_admin()` the main thread holds only
+   `CAP_NET_ADMIN`. The listener thread holds zero capabilities. `CAP_SYS_ADMIN`
+   is never held beyond the setup window.
 
-6. **systemd hardening.** The unit file sets `NoNewPrivileges=true`,
+6. **`CAP_NET_RAW` not required.** The netlink-only collection path (ADR-0009)
+   eliminates the need for raw packet sockets. The attack surface is strictly
+   narrower than node_exporter.
+
+7. **systemd hardening.** The unit file sets `NoNewPrivileges=true`,
    `ProtectSystem=strict`, `PrivateTmp=true`, `PrivateDevices=true`,
    `ProtectKernelTunables=true`, `ProtectControlGroups=true`,
    `RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`,
@@ -351,9 +377,9 @@ state for all other pods and services on the node.
 
 **Impact:** H. Full node network namespace control after process compromise.
 
-**Likelihood:** L. Exploiting the exporter requires an RCE vulnerability in axum,
-tokio, or the metric parsing path — all pure Rust code with memory-safety
-guarantees.
+**Likelihood:** L. Exploiting the exporter requires an RCE vulnerability in the
+monoio HTTP handler or the metric parsing path — all pure Rust code with
+memory-safety guarantees.
 
 **Mitigations:**
 
