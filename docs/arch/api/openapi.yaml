@@ -1,0 +1,75 @@
+openapi: 3.1.0
+info:
+  title: netlink_exporter HTTP API
+  version: 0.1.0
+  description: >-
+    Driving (inbound) HTTP contract for the netlink_exporter Exposition
+    bounded context. Prometheus scrapes GET /metrics; Kubernetes uses
+    /healthz (liveness) and /ready (readiness). Implemented by the
+    AxumHttpAdapter (ADR-0010) on port 9456.
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+servers:
+  - url: http://0.0.0.0:9456
+    description: Default listen address (ADR-0010)
+tags:
+  - name: exposition
+    description: Metric exposition and health driving ports.
+paths:
+  /metrics:
+    get:
+      tags: [exposition]
+      summary: Prometheus scrape endpoint
+      description: >-
+        Triggers a fan-out scrape across all enabled, runtime-available
+        collectors and returns the aggregated metric set in OpenMetrics
+        text exposition format. A failing or unavailable collector never
+        fails the scrape; it is reported via nft_scrape_collector_available
+        and nft_scrape_collector_success.
+      operationId: getMetrics
+      responses:
+        '200':
+          description: OpenMetrics text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP nft_up 1 if the exporter is running.
+                # TYPE nft_up gauge
+                nft_up 1
+        '503':
+          description: Scrape failed irrecoverably (no metrics available).
+  /healthz:
+    get:
+      tags: [exposition]
+      summary: Liveness probe
+      description: Process-level liveness; does not require a successful scrape.
+      operationId: getHealthz
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: ok
+        '503':
+          description: Process is unhealthy.
+  /ready:
+    get:
+      tags: [exposition]
+      summary: Readiness probe
+      description: Ready only after at least one successful scrape has completed.
+      operationId: getReady
+      responses:
+        '200':
+          description: Exporter is ready to serve metrics.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: ready
+        '503':
+          description: Not ready yet (no successful scrape).

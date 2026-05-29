@@ -12,6 +12,7 @@ use axum::{
 use thiserror::Error;
 use tracing::info;
 
+use nlx_ports::driven::MetricRegistryPort;
 use nlx_ports::driving::{HealthPort, ReadinessPort, ScrapeTriggerPort};
 
 /// Configuration for the HTTP adapter.
@@ -38,16 +39,19 @@ pub enum HttpAdapterError {
 }
 
 /// Shared application state injected into Axum handlers.
-struct AppState<S, H, R> {
+struct AppState<S, H, R, M> {
     scrape: Arc<S>,
     health: Arc<H>,
     readiness: Arc<R>,
+    /// Metrics registry used to encode the response body for `GET /metrics`.
+    registry: Arc<M>,
 }
 
 /// Driving Axum HTTP adapter.
 ///
-/// Type parameters `S`, `H`, and `R` are the concrete implementations of
-/// [`ScrapeTriggerPort`], [`HealthPort`], and [`ReadinessPort`] respectively.
+/// Type parameters `S`, `H`, `R`, and `M` are the concrete implementations of
+/// [`ScrapeTriggerPort`], [`HealthPort`], [`ReadinessPort`], and
+/// [`MetricRegistryPort`] respectively.
 /// They are injected at construction time by the composition root.
 pub struct AxumHttpAdapter {
     config: HttpAdapterConfig,
@@ -68,26 +72,34 @@ impl AxumHttpAdapter {
         Self { config }
     }
 
-    /// Build the Axum [`Router`] wired to the three port implementations.
+    /// Build the Axum [`Router`] wired to the four port implementations.
     ///
     /// The returned router can be passed to `axum::serve` or used in tests
     /// without starting a TCP listener.
-    pub fn build_router<S, H, R>(&self, scrape: Arc<S>, health: Arc<H>, readiness: Arc<R>) -> Router
+    pub fn build_router<S, H, R, M>(
+        &self,
+        scrape: Arc<S>,
+        health: Arc<H>,
+        readiness: Arc<R>,
+        registry: Arc<M>,
+    ) -> Router
     where
         S: ScrapeTriggerPort + 'static,
         H: HealthPort + 'static,
         R: ReadinessPort + 'static,
+        M: MetricRegistryPort + 'static,
     {
         let state = Arc::new(AppState {
             scrape,
             health,
             readiness,
+            registry,
         });
 
         Router::new()
-            .route("/metrics", get(metrics_handler::<S, H, R>))
-            .route("/healthz", get(healthz_handler::<S, H, R>))
-            .route("/ready", get(ready_handler::<S, H, R>))
+            .route("/metrics", get(metrics_handler::<S, H, R, M>))
+            .route("/healthz", get(healthz_handler::<S, H, R, M>))
+            .route("/ready", get(ready_handler::<S, H, R, M>))
             .with_state(state)
     }
 
@@ -96,18 +108,20 @@ impl AxumHttpAdapter {
     /// # Errors
     ///
     /// Returns [`HttpAdapterError::Serve`] if the TCP bind fails.
-    pub async fn serve<S, H, R>(
+    pub async fn serve<S, H, R, M>(
         &self,
         scrape: Arc<S>,
         health: Arc<H>,
         readiness: Arc<R>,
+        registry: Arc<M>,
     ) -> Result<(), HttpAdapterError>
     where
         S: ScrapeTriggerPort + 'static,
         H: HealthPort + 'static,
         R: ReadinessPort + 'static,
+        M: MetricRegistryPort + 'static,
     {
-        let router = self.build_router(scrape, health, readiness);
+        let router = self.build_router(scrape, health, readiness, registry);
 
         let listener = tokio::net::TcpListener::bind(&self.config.listen_addr)
             .await
@@ -126,43 +140,50 @@ impl AxumHttpAdapter {
 // ---------------------------------------------------------------------------
 
 /// `GET /metrics` — trigger a scrape and return OpenMetrics text.
-async fn metrics_handler<S, H, R>(State(state): State<Arc<AppState<S, H, R>>>) -> Response
+///
+/// The handler first calls `scrape()` (which internally calls
+/// `MetricRegistryPort::update_samples`), then reads back the encoded body via
+/// `MetricRegistryPort::encode_text`.
+async fn metrics_handler<S, H, R, M>(State(state): State<Arc<AppState<S, H, R, M>>>) -> Response
 where
     S: ScrapeTriggerPort,
     H: HealthPort,
     R: ReadinessPort,
+    M: MetricRegistryPort,
 {
-    match state.scrape.scrape().await {
-        Ok(samples) => {
-            // The caller (composition root) is responsible for rendering
-            // samples via MetricRegistryPort::encode_text.  Here we return
-            // a placeholder until the full wiring is in place.
-            // TODO(impl): encode samples to OpenMetrics text via MetricRegistryPort.
-            let _ = samples;
-            (
-                StatusCode::OK,
-                [(
-                    "content-type",
-                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
-                )],
-                "# TODO: wire MetricRegistryPort encode_text\n".to_owned(),
-            )
-                .into_response()
-        }
-        Err(e) => (
+    if let Err(e) = state.scrape.scrape().await {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("scrape error: {e}"),
+        )
+            .into_response();
+    }
+
+    match state.registry.encode_text().await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(
+                "content-type",
+                "application/openmetrics-text; version=1.0.0; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode error: {e}"),
         )
             .into_response(),
     }
 }
 
 /// `GET /healthz` — liveness probe.
-async fn healthz_handler<S, H, R>(State(state): State<Arc<AppState<S, H, R>>>) -> StatusCode
+async fn healthz_handler<S, H, R, M>(State(state): State<Arc<AppState<S, H, R, M>>>) -> StatusCode
 where
     S: ScrapeTriggerPort,
     H: HealthPort,
     R: ReadinessPort,
+    M: MetricRegistryPort,
 {
     if state.health.is_healthy().await {
         StatusCode::OK
@@ -172,11 +193,12 @@ where
 }
 
 /// `GET /ready` — readiness probe.
-async fn ready_handler<S, H, R>(State(state): State<Arc<AppState<S, H, R>>>) -> StatusCode
+async fn ready_handler<S, H, R, M>(State(state): State<Arc<AppState<S, H, R, M>>>) -> StatusCode
 where
     S: ScrapeTriggerPort,
     H: HealthPort,
     R: ReadinessPort,
+    M: MetricRegistryPort,
 {
     if state.readiness.is_ready().await {
         StatusCode::OK
