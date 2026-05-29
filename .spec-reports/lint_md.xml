@@ -1,2 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<testsuite name="lint_md" tests="1" failures="1" skipped="0"><testcase name="/Users/farchanjo/dev/nft_exporter/docs/arch/glossary.md" classname="lint_md"><failure message="/Users/farchanjo/dev/nft_exporter/docs/arch/glossary.md:153:75: MD033: Inline HTML [Element: u16] (no-inline-html)">/Users/farchanjo/dev/nft_exporter/docs/arch/glossary.md:153:75: MD033: Inline HTML [Element: u16] (no-inline-html)</failure></testcase></testsuite>
