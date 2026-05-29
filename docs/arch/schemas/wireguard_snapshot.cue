@@ -29,14 +29,16 @@ package schemas
 // Source: include/uapi/linux/wireguard.h WG_CMD_*.
 // The family uses version=1 in genlmsghdr for all commands.
 #WgCmd:
-	0 | // WG_CMD_GET_DEVICE — dump all WireGuard interfaces (NLM_F_DUMP) or
-	    //                     get a specific interface (NLM_F_REQUEST with
-	    //                     WGDEVICE_A_IFNAME or WGDEVICE_A_IFINDEX)
+	0 | // WG_CMD_GET_DEVICE — get a single interface (NLM_F_DUMP) identified by
+	    //                     exactly one of WGDEVICE_A_IFNAME / WGDEVICE_A_IFINDEX
 	1   // WG_CMD_SET_DEVICE — configure a WireGuard device (never used by exporter)
 
-// #WgCmdGetDevice is the command value for the dump request.
-// The exporter sends this with NLM_F_REQUEST | NLM_F_DUMP and an empty body
-// (no WGDEVICE_A_IFNAME attr) to enumerate every WireGuard interface.
+// #WgCmdGetDevice is the command value for the per-interface dump request.
+// WG_CMD_GET_DEVICE has NO dump-all form: lookup_interface() returns -EBADR
+// (errno 53) unless exactly one of WGDEVICE_A_IFNAME / WGDEVICE_A_IFINDEX is
+// present. The exporter therefore enumerates WireGuard interfaces first via an
+// RTM_GETLINK dump (IFLA_INFO_KIND == "wireguard") and issues one filtered
+// WG_CMD_GET_DEVICE dump (with WGDEVICE_A_IFNAME) per interface.
 #WgCmdGetDevice: 0 & #WgCmd
 
 // #WgFamilyName is the NUL-terminated name sent in CTRL_ATTR_FAMILY_NAME

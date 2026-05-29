@@ -28,8 +28,8 @@ package schemas
 // Only the subset issued by this exporter is listed.
 #DevlinkCmd:
 	1  | // DEVLINK_CMD_GET              — device info dump
-	7  | // DEVLINK_CMD_PORT_GET         — port info dump
-	66   // DEVLINK_CMD_HEALTH_REPORTER_GET — health reporter dump
+	5  | // DEVLINK_CMD_PORT_GET         — port info dump
+	52   // DEVLINK_CMD_HEALTH_REPORTER_GET — health reporter dump
 
 // #DevlinkCmdGet is the command code for device enumeration.
 // Send with NLM_F_REQUEST|NLM_F_DUMP and no filter attributes to dump all
@@ -38,12 +38,13 @@ package schemas
 
 // #DevlinkCmdPortGet is the command code for port enumeration.
 // Send with NLM_F_REQUEST|NLM_F_DUMP to retrieve all ports across all devices.
-#DevlinkCmdPortGet: 7 & #DevlinkCmd
+#DevlinkCmdPortGet: 5 & #DevlinkCmd
 
 // #DevlinkCmdHealthReporterGet is the command code for health reporter dump.
 // Requires the bus_name and dev_name filter attributes when issued per-device.
-// Issue once per device obtained from DevlinkCmdGet.
-#DevlinkCmdHealthReporterGet: 66 & #DevlinkCmd
+// Issue once per device obtained from DevlinkCmdGet. A per-device dump also
+// returns the device's port-level reporters (carrying DEVLINK_ATTR_PORT_INDEX).
+#DevlinkCmdHealthReporterGet: 52 & #DevlinkCmd
 
 // #DevlinkFamilyName is the NUL-terminated string used in CTRL_ATTR_FAMILY_NAME
 // when resolving the devlink genl family via CTRL_CMD_GETFAMILY.

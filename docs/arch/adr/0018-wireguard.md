@@ -93,14 +93,21 @@ The ethtool family-id `OnceLock` pattern (section 8.1 of
 
 ### WG_CMD_GET_DEVICE dump
 
-Request: `nlmsghdr{type=family_id, flags=NLM_F_REQUEST|NLM_F_DUMP}` followed by
-`genlmsghdr{cmd=WG_CMD_GET_DEVICE=0, version=1, reserved=0}`. No additional
-nlattr is appended; an empty body causes the kernel to enumerate all WireGuard
-interfaces.
+`WG_CMD_GET_DEVICE` has **no dump-all form**. The kernel's `lookup_interface()`
+returns `-EBADR` (errno 53) unless exactly one of `WGDEVICE_A_IFINDEX` /
+`WGDEVICE_A_IFNAME` is supplied (`drivers/net/wireguard/netlink.c`). The exporter
+therefore:
 
-The dump returns one multi-part response per WireGuard interface. Each response
-carries `WGDEVICE_A_*` top-level attributes, with `WGDEVICE_A_PEERS` (type=8) as
-a nested list of `WGPEER_A_*` entries.
+1. Enumerates WireGuard interfaces via an `RTM_GETLINK` dump on `NETLINK_ROUTE`,
+   keeping links whose `IFLA_LINKINFO` → `IFLA_INFO_KIND` equals `"wireguard"`.
+2. For each interface, issues `nlmsghdr{type=family_id,
+   flags=NLM_F_REQUEST|NLM_F_DUMP}` + `genlmsghdr{cmd=WG_CMD_GET_DEVICE=0,
+   version=1}` + `WGDEVICE_A_IFNAME` (the interface name).
+
+A single interface's reply may span several `NLM_F_MULTI` frames when its peers
+do not fit in one message; the frames are merged by interface. Each frame carries
+`WGDEVICE_A_*` top-level attributes, with `WGDEVICE_A_PEERS` (type=8) as a nested
+list of `WGPEER_A_*` entries.
 
 ### Peer identity label strategy
 
