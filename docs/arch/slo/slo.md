@@ -146,7 +146,7 @@ dump latency.
 ## SLO-3: Exporter Availability
 
 **SLI description.** The fraction of 1-minute measurement windows in which the
-nft_exporter process is alive and responsive on port 9456, as measured by the
+nft_exporter process is alive and responsive on port 33400, as measured by the
 Prometheus target `up` metric. A measurement window is unavailable when
 `up{job="nft-exporter"}` == 0 for the entire minute (Prometheus marks a target
 as down after a scrape timeout or connection refused).
@@ -183,7 +183,7 @@ labels:
 annotations:
   summary: "nft_exporter is down on {{ $labels.instance }}"
   description: >
-    nft_exporter has been unreachable on port 9456 for more than 5 minutes.
+    nft_exporter has been unreachable on port 33400 for more than 5 minutes.
     Check the DaemonSet pod status and systemd journal.
 
 alert: NftExporterAvailabilityBudgetBurn

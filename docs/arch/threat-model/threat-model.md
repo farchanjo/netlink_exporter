@@ -8,7 +8,7 @@ nft-exporter). It holds `CAP_NET_ADMIN` and (transiently) `CAP_SYS_ADMIN`
 during startup for drop_monitor multicast group join (ADR-0026). After the
 privileged setup phase it drops capabilities: the main process retains only
 `CAP_NET_ADMIN`; the drop_monitor listener thread drops to zero. It exposes
-one HTTP endpoint on port 9456.
+one HTTP endpoint on port 33400.
 
 The threat model uses the STRIDE framework. Assets are the netlink socket file
 descriptors, the kernel-level capabilities held by the process, and the
@@ -28,7 +28,7 @@ All threats are rated on a two-axis scale:
 
 #### S-1: Spoofed Prometheus scrape request
 
-**Description.** Any process that can reach port 9456 on the node host network
+**Description.** Any process that can reach port 33400 on the node host network
 can issue GET /metrics and receive the full metric export. A malicious actor on
 the same host or cluster network could impersonate a legitimate Prometheus
 server and collect telemetry data.
@@ -36,14 +36,14 @@ server and collect telemetry data.
 **Impact:** L. The endpoint is read-only and returns aggregated counters. No
 secrets, credentials, or individual flow details are emitted.
 
-**Likelihood:** M. In hostNetwork:true pods, port 9456 is accessible to all
+**Likelihood:** M. In hostNetwork:true pods, port 33400 is accessible to all
 processes sharing the host network namespace unless a NetworkPolicy restricts
 ingress.
 
 **Mitigations:**
 
 1. **NetworkPolicy ingress restriction.** The recommended Kubernetes deployment
-   includes a NetworkPolicy that allows ingress on port 9456 only from the
+   includes a NetworkPolicy that allows ingress on port 33400 only from the
    Prometheus namespace (namespaceSelector + podSelector on the Prometheus
    operator service account). Denies all other sources.
 
@@ -170,7 +170,7 @@ continue over-privileged.
 #### I-1: Metric exfiltration via unauthenticated /metrics endpoint
 
 **Description.** The /metrics endpoint is unauthenticated by design (matching
-the Prometheus ecosystem convention). Any actor with network access to port 9456
+the Prometheus ecosystem convention). Any actor with network access to port 33400
 can retrieve aggregated network telemetry for the node, including interface
 names, TC qdisc hierarchy, nftables table and chain names, conntrack aggregate
 counts, and ethtool NIC statistics.
@@ -287,7 +287,7 @@ send raw HTTP requests directly.
 
 **Mitigations:**
 
-1. **NetworkPolicy ingress restriction** limits which pods can reach port 9456,
+1. **NetworkPolicy ingress restriction** limits which pods can reach port 33400,
    preventing arbitrary HTTP clients from issuing scrape requests.
 
 2. **Axum concurrency limits.** The axum server is configured with a maximum

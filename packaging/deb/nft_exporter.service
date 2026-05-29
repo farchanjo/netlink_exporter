@@ -12,13 +12,13 @@ ExecStart=/usr/bin/netlink_exporter --config /etc/nft_exporter/nft_exporter.toml
 
 # Least privilege (ADR-0009): unprivileged user + only the caps the exporter needs.
 # The process opens netlink sockets then drops to CAP_NET_ADMIN itself.
-# If you enable the drop_monitor collector, also add CAP_SYS_ADMIN below.
+# CAP_NET_ADMIN: netlink. CAP_SYS_ADMIN: the drop_monitor collector (default-on)
+# joins the NET_DM multicast group at startup (ADR-0026); drop it if you disable
+# drop_monitor (NLX_COLLECTORS__DROP_MONITOR=false).
 User=nft-exporter
 Group=nft-exporter
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
-# AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN   # <- drop_monitor
-# CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
 
 NoNewPrivileges=true
 ProtectSystem=strict

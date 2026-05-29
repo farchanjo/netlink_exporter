@@ -6,7 +6,7 @@
 #   systemctl restart nft_exporter
 
 # HTTP listen address for /metrics, /healthz, /ready.
-#NLX_LISTEN_ADDR=0.0.0.0:9456
+#NLX_LISTEN_ADDR=0.0.0.0:33400
 
 # Log level: trace | debug | info | warn | error
 NLX_LOG_LEVEL=info

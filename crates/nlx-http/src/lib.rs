@@ -15,7 +15,7 @@
 //! - `GET /healthz`  → [`nlx_ports::driving::HealthPort::is_healthy`] → 200/503.
 //! - `GET /ready`    → [`nlx_ports::driving::ReadinessPort::is_ready`] → 200/503.
 //!
-//! Default listen address: `0.0.0.0:9456` (ADR-0010).
+//! Default listen address: `0.0.0.0:33400` (ADR-0010).
 //!
 //! ## Hexagonal note
 //!

@@ -26,7 +26,7 @@ User=nft-exporter
 Group=nft-exporter
 
 ExecStart=/usr/local/bin/nft_exporter \
-    --listen 0.0.0.0:9456 \
+    --listen 0.0.0.0:33400 \
     --scrape-timeout-ms 9800 \
     --log-format json \
     --log-level info

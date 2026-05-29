@@ -216,7 +216,7 @@ After two scrape intervals (2 x 15 s), validate the metric output against
 the CUE contract:
 
 ```
-curl -sf http://127.0.0.1:9456/metrics | cue vet - docs/arch/schemas/metric_contract.cue
+curl -sf http://127.0.0.1:33400/metrics | cue vet - docs/arch/schemas/metric_contract.cue
 ```
 
 A non-zero exit from `cue vet` means the implementation violates the metric

@@ -12,7 +12,7 @@ A Prometheus exporter for full Linux network observability. It reads the kernel 
 `AF_NETLINK` / `NETLINK_GENERIC`** using a **`monoio` / `io_uring`** async runtime
 (thread-per-core, no tokio). Architecture: hexagonal (ports-and-adapters), 8 crates,
 lock-free (`arc-swap` RCU + `AtomicU64`/`AtomicBool`). The deployable binary is **`netlink_exporter`**
-(`nft_exporter` is the project/repo name only). Serves Prometheus text `0.0.4` on port **`9456`**
+(`nft_exporter` is the project/repo name only). Serves Prometheus text `0.0.4` on port **`33400`**
 at `/metrics`, `/healthz`, and `/ready`. 21 collectors — 13 netlink (default ON) + 8 procfs/sysfs
 (default OFF, ADR-0027 opt-in).
 
@@ -21,7 +21,7 @@ at `/metrics`, `/healthz`, and `/ready`. 21 collectors — 13 netlink (default O
 > against `*-linux-musl`; verified). Release binary, `.deb`, and container image are all glibc.
 > `make deb` builds the package end-to-end from a clean `git clone` (validated). Release profile is
 > optimized (`opt-level=3`, `lto="fat"`, `codegen-units=1`, `strip`). Rust pinned to `1.96.0`
-> (`rust-toolchain.toml`). Binary name is `netlink_exporter`; env prefix `NLX_`; port `9456`.
+> (`rust-toolchain.toml`). Binary name is `netlink_exporter`; env prefix `NLX_`; port `33400`.
 
 ---
 
@@ -114,7 +114,7 @@ CAP_SYS_ADMIN          # only when drop_monitor collector is enabled
 | Env var | CLI flag | Default |
 |---|---|---|
 | `NLX_CONFIG_PATH` | `--config` | `nft_exporter.toml` |
-| `NLX_LISTEN_ADDR` | `--listen-addr` | `0.0.0.0:9456` |
+| `NLX_LISTEN_ADDR` | `--listen-addr` | `0.0.0.0:33400` |
 | `NLX_LOG_LEVEL` | `--log-level` | `info` |
 | `NLX_SCRAPE_TIMEOUT_MS` | — | `30000` |
 
@@ -155,17 +155,17 @@ make docker    # tags as ghcr.io/example/nft_exporter:<git-describe>
 ./target/release/netlink_exporter
 
 # ── Run with overrides ──────────────────────────────────────────────────────
-NLX_LISTEN_ADDR=0.0.0.0:9456 NLX_LOG_LEVEL=debug \
+NLX_LISTEN_ADDR=0.0.0.0:33400 NLX_LOG_LEVEL=debug \
     ./target/release/netlink_exporter
 
 ./target/release/netlink_exporter --config /etc/nft_exporter/nft_exporter.toml
 
 # ── Run as container ────────────────────────────────────────────────────────
-docker run --rm --cap-add=NET_ADMIN -p 9456:9456 netlink_exporter:dev
+docker run --rm --cap-add=NET_ADMIN -p 33400:33400 netlink_exporter:dev
 
 # With drop_monitor (also needs CAP_SYS_ADMIN):
 docker run --rm --cap-add=NET_ADMIN --cap-add=SYS_ADMIN \
-    -p 9456:9456 -e NLX_LOG_LEVEL=debug netlink_exporter:dev
+    -p 33400:33400 -e NLX_LOG_LEVEL=debug netlink_exporter:dev
 
 # ── Lint ────────────────────────────────────────────────────────────────────
 make lint
@@ -179,9 +179,9 @@ cargo test --workspace                          # Linux build host
 cargo test -p nlx-procfs -p nlx-domain -p nlx-ports -p nlx-config -p nlx-metrics  # macOS (pure crates only)
 
 # ── Verify endpoints (on a running instance) ─────────────────────────────────
-curl http://localhost:9456/metrics
-curl http://localhost:9456/healthz
-curl http://localhost:9456/ready
+curl http://localhost:33400/metrics
+curl http://localhost:33400/healthz
+curl http://localhost:33400/ready
 
 # ── Clean ────────────────────────────────────────────────────────────────────
 cargo clean
@@ -223,7 +223,7 @@ spec validate
 After running on the Linux host, validate the live output against the contract:
 
 ```sh
-curl -sf http://127.0.0.1:9456/metrics | cue vet - docs/arch/schemas/metric_contract.cue
+curl -sf http://127.0.0.1:33400/metrics | cue vet - docs/arch/schemas/metric_contract.cue
 ```
 
 A non-zero exit means the implementation violates the contract. This is the integration test gate
@@ -447,7 +447,7 @@ Config is resolved in CLI → env → TOML → defaults order. Key rules:
 - `RUST_LOG` takes precedence over `NLX_LOG_LEVEL` for log filtering.
 - Interface filtering: include/exclude regex via `[interface_filter]` section (ADR-0013).
 
-Source: `crates/nlx-config/src/config.rs` (line 201: `listen_addr = "0.0.0.0:9456"`,
+Source: `crates/nlx-config/src/config.rs` (line 201: `listen_addr = "0.0.0.0:33400"`,
 line 202: `scrape_timeout_ms = 30_000`); CLI args: `crates/nlx-config/src/cli.rs`.
 
 ---
@@ -540,7 +540,7 @@ closes → `ssh exit 255` + empty capture.
 **Acceptable — foreground ssh that completes within tool timeout:**
 ```sh
 ssh -i ~/.ssh/id_rsa root@213.155.16.6 \
-  'RUST_LOG=info ./netlink_exporter & sleep 6; curl http://127.0.0.1:9456/metrics >/tmp/out; kill %1'
+  'RUST_LOG=info ./netlink_exporter & sleep 6; curl http://127.0.0.1:33400/metrics >/tmp/out; kill %1'
 # then read /tmp/out in a separate read-only ssh call
 ```
 
@@ -569,7 +569,7 @@ make release        # cargo build --release --bin netlink_exporter --target x86_
 
 **Phase 3 — validate:**
 ```sh
-curl -sf http://127.0.0.1:9456/metrics | cue vet - docs/arch/schemas/metric_contract.cue
+curl -sf http://127.0.0.1:33400/metrics | cue vet - docs/arch/schemas/metric_contract.cue
 ```
 
 > The Makefile no longer has a `test-remote` target (the drifted musl/vault one was removed). The

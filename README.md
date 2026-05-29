@@ -60,14 +60,14 @@ curl -sSL -o nft.tgz \
 tar xzf nft.tgz
 
 # 2. Run it (needs CAP_NET_ADMIN — root is simplest for a quick look)
-sudo ./netlink_exporter            # serves on 0.0.0.0:9456
+sudo ./netlink_exporter            # serves on 0.0.0.0:33400
 
 # 3. Scrape
-curl -s localhost:9456/metrics | head
+curl -s localhost:33400/metrics | head
 
 # 4. Health & readiness
-curl -s localhost:9456/healthz     # liveness  → 200 when up
-curl -s localhost:9456/ready       # readiness → 200 after startup probes
+curl -s localhost:33400/healthz     # liveness  → 200 when up
+curl -s localhost:33400/ready       # readiness → 200 after startup probes
 ```
 
 > 💡 The 13 netlink collectors are **on by default**. The 8 `procfs`/`sysfs` collectors are
@@ -195,14 +195,14 @@ Precedence (highest wins): **CLI flags → `NLX_*` env vars → TOML file → bu
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
 | `--config <path>` | `NLX_CONFIG_PATH` | `nft_exporter.toml` | TOML config file (optional) |
-| `--listen-addr <addr>` | `NLX_LISTEN_ADDR` | `0.0.0.0:9456` | HTTP listen address |
+| `--listen-addr <addr>` | `NLX_LISTEN_ADDR` | `0.0.0.0:33400` | HTTP listen address |
 | `--log-level <level>` | `NLX_LOG_LEVEL` | `info` | `trace`/`debug`/`info`/`warn`/`error` |
 
 ### Settings
 
 | Key (TOML) | Env | Default | Meaning |
 |------------|-----|---------|---------|
-| `listen_addr` | `NLX_LISTEN_ADDR` | `0.0.0.0:9456` | Metrics/health bind address |
+| `listen_addr` | `NLX_LISTEN_ADDR` | `0.0.0.0:33400` | Metrics/health bind address |
 | `scrape_timeout_ms` | `NLX_SCRAPE_TIMEOUT_MS` | `30000` | Per-collector scrape timeout |
 | `netlink_dump_max_restarts` | `NLX_NETLINK_DUMP_MAX_RESTARTS` | `8` | `NLM_F_DUMP_INTR` restarts before stale-snapshot fallback |
 | `log_level` | `NLX_LOG_LEVEL` | `info` | Log verbosity |
@@ -228,7 +228,7 @@ NLX_COLLECTORS__NIC_TEMP=true \
 
 ```toml
 # nft_exporter.toml — equivalent TOML
-listen_addr = "0.0.0.0:9456"
+listen_addr = "0.0.0.0:33400"
 scrape_timeout_ms = 30000
 log_level = "info"
 
@@ -269,7 +269,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/netlink_exporter --config /etc/nft_exporter.toml
-Environment=NLX_LISTEN_ADDR=0.0.0.0:9456
+Environment=NLX_LISTEN_ADDR=0.0.0.0:33400
 Environment=NLX_LOG_LEVEL=info
 
 # Least privilege: run unprivileged, grant only the caps the exporter needs.
@@ -330,7 +330,7 @@ spec:
       labels: { app: nft-exporter }
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "9456"
+        prometheus.io/port: "33400"
     spec:
       hostNetwork: true            # observe the node's netns
       hostPID: false
@@ -338,9 +338,9 @@ spec:
         - name: nft-exporter
           image: ghcr.io/farchanjo/nft_exporter:0.1.0   # or your registry
           ports:
-            - { name: metrics, containerPort: 9456, hostPort: 9456 }
+            - { name: metrics, containerPort: 33400, hostPort: 33400 }
           env:
-            - { name: NLX_LISTEN_ADDR, value: "0.0.0.0:9456" }
+            - { name: NLX_LISTEN_ADDR, value: "0.0.0.0:33400" }
             - { name: NLX_LOG_LEVEL,   value: "info" }
           securityContext:
             runAsNonRoot: true
@@ -350,9 +350,9 @@ spec:
               drop: ["ALL"]
               add: ["NET_ADMIN"]    # + ["SYS_ADMIN"] if drop_monitor enabled
           livenessProbe:
-            httpGet: { path: /healthz, port: 9456 }
+            httpGet: { path: /healthz, port: 33400 }
           readinessProbe:
-            httpGet: { path: /ready, port: 9456 }
+            httpGet: { path: /ready, port: 33400 }
           resources:
             requests: { cpu: 25m, memory: 32Mi }
             limits:   { cpu: 200m, memory: 128Mi }
@@ -375,7 +375,7 @@ scrape_configs:
         regex: nft-exporter
   # or static:
   # - job_name: nft_exporter
-  #   static_configs: [{ targets: ['node1:9456', 'node2:9456'] }]
+  #   static_configs: [{ targets: ['node1:33400', 'node2:33400'] }]
 ```
 
 ```promql

@@ -198,7 +198,7 @@ pub struct ExporterConfig {
 impl Default for ExporterConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9456".to_owned(),
+            listen_addr: "0.0.0.0:33400".to_owned(),
             scrape_timeout_ms: 30_000,
             netlink_dump_max_restarts: 8,
             log_level: "info".to_owned(),

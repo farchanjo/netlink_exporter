@@ -16,7 +16,7 @@ pub struct CliArgs {
     #[arg(long, env = "NLX_CONFIG_PATH", default_value = "nft_exporter.toml")]
     pub config: String,
 
-    /// Override the HTTP listen address (e.g. `0.0.0.0:9456`).
+    /// Override the HTTP listen address (e.g. `0.0.0.0:33400`).
     ///
     /// Takes precedence over the TOML `listen_addr` key and the
     /// `NLX_LISTEN_ADDR` environment variable.

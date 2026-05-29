@@ -5,7 +5,7 @@ edition.workspace    = true
 rust-version.workspace = true
 authors.workspace    = true
 license.workspace    = true
-description = "Driving HTTP adapter: Axum server exposing /metrics, /healthz, /ready on port 9456 (ADR-0010)."
+description = "Driving HTTP adapter: Axum server exposing /metrics, /healthz, /ready on port 33400 (ADR-0010)."
 
 # ADR-0023: axum + tokio + tower REMOVED; replaced by monoio hand-rolled HTTP/1.
 # monoio-http/service-async deferred (ADR-0023 deviation: hand-rolled approach

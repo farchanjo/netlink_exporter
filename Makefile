@@ -3,7 +3,7 @@
 # Toolchain: Rust 1.96 (pinned in rust-toolchain.toml), edition 2024.
 # The full workspace builds on LINUX ONLY (monoio/io_uring); the pure crates
 # build anywhere. Release binaries and the .deb are dynamic glibc — musl does
-# NOT build (monoio is glibc-only; ADR-0023). Metrics port 9456 (ADR-0010).
+# NOT build (monoio is glibc-only; ADR-0023). Metrics port 33400 (ADR-0010).
 
 BINARY        := netlink_exporter
 PKG           := netlink-exporter

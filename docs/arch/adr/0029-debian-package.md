@@ -70,9 +70,20 @@ The package version tracks the crate version (`0.1.0`).
 
 Conffiles in the package: `/etc/nft_exporter/nft_exporter.toml` and `/etc/default/nft_exporter`.
 
+## Amendment (2026-05-29) — default port 33400 + CAP_SYS_ADMIN in the unit
+
+- **Default port is now `33400`** (ADR-0010 amendment), reflected in the shipped
+  `nft_exporter.toml`, `/etc/default/nft_exporter`, and the `EXPOSE`/`ENV` in the Dockerfile.
+- **The unit ships `AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN`** (both also in the bounding
+  set). Rationale: the `drop_monitor` collector is default-on and must join the `NET_DM` multicast
+  group at startup (`GENL_MCAST_CAP_SYS_ADMIN`, ADR-0026) before the process drops to
+  `CAP_NET_ADMIN`. This widens the unit beyond the ADR-0009 `CAP_NET_ADMIN`-only baseline for the
+  out-of-the-box experience; operators who disable `drop_monitor`
+  (`NLX_COLLECTORS__DROP_MONITOR=false`) should remove `CAP_SYS_ADMIN` from the unit.
+
 ## Validation
 
 - `dpkg-deb --info` / `--contents` on the built artifact; install on a Ubuntu
-  host, confirm the unit starts and `/metrics` serves on `:9456`, then `purge`
+  host, confirm the unit starts and `/metrics` serves on `:33400`, then `purge`
   and confirm the user/unit are removed. Build host: the project's Linux build
   box (`packaging/deb/build-deb.sh`).

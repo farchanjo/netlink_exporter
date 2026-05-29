@@ -10,7 +10,7 @@
 //! 1. Environment variables (prefix `NLX_`, e.g. `NLX_LISTEN_ADDR`).
 //! 2. TOML configuration file (path from `--config` CLI flag or
 //!    `NLX_CONFIG_PATH` env var; default `nft_exporter.toml`).
-//! 3. Built-in defaults (e.g. `listen_addr = "0.0.0.0:9456"`).
+//! 3. Built-in defaults (e.g. `listen_addr = "0.0.0.0:33400"`).
 //!
 //! Merging is handled by [`figment`] with
 //! `Figment::with(Toml::file(...)).merge(Env::prefixed("NLX_"))`.

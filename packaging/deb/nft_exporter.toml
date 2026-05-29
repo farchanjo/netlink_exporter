@@ -1,7 +1,7 @@
 # nft_exporter configuration — https://github.com/farchanjo/netlink_exporter
 # Precedence: CLI flags > NLX_* env vars > this file > built-in defaults.
 
-listen_addr       = "0.0.0.0:9456"
+listen_addr       = "0.0.0.0:33400"
 scrape_timeout_ms = 30000
 log_level         = "info"
 

@@ -35,12 +35,12 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /netlink_exporter /usr/local/bin/netlink_exporter
 
 # Prometheus metrics / health port (ADR-0010).
-EXPOSE 9456
+EXPOSE 33400
 
 # Defaults — override with `docker run -e` or Kubernetes `env:`.
 # The exporter reads NLX_-prefixed variables (double-underscore nests into the
 # collector flags, e.g. NLX_COLLECTORS__NIC_PCIE=true).
-ENV NLX_LISTEN_ADDR="0.0.0.0:9456" \
+ENV NLX_LISTEN_ADDR="0.0.0.0:33400" \
     NLX_LOG_LEVEL="info" \
     NLX_SCRAPE_TIMEOUT_MS="30000"
 

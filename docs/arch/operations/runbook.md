@@ -62,11 +62,11 @@ spec:
               add: ["NET_ADMIN"]
           ports:
             - name: metrics
-              containerPort: 9456
+              containerPort: 33400
               protocol: TCP
           env:
             - name: NFT_EXPORTER_LISTEN
-              value: "0.0.0.0:9456"
+              value: "0.0.0.0:33400"
             - name: NFT_EXPORTER_SCRAPE_TIMEOUT_MS
               value: "9800"
             - name: NFT_EXPORTER_LOG_FORMAT
@@ -81,13 +81,13 @@ spec:
           livenessProbe:
             httpGet:
               path: /healthz
-              port: 9456
+              port: 33400
             initialDelaySeconds: 5
             periodSeconds: 15
           readinessProbe:
             httpGet:
               path: /ready
-              port: 9456
+              port: 33400
             initialDelaySeconds: 5
             periodSeconds: 10
       tolerations:
@@ -145,7 +145,7 @@ spec:
             matchLabels:
               app.kubernetes.io/name: prometheus
       ports:
-        - port: 9456
+        - port: 33400
           protocol: TCP
   policyTypes:
     - Ingress
@@ -212,7 +212,7 @@ Type=notify
 User=nft-exporter
 Group=nft-exporter
 ExecStart=/usr/local/bin/nft_exporter \
-  --listen 0.0.0.0:9456 \
+  --listen 0.0.0.0:33400 \
   --scrape-timeout-ms 9800 \
   --log-format json
 
@@ -260,14 +260,14 @@ systemctl status nft-exporter
 
 ```bash
 # Check the liveness endpoint
-curl -s http://localhost:9456/healthz
+curl -s http://localhost:33400/healthz
 
 # Check the readiness endpoint (returns 200 after first scrape)
-curl -s http://localhost:9456/ready
+curl -s http://localhost:33400/ready
 
 # Fetch a sample of the metrics output
-curl -s http://localhost:9456/metrics | grep ^nft_up
-curl -s http://localhost:9456/metrics | grep ^nft_scrape_duration_seconds
+curl -s http://localhost:33400/metrics | grep ^nft_up
+curl -s http://localhost:33400/metrics | grep ^nft_scrape_duration_seconds
 ```
 
 ---
@@ -328,7 +328,7 @@ near the timeout limit.
 **Diagnosis.** Identify the slow collector:
 
 ```bash
-curl -s http://localhost:9456/metrics \
+curl -s http://localhost:33400/metrics \
   | grep nft_scrape_collector_duration_seconds
 ```
 
@@ -352,7 +352,7 @@ nft_scrape_collector_success{collector="conntrack"} 0
 **Diagnosis.** Check the error reason:
 
 ```bash
-curl -s http://localhost:9456/metrics \
+curl -s http://localhost:33400/metrics \
   | grep nft_scrape_collector_error_total
 ```
 
@@ -536,7 +536,7 @@ systemctl start nft-exporter
 
 | Environment variable | CLI flag | Default | Valid range |
 |---|---|---|---|
-| `NFT_EXPORTER_LISTEN` | `--listen` | `0.0.0.0:9456` | Any valid SocketAddr |
+| `NFT_EXPORTER_LISTEN` | `--listen` | `0.0.0.0:33400` | Any valid SocketAddr |
 | `NFT_EXPORTER_SCRAPE_TIMEOUT_MS` | `--scrape-timeout-ms` | `9800` | 1000–30000 |
 | `NFT_EXPORTER_COLLECTORS` | `--collectors` | all six | comma-separated subset |
 | `NFT_EXPORTER_LOG_LEVEL` | `--log-level` | `info` | trace,debug,info,warn,error |

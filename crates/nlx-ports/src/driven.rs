@@ -426,7 +426,7 @@ pub trait ConfigPort: Send + Sync {
     /// Scrape timeout in milliseconds.
     fn scrape_timeout_ms(&self) -> u64;
 
-    /// HTTP listen address (e.g. `"0.0.0.0:9456"`).
+    /// HTTP listen address (e.g. `"0.0.0.0:33400"`).
     fn listen_addr(&self) -> &str;
 
     /// Returns `true` if the named collector is enabled.

@@ -59,3 +59,16 @@ GET /ready    -> ReadinessPort::readiness()            -> 200 "ready"          |
 
 - *hyper 1.x directly*: hyper 1.x provides the underlying HTTP/1.1 and HTTP/2 implementation that axum builds on. Using it directly requires manual route matching, `Request<Incoming>` body handling, and response construction for each of the three endpoints. For three routes this is workable but adds ~200 lines of boilerplate relative to the three `Router::route()` calls in axum.
 - *tiny_http*: tiny_http is synchronous and spawns a thread per connection. It cannot be integrated into the tokio runtime; calling `ScrapeTriggerPort::trigger_scrape()` (an async method) from a tiny_http handler would require `tokio::runtime::Handle::current().block_on(...)`, which panics if called from within a tokio context. A separate OS thread with its own runtime would be required, defeating the purpose of the shared runtime model.
+
+## Amendment (2026-05-29) — default port 9456 → 33400
+
+The default listen port changes to **`33400`** (`0.0.0.0:33400`). 9456 was an
+unallocated Prometheus-registry port; 33400 is the operator-chosen default and
+is likewise outside the well-known Prometheus exporter range. The port stays
+fully configurable via `NLX_LISTEN_ADDR` / `--listen-addr`; the authoritative
+default lives in `crates/nlx-config/src/config.rs` (`ExporterConfig::default`).
+
+> Note: this ADR's original body predates the monoio rewrite. The actual stack
+> is **monoio / io_uring** with a **hand-rolled HTTP/1** adapter (no axum/tokio),
+> **Prometheus text 0.0.4** (not OpenMetrics), env prefix **`NLX_`**, and flag
+> **`--listen-addr`**. See ADR-0023/0024 and `docs/arch/architecture/workspace.dsl`.

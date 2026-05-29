@@ -46,7 +46,7 @@ graph TD
     end
 
     subgraph external["External Systems"]
-        PROM["Prometheus Server\nport 9456 GET /metrics"]
+        PROM["Prometheus Server\nport 33400 GET /metrics"]
         AM["Alertmanager"]
         GF["Grafana"]
     end

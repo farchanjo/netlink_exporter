@@ -78,14 +78,14 @@ const REQUEST_HEADER_CAP: usize = 8 * 1024;
 /// Configuration for the HTTP adapter.
 #[derive(Debug, Clone)]
 pub struct HttpAdapterConfig {
-    /// Listen address and port (e.g. `"0.0.0.0:9456"`).
+    /// Listen address and port (e.g. `"0.0.0.0:33400"`).
     pub listen_addr: String,
 }
 
 impl Default for HttpAdapterConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9456".to_owned(),
+            listen_addr: "0.0.0.0:33400".to_owned(),
         }
     }
 }
