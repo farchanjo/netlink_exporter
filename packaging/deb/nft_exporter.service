@@ -1,0 +1,33 @@
+[Unit]
+Description=nft_exporter — Linux netlink Prometheus exporter
+Documentation=https://github.com/farchanjo/netlink_exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/netlink_exporter --config /etc/nft_exporter/nft_exporter.toml
+Environment=NLX_LOG_LEVEL=info
+
+# Least privilege (ADR-0009): unprivileged user + only the caps the exporter needs.
+# The process opens netlink sockets then drops to CAP_NET_ADMIN itself.
+# If you enable the drop_monitor collector, also add CAP_SYS_ADMIN below.
+User=nft-exporter
+Group=nft-exporter
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+# AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN   # <- drop_monitor
+# CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

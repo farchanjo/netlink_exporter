@@ -1,0 +1,19 @@
+# nft_exporter configuration — https://github.com/farchanjo/netlink_exporter
+# Precedence: CLI flags > NLX_* env vars > this file > built-in defaults.
+
+listen_addr       = "0.0.0.0:9456"
+scrape_timeout_ms = 30000
+log_level         = "info"
+
+# The 13 netlink collectors are enabled by default (runtime-probed, ADR-0015).
+# The 8 procfs/sysfs collectors are opt-in (ADR-0027) — uncomment to enable.
+# Note: enabling `drop_monitor` requires CAP_SYS_ADMIN in the systemd unit.
+[collectors]
+# softnet  = true
+# netstat  = true
+# softirq  = true
+# irq      = true
+# sockstat = true
+# nic_bql  = true
+# nic_pcie = true
+# nic_temp = true

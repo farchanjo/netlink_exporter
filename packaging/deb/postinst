@@ -1,0 +1,20 @@
+#!/bin/sh
+# postinst — create the service user, register and start the systemd unit.
+set -e
+
+case "$1" in
+  configure)
+    # Dedicated unprivileged system user (no home, no shell).
+    if ! getent passwd nft-exporter >/dev/null 2>&1; then
+      adduser --system --group --no-create-home --home /nonexistent \
+        --shell /usr/sbin/nologin --quiet nft-exporter 2>/dev/null \
+      || useradd --system --no-create-home --shell /usr/sbin/nologin nft-exporter
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # Enable and start (best-effort — never fail the install on a start error).
+    systemctl enable --now nft_exporter.service >/dev/null 2>&1 || true
+    ;;
+esac
+
+exit 0

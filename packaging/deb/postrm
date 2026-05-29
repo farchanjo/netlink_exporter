@@ -1,0 +1,17 @@
+#!/bin/sh
+# postrm — reload systemd; on purge, drop the service user and config dir.
+set -e
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+case "$1" in
+  purge)
+    if getent passwd nft-exporter >/dev/null 2>&1; then
+      deluser --system --quiet nft-exporter >/dev/null 2>&1 \
+        || userdel nft-exporter >/dev/null 2>&1 || true
+    fi
+    rm -rf /etc/nft_exporter
+    ;;
+esac
+
+exit 0
