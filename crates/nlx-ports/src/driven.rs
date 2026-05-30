@@ -43,7 +43,10 @@ use nlx_domain::{
         ipvs::{IpvsDestination, IpvsService},
         link::LinkReadModel,
         neighbor::NeighborReadModel,
-        nftables::{NftChain, NftCounter, NftSet, NftTable},
+        nftables::{
+            NftChain, NftCounter, NftFlowtable, NftLimit, NftQuota, NftRuleCounter, NftSet,
+            NftTable,
+        },
         route::RouteReadModel,
         sockdiag::SockDiagEntry,
         tc::TcReadModel,
@@ -185,8 +188,12 @@ pub trait NetlinkConntrackExpectPort: Send + Sync {
 }
 
 /// Driven port for nfnetlink nftables.  Adapter: `nlx-netlink` (ADR-0011).
+///
+/// Covers the full ADR-0030 observability surface:
+/// tables, chains, per-rule counters, named counters/quotas/limits, sets,
+/// ruleset generation, and flowtables.
 pub trait NetlinkNftablesPort: Send + Sync {
-    /// Dump all nftables tables.
+    /// Dump all nftables tables (`NFT_MSG_GETTABLE`).
     ///
     /// # Errors
     ///
@@ -195,7 +202,7 @@ pub trait NetlinkNftablesPort: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<NftTable>, DomainError>> + Send;
 
-    /// Dump all nftables chains.
+    /// Dump all nftables chains (`NFT_MSG_GETCHAIN`).
     ///
     /// # Errors
     ///
@@ -204,7 +211,7 @@ pub trait NetlinkNftablesPort: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<NftChain>, DomainError>> + Send;
 
-    /// Dump all named counter objects.
+    /// Dump all named counter objects (`NFT_MSG_GETOBJ`, `NFT_OBJECT_COUNTER`).
     ///
     /// # Errors
     ///
@@ -213,7 +220,7 @@ pub trait NetlinkNftablesPort: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<NftCounter>, DomainError>> + Send;
 
-    /// Dump all named sets.
+    /// Dump all named sets, excluding anonymous sets (`NFT_MSG_GETSET`).
     ///
     /// # Errors
     ///
@@ -221,6 +228,55 @@ pub trait NetlinkNftablesPort: Send + Sync {
     fn dump_sets(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<NftSet>, DomainError>> + Send;
+
+    /// Dump rules with a counter expression and a non-empty comment
+    /// (`NFT_MSG_GETRULE`).  Rules without a comment or counter are silently
+    /// skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] on netlink I/O failure.
+    fn dump_rule_counters(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<NftRuleCounter>, DomainError>> + Send;
+
+    /// Dump all named quota objects (`NFT_MSG_GETOBJ`, `NFT_OBJECT_QUOTA`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] on netlink I/O failure.
+    fn dump_quota_objects(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<NftQuota>, DomainError>> + Send;
+
+    /// Dump all named limit objects (`NFT_MSG_GETOBJ`, `NFT_OBJECT_LIMIT`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] on netlink I/O failure.
+    fn dump_limit_objects(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<NftLimit>, DomainError>> + Send;
+
+    /// Fetch the current ruleset generation ID (`NFT_MSG_GETGEN`).
+    ///
+    /// Returns 0 when the frame is absent or unparseable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] on netlink I/O failure.
+    fn get_ruleset_generation(
+        &self,
+    ) -> impl std::future::Future<Output = Result<u32, DomainError>> + Send;
+
+    /// Dump all flowtables (`NFT_MSG_GETFLOWTABLE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] on netlink I/O failure.
+    fn dump_flowtables(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<NftFlowtable>, DomainError>> + Send;
 }
 
 /// Driven port for `NETLINK_SOCK_DIAG` (`inet_diag`).
