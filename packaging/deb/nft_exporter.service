@@ -10,17 +10,19 @@ Type=simple
 EnvironmentFile=-/etc/default/nft_exporter
 ExecStart=/usr/bin/netlink_exporter --config /etc/nft_exporter/nft_exporter.toml
 
-# Least privilege (ADR-0009): unprivileged user + only the caps the exporter needs.
-# The process opens netlink sockets then drops to CAP_NET_ADMIN itself.
-# CAP_NET_ADMIN: netlink. CAP_SYS_ADMIN: the drop_monitor collector (default-on)
-# joins the NET_DM multicast group at startup (ADR-0026); drop it if you disable
-# drop_monitor (NLX_COLLECTORS__DROP_MONITOR=false).
+# Least privilege (ADR-0009): runs as the unprivileged nft-exporter user.
+# The drop_monitor collector (default-on) joins the NET_DM multicast group at
+# startup, which needs CAP_SYS_ADMIN (ADR-0026); CAP_NET_ADMIN covers the rest.
+# These startup caps are granted via FILE CAPABILITIES on the binary
+# (`setcap cap_net_admin,cap_sys_admin=ep`, applied by the package postinst) —
+# systemd AmbientCapabilities does NOT satisfy the NET_DM join, file caps do.
+# The binary drops its effective set to CAP_NET_ADMIN right after the join.
+# File capabilities are honoured only when NoNewPrivileges is OFF.
 User=nft-exporter
 Group=nft-exporter
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+NoNewPrivileges=false
 
-NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

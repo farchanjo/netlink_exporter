@@ -36,7 +36,7 @@ Architecture: $ARCH
 Maintainer: eonf <fabricio@eonf.ltd>
 Section: net
 Priority: optional
-Depends: libc6
+Depends: libc6, libcap2-bin
 Installed-Size: $SIZE_KB
 Homepage: https://github.com/farchanjo/netlink_exporter
 Description: Linux netlink Prometheus exporter

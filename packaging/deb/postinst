@@ -11,6 +11,14 @@ case "$1" in
       || useradd --system --no-create-home --shell /usr/sbin/nologin nft-exporter
     fi
 
+    # Grant startup file capabilities: the drop_monitor collector joins the
+    # NET_DM multicast group at startup (CAP_SYS_ADMIN, ADR-0026); CAP_NET_ADMIN
+    # covers netlink. The binary drops to CAP_NET_ADMIN after the join. (Needs
+    # libcap2-bin; the unit must run with NoNewPrivileges=off to honour these.)
+    if command -v setcap >/dev/null 2>&1; then
+      setcap 'cap_net_admin,cap_sys_admin=ep' /usr/bin/netlink_exporter || true
+    fi
+
     systemctl daemon-reload >/dev/null 2>&1 || true
     # Enable and start (best-effort — never fail the install on a start error).
     systemctl enable --now nft_exporter.service >/dev/null 2>&1 || true

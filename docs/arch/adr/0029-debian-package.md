@@ -74,12 +74,22 @@ Conffiles in the package: `/etc/nft_exporter/nft_exporter.toml` and `/etc/defaul
 
 - **Default port is now `33400`** (ADR-0010 amendment), reflected in the shipped
   `nft_exporter.toml`, `/etc/default/nft_exporter`, and the `EXPOSE`/`ENV` in the Dockerfile.
-- **The unit ships `AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN`** (both also in the bounding
-  set). Rationale: the `drop_monitor` collector is default-on and must join the `NET_DM` multicast
-  group at startup (`GENL_MCAST_CAP_SYS_ADMIN`, ADR-0026) before the process drops to
-  `CAP_NET_ADMIN`. This widens the unit beyond the ADR-0009 `CAP_NET_ADMIN`-only baseline for the
-  out-of-the-box experience; operators who disable `drop_monitor`
-  (`NLX_COLLECTORS__DROP_MONITOR=false`) should remove `CAP_SYS_ADMIN` from the unit.
+- **Startup capabilities via FILE CAPABILITIES, not systemd ambient caps.** The `drop_monitor`
+  collector is default-on and must join the `NET_DM` multicast group at startup, which needs
+  `CAP_SYS_ADMIN` (ADR-0026), before the binary drops its effective set to `CAP_NET_ADMIN`.
+  Empirically, systemd `AmbientCapabilities=CAP_SYS_ADMIN` does **not** satisfy the
+  `NETLINK_ADD_MEMBERSHIP` for the `NET_DM` group (EPERM), but **file capabilities** do
+  (verified on Ubuntu 24.04 / kernel 6.17 as a non-root user). The package therefore:
+  - runs as the unprivileged `nft-exporter` user;
+  - sets `setcap 'cap_net_admin,cap_sys_admin=ep' /usr/bin/netlink_exporter` in `postinst`
+    (adds `Depends: libcap2-bin`);
+  - sets `CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN` and **`NoNewPrivileges=false`**
+    (file caps are ignored when NoNewPrivileges is on).
+
+  This keeps least privilege (non-root, bounded to two caps, effective set dropped to
+  `CAP_NET_ADMIN` after the join). Operators who disable `drop_monitor`
+  (`NLX_COLLECTORS__DROP_MONITOR=false`) can re-tighten to `setcap cap_net_admin=ep` +
+  `NoNewPrivileges=true`.
 
 ## Validation
 
