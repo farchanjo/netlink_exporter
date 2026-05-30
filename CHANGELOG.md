@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.2] - 2026-05-30
+
+### Added
+
+- **Complete nftables firewall monitoring** over NFNETLINK (ADR-0030). 14 metrics:
+  - **`nft_rule_counter_{bytes,packets}_total{table,chain,comment}`** — per-rule
+    hit counters keyed by comment (the "which rule matched/dropped" forensic),
+    parsed from `NFTA_RULE_EXPRESSIONS` + `NFTA_RULE_USERDATA`. Comment-keyed,
+    anonymous rules suppressed, hard cap of 1000 emitted series.
+  - `nft_chain_info{table,chain,type,hook,priority,policy}`, `nft_table_info`,
+    `nft_set_elements{table,name,type}`.
+  - `nft_named_counter/quota/limit_*` (named-object stats incl quota/limit
+    exhaustion), `nft_ruleset_generation` (change detection), `nft_flowtable_info`.
+
+### Fixed
+
+- `nftables.family_label`: corrected `NFPROTO_*` values (3=arp, 5=netdev,
+  7=bridge, 10=ip6) — were wrong for bridge/arp families.
+- `nftables` scrape no longer hangs: dumps now use a fresh netlink socket each
+  (sequential dumps on a shared socket stalled), and `GETGEN` is a single
+  `request_single` (not a `NLM_F_DUMP` that blocks on a never-sent `NLMSG_DONE`).
+
+### Known issues
+
+- nftables set key-type label falls back to `other` for some key types (the
+  element count is correct).
+
 ## [0.1.1] - 2026-05-30
 
 ### Changed

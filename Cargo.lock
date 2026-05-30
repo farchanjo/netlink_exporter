@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "netlink_exporter"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "figment",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-domain"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "thiserror",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-http"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "monoio",
  "nlx-ports",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-metrics"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arc-swap",
  "nlx-domain",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-netlink"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-ports"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nlx-domain",
  "thiserror",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "nlx-procfs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nlx-domain",
  "nlx-ports",

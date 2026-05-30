@@ -12,7 +12,7 @@ on an **`io_uring`** runtime, with **zero `/proc` text-scraping** by default.
 [![Runtime](https://img.shields.io/badge/runtime-monoio%20%2F%20io__uring-9cf)](docs/arch/adr/0023-io-uring-runtime.md)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](LICENSE)
 [![Collectors](https://img.shields.io/badge/collectors-21-brightgreen)](#-collectors)
-[![Release](https://img.shields.io/badge/release-v0.1.1-blueviolet)](https://github.com/farchanjo/netlink_exporter/releases/tag/v0.1.1)
+[![Release](https://img.shields.io/badge/release-v0.1.2-blueviolet)](https://github.com/farchanjo/netlink_exporter/releases/tag/v0.1.2)
 
 </div>
 
@@ -55,12 +55,12 @@ only falls back to `procfs`/`sysfs` for the handful of signals that have **no ne
 
 ```bash
 # Option A — Debian/Ubuntu package (recommended): managed systemd service on :33400
-curl -sSLO https://github.com/farchanjo/netlink_exporter/releases/download/v0.1.1/netlink-exporter_0.1.1_amd64.deb
-sudo apt install ./netlink-exporter_0.1.1_amd64.deb     # service auto-starts; drop_monitor enabled
+curl -sSLO https://github.com/farchanjo/netlink_exporter/releases/download/v0.1.2/netlink-exporter_0.1.2_amd64.deb
+sudo apt install ./netlink-exporter_0.1.2_amd64.deb     # service auto-starts; drop_monitor enabled
 
 # Option B — raw binary (Linux x86_64, glibc)
 curl -sSL -o nft.tgz \
-  https://github.com/farchanjo/netlink_exporter/releases/download/v0.1.1/netlink_exporter-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+  https://github.com/farchanjo/netlink_exporter/releases/download/v0.1.2/netlink_exporter-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
 tar xzf nft.tgz
 
 # Run it (needs CAP_NET_ADMIN — root is simplest for a quick look)
@@ -303,14 +303,14 @@ systemctl status nft_exporter
 
 ```bash
 # Build the image (glibc, distroless runtime — see Dockerfile)
-docker build -t nft_exporter:0.1.1 .
+docker build -t nft_exporter:0.1.2 .
 
 # Run with the required capability
 docker run -d --name nft_exporter \
   --network host \
   --cap-drop ALL --cap-add NET_ADMIN \
   -e NLX_LOG_LEVEL=info \
-  nft_exporter:0.1.1
+  nft_exporter:0.1.2
 ```
 
 > 🌐 `--network host` is recommended: the exporter reports the **host's** network stack, so it should
@@ -340,7 +340,7 @@ spec:
       hostPID: false
       containers:
         - name: nft-exporter
-          image: ghcr.io/farchanjo/nft_exporter:0.1.1   # or your registry
+          image: ghcr.io/farchanjo/nft_exporter:0.1.2   # or your registry
           ports:
             - { name: metrics, containerPort: 33400, hostPort: 33400 }
           env:
