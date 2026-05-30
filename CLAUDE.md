@@ -662,7 +662,9 @@ All ADRs under `docs/arch/adr/` in MADR 4.0 format. Status must be `accepted` be
 
 ## Release
 
-Tag `v0.1.0` ships a **dynamic glibc x86_64** binary built from the tagged commit on the Linux host
-(`netlink_exporter-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` + `SHA256SUMS`). No musl/static artifact
-is produced — `monoio` does not compile against musl (ADR-0008 superseded by the glibc/ADR-0023
-runtime).
+Latest tag `v0.1.1` ships **dynamic glibc x86_64** artifacts built from the tagged commit on the
+Linux host: the `.deb` (`netlink-exporter_0.1.1_amd64.deb`), the raw binary tarball
+(`netlink_exporter-v0.1.1-x86_64-unknown-linux-gnu.tar.gz`), and `SHA256SUMS`. No musl/static
+artifact is produced — `monoio` does not compile against musl (ADR-0008 superseded by the
+glibc/ADR-0023 runtime). Cut a release with `cargo` version bump (all 8 crate `Cargo.toml`s +
+`Cargo.lock`) → tag → `make deb` + tarball on the Linux host → `gh release create`.

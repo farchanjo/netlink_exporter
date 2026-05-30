@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.1.1] - 2026-05-30
+
+### Changed
+
+- **Default HTTP listen port `9456` → `33400`** (ADR-0010 amendment); still
+  configurable via `NLX_LISTEN_ADDR` / `--listen-addr`.
+- **Rust toolchain + MSRV → `1.96`** (edition 2024). Release profile optimized:
+  `opt-level=3`, `lto="fat"`, `codegen-units=1`, `strip="symbols"`.
+- **`nic_pcie` AER counters aggregated per device** (dropped the `kind` label) —
+  ADR-0028; ~91% fewer series for that collector.
+- Builds are **dynamic glibc** (musl dropped — `monoio` is glibc-only,
+  ADR-0023); container image on glibc distroless.
+
+### Added
+
+- **Debian package (`.deb`)** — systemd unit, `/etc/default/nft_exporter`
+  (EnvironmentFile), conffiles, and `make deb` (ADR-0029). `Depends: libc6,
+  libcap2-bin`.
+- Rewritten **Makefile** (`make deb` / `release` / `lint` / `test` / …) using the
+  correct binary name (`netlink_exporter`) and the glibc target.
+
+### Fixed
+
+- **`drop_monitor` starts under the packaged service**: startup `CAP_SYS_ADMIN`
+  (NET_DM multicast join, ADR-0026) is granted via **file capabilities**
+  (`setcap`), because systemd `AmbientCapabilities` does not satisfy the join.
+  The unit runs non-root and the binary drops to `CAP_NET_ADMIN` after the join.
+- Cleared pre-existing clippy `indexing_slicing` / `arithmetic_side_effects`
+  warnings in the procfs collectors.
+
+### Docs
+
+- Presentation-quality README with a full deployment guide; spec-first
+  `CLAUDE.md` onboarding guide; C4 `workspace.dsl` refreshed to the
+  monoio/wire-direct architecture; GitHub Actions CI removed.
+
+## [0.1.0] - 2026-05-29
 
 ### Added
 
