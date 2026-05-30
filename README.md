@@ -170,19 +170,19 @@ sequenceDiagram
     participant P as Prometheus
     participant H as nlx-http
     participant S as ScrapeService
-    participant C as Collectors (×N)
+    participant C as Collectors
     participant K as Kernel
     P->>H: GET /metrics
-    H->>S: scrape()
-    par per collector (timeout-bounded)
-        S->>C: collect()
+    H->>S: scrape
+    par per collector, timeout-bounded
+        S->>C: collect
         C->>K: netlink dump / sysfs read
         K-->>C: wire response
-        C-->>S: Vec<MetricSample>
+        C-->>S: metric samples
     end
-    S->>S: encode 0.0.4 + dedup guard
+    S->>S: encode 0.0.4 plus dedup guard
     S-->>H: text body
-    H-->>P: 200 text/plain; version=0.0.4
+    H-->>P: 200 metrics text 0.0.4
 ```
 
 > 📎 The full C4 model lives in [`docs/arch/architecture/workspace.dsl`](docs/arch/architecture/workspace.dsl)
